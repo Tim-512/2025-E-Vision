@@ -28,3 +28,6 @@ Thumbs.db
 
 # Isolated development worktrees
 .worktrees/
+
+# Python package metadata
+*.egg-info/
