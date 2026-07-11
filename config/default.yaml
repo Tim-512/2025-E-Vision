@@ -1,0 +1,52 @@
+﻿camera:
+  width: 1280
+  height: 1024
+  pixel_format: BayerRG8
+  acquisition_fps: 120
+  exposure_us: 800
+  gain_db: 6.0
+  auto_exposure: false
+  auto_gain: false
+  auto_white_balance: false
+  buffer_size: 2
+
+board:
+  width_cm: 21.0
+  height_cm: 29.7
+  rectified_px_per_cm: 40.0
+
+circle:
+  radius_cm: 6.0
+  start_phase_deg: 0.0
+  phase_direction: 1
+  progress_timeout_ms: 300
+  max_phase_correction_deg_s: 45.0
+
+control:
+  command_hz: 100
+  estimated_latency_ms: 25.0
+  source_timeout_ms: 100
+  kp_yaw: 1.0
+  kd_yaw: 0.0
+  kp_pitch: 1.0
+  kd_pitch: 0.0
+  derivative_alpha: 0.25
+  deadband_enter_mdeg: 50
+  deadband_exit_mdeg: 100
+  max_yaw_rate_deg_s: null
+  max_pitch_rate_deg_s: null
+  max_yaw_accel_deg_s2: null
+  max_pitch_accel_deg_s2: null
+  yaw_sign: 1
+  pitch_sign: 1
+  swap_axes: false
+
+serial:
+  port: /dev/ttyUSB0
+  baudrate: 921600
+  feedback_timeout_ms: 300
+
+laser:
+  backend: mock
+  active_high: true
+  gpio_line: null

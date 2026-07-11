@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ev-vision"
+version = "0.1.0"
+description = "Vision system for the 2025 E-problem autonomous aiming device"
+requires-python = ">=3.10"
+dependencies = ["PyYAML>=6.0", "numpy>=1.24"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+vision = ["opencv-python>=4.8"]
+hardware = ["pyserial>=3.5"]
+
+[project.scripts]
+ev-vision = "ev_vision.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra"
