@@ -1,0 +1,27 @@
+﻿# Local assistant/session caches
+.superpowers/
+
+# Generated PDF intermediates
+tmp/
+
+# Original contest material kept locally
+E题_简易自行瞄准装置.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build/model outputs
+build/
+dist/
+runs/
+*.engine
+*.onnx
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
