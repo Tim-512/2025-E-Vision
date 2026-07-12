@@ -25,9 +25,12 @@ runs/
 .idea/
 .DS_Store
 Thumbs.db
+<<<<<<< HEAD
 
 # Isolated development worktrees
 .worktrees/
 
 # Python package metadata
 *.egg-info/
+=======
+>>>>>>> origin/main
