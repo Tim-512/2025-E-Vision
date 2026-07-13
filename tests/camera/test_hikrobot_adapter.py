@@ -149,3 +149,16 @@ def test_native_api_factory_is_lazy_and_uses_version_specific_adapter(monkeypatc
     from ev_vision.camera.hikrobot import create_native_api
 
     assert create_native_api("fake_mvs_adapter") is expected
+
+
+def test_open_failure_before_handle_assignment_is_translated_without_unbound_local():
+    class OpenFailApi(FakeMvsApi):
+        def open_device(self, serial):
+            self.calls.append(("open_device", serial))
+            raise RuntimeError("exclusive open failed")
+
+    api = OpenFailApi()
+    with pytest.raises(CameraDisconnected, match="failed to initialize") as caught:
+        HikrobotCamera(api, config(), serial_number="SERIAL-A").open()
+
+    assert isinstance(caught.value.__cause__, RuntimeError)
