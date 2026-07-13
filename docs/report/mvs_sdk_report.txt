@@ -1,0 +1,1203 @@
+===== PLATFORM =====
+Linux wheeltec 5.15.148-tegra #1 SMP PREEMPT Thu Sep 18 15:08:33 PDT 2025 aarch64 aarch64 aarch64 GNU/Linux
+
+===== CAMERA IDENTITY =====
+model=MV-CA013-21UC
+serial=00G02809155
+transport=USB3
+
+===== MVS LIBRARIES =====
+lrwxrwxrwx 1 1003 1004      29 May 12 18:47 /opt/MVS/lib/aarch64/libMvCameraControl.so -> libMvCameraControl.so.4.8.0.3
+-rwxrwxrwx 1 1003 1004 7553192 May 12 18:47 /opt/MVS/lib/aarch64/libMvCameraControl.so.4.8.0.3
+
+===== GRABIMAGE.PY =====
+# -- coding: utf-8 --
+
+import sys
+import platform
+import threading
+import os
+from ctypes import *
+
+
+# 兼容不同操作系统加载 动态库
+currentsystem = platform.system()
+if currentsystem == 'Windows':
+    sys.path.append(os.path.join(os.getenv('MVCAM_COMMON_RUNENV'), "Samples", "Python", "MvImport"))
+else:
+    sys.path.append(os.path.join("..", "..", "MvImport"))
+
+from MvCameraControl_class import *
+
+# 兼容Python 2.x和3.x的输入处理
+if sys.version_info[0] < 3:  # Python 2
+    # Python 2.x
+    input_func = raw_input
+else:  # Python 3
+    # Python 3.x
+    input_func = input
+
+# Decoding Characters
+def decoding_char(ctypes_char_array):
+    """
+    安全地从 ctypes 字符数组中解码出字符串。
+    适用于 Python 2.x 和 3.x，以及 32/64 位环境。
+    """
+    byte_str = memoryview(ctypes_char_array).tobytes()
+    
+    # 在第一个空字符处截断
+    null_index = byte_str.find(b'\x00')
+    if null_index != -1:
+        byte_str = byte_str[:null_index]
+    
+    # 多编码尝试解码
+    for encoding in ['gbk', 'utf-8', 'latin-1']:
+        try:
+            return byte_str.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    
+    # 如果所有编码都失败，使用替换策略
+    return byte_str.decode('latin-1', errors='replace')
+
+
+g_bExit = False
+
+# 为线程定义一个函数
+def work_thread(cam=0, pData=0, nDataSize=0):
+    stOutFrame = MV_FRAME_OUT()  
+    memset(byref(stOutFrame), 0, sizeof(stOutFrame))
+    while True:
+        ret = cam.MV_CC_GetImageBuffer(stOutFrame, 1000)
+        if None != stOutFrame.pBufAddr and 0 == ret:
+            print ("get one frame: Width[%d], Height[%d], nFrameNum[%d]"  % (stOutFrame.stFrameInfo.nWidth, stOutFrame.stFrameInfo.nHeight, stOutFrame.stFrameInfo.nFrameNum))
+            nRet = cam.MV_CC_FreeImageBuffer(stOutFrame)
+        else:
+            print ("no data[0x%x]" % ret)
+        if g_bExit == True:
+            break
+
+if __name__ == "__main__":
+
+    try:
+        # ch:初始化SDK | en: initialize SDK
+        MvCamera.MV_CC_Initialize()
+
+        SDKVersion = MvCamera.MV_CC_GetSDKVersion()
+        print ("SDKVersion[0x%x]" % SDKVersion)
+
+        deviceList = MV_CC_DEVICE_INFO_LIST()
+        tlayerType = MV_GIGE_DEVICE | MV_USB_DEVICE
+        
+        # ch:枚举设备 | en:Enum device
+        ret = MvCamera.MV_CC_EnumDevices(tlayerType, deviceList)
+        if ret != 0:
+            print ("enum devices fail! ret[0x%x]" % ret)
+            sys.exit()
+
+        if deviceList.nDeviceNum == 0:
+            print ("find no device!")
+            sys.exit()
+
+        print ("Find %d devices!" % deviceList.nDeviceNum)
+
+        for i in range(0, deviceList.nDeviceNum):
+            mvcc_dev_info = cast(deviceList.pDeviceInfo[i], POINTER(MV_CC_DEVICE_INFO)).contents
+            if mvcc_dev_info.nTLayerType == MV_GIGE_DEVICE:
+                print ("\ngige device: [%d]" % i)
+                strModeName = decoding_char(mvcc_dev_info.SpecialInfo.stGigEInfo.chModelName)
+                print ("device model name: %s" % strModeName)
+                strSerialNumber = decoding_char(mvcc_dev_info.SpecialInfo.stGigEInfo.chSerialNumber)
+                print("device serial number: %s" % strSerialNumber)
+                nip1 = ((mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp & 0xff000000) >> 24)
+                nip2 = ((mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp & 0x00ff0000) >> 16)
+                nip3 = ((mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp & 0x0000ff00) >> 8)
+                nip4 = (mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp & 0x000000ff)
+                print ("current ip: %d.%d.%d.%d\n" % (nip1, nip2, nip3, nip4))
+            elif mvcc_dev_info.nTLayerType == MV_USB_DEVICE:
+                print ("\nu3v device: [%d]" % i)
+                strModeName = decoding_char(mvcc_dev_info.SpecialInfo.stUsb3VInfo.chModelName)
+                print ("device model name: %s" % strModeName)
+
+                strSerialNumber = decoding_char(mvcc_dev_info.SpecialInfo.stUsb3VInfo.chSerialNumber)                
+                print ("device serial number: %s" % strSerialNumber)
+
+        nConnectionNum = input_func("please input the number of the device to connect:")
+
+        if int(nConnectionNum) >= deviceList.nDeviceNum:
+            print ("intput error!")
+            sys.exit()
+
+        # ch:创建相机实例 | en:Creat Camera Object
+        cam = MvCamera()
+        
+        # ch:选择设备并创建句柄| en:Select device and create handle
+        stDeviceList = cast(deviceList.pDeviceInfo[int(nConnectionNum)], POINTER(MV_CC_DEVICE_INFO)).contents
+
+        ret = cam.MV_CC_CreateHandle(stDeviceList)
+        if ret != 0:
+            raise Exception ("create handle fail! ret[0x%x]" % ret)
+
+        # ch:打开设备 | en:Open device
+        ret = cam.MV_CC_OpenDevice(MV_ACCESS_Exclusive, 0)
+        if ret != 0:
+            raise Exception ("open device fail! ret[0x%x]" % ret)
+        
+        # ch:探测网络最佳包大小(只对GigE相机有效) | en:Detection network optimal package size(It only works for the GigE camera)
+        if stDeviceList.nTLayerType == MV_GIGE_DEVICE:
+            nPacketSize = cam.MV_CC_GetOptimalPacketSize()
+            if int(nPacketSize) > 0:
+                ret = cam.MV_CC_SetIntValue("GevSCPSPacketSize",nPacketSize)
+                if ret != 0:
+                    print ("Warning: Set Packet Size fail! ret[0x%x]" % ret)
+            else:
+                print ("Warning: Get Packet Size fail! ret[0x%x]" % nPacketSize)
+
+        # ch:设置触发模式为off | en:Set trigger mode as off
+        ret = cam.MV_CC_SetEnumValue("TriggerMode", MV_TRIGGER_MODE_OFF)
+        if ret != 0:
+            raise Exception ("set trigger mode fail! ret[0x%x]" % ret)
+
+        # ch:开始取流 | en:Start grab image
+        ret = cam.MV_CC_StartGrabbing()
+        if ret != 0:
+            raise Exception ("start grabbing fail! ret[0x%x]" % ret)
+
+        try:
+            hThreadHandle = threading.Thread(target=work_thread, args=(cam, None, None))
+            hThreadHandle.start()
+        except:
+            print ("error: unable to start thread")
+            
+        print ("press Enter key to stop grabbing.")
+        input_func()
+
+        g_bExit = True
+        hThreadHandle.join()
+
+        # ch:停止取流 | en:Stop grab image
+        ret = cam.MV_CC_StopGrabbing()
+        if ret != 0:
+            raise Exception ("stop grabbing fail! ret[0x%x]" % ret)
+
+        # ch:关闭设备 | Close device
+        ret = cam.MV_CC_CloseDevice()
+        if ret != 0:
+            raise Exception ("close deivce fail! ret[0x%x]" % ret)
+
+        # ch:销毁句柄 | Destroy handle
+        cam.MV_CC_DestroyHandle()
+
+    except Exception as e:
+        print(e)
+        cam.MV_CC_CloseDevice()
+        cam.MV_CC_DestroyHandle()
+    finally:
+        # ch:反初始化SDK | en: finalize SDK
+        MvCamera.MV_CC_Finalize()
+
+===== OPENCV GRABIMAGE_CV.PY =====
+# -- coding: utf-8 --
+
+import sys
+import platform
+import threading
+import os
+from ctypes import *
+import numpy
+import cv2
+
+currentsystem = platform.system()
+if currentsystem == 'Windows':
+    sys.path.append(os.getenv('MVCAM_COMMON_RUNENV') + "/Samples/Python/MvImport")
+else:
+    # Demo 目录:  "/opt/xxx/Samples/平台/OpenCV/ZZ/ ")   python接口目录： "/opt/xxx/Samples/平台/Python/MvImport"
+    sys.path.append("./../../../Python/MvImport")
+
+
+from MvCameraControl_class import *
+g_bExit = False
+
+# 兼容Python 2.x和3.x的输入处理
+if sys.version_info[0] < 3: 
+    # Python 2.x
+    input_func = raw_input
+else: 
+    # Python 3.x
+    input_func = input
+
+
+def IsHBPixelFormat(enPixelType = 0):
+    if enPixelType in (PixelType_Gvsp_HB_Mono8, \
+                        PixelType_Gvsp_HB_Mono10,\
+                        PixelType_Gvsp_HB_Mono10_Packed,\
+                        PixelType_Gvsp_HB_Mono12,\
+                        PixelType_Gvsp_HB_Mono12_Packed,\
+                        PixelType_Gvsp_HB_Mono16,\
+                        PixelType_Gvsp_HB_RGB8_Packed,\
+                        PixelType_Gvsp_HB_BGR8_Packed,\
+                        PixelType_Gvsp_HB_RGBA8_Packed,\
+                        PixelType_Gvsp_HB_BGRA8_Packed,\
+                        PixelType_Gvsp_HB_RGB16_Packed,\
+                        PixelType_Gvsp_HB_BGR16_Packed,\
+                        PixelType_Gvsp_HB_RGBA16_Packed,\
+                        PixelType_Gvsp_HB_BGRA16_Packed,\
+                        PixelType_Gvsp_HB_YUV422_Packed,\
+                        PixelType_Gvsp_HB_YUV422_YUYV_Packed,\
+                        PixelType_Gvsp_HB_BayerGR8,\
+                        PixelType_Gvsp_HB_BayerRG8,\
+                        PixelType_Gvsp_HB_BayerGB8,\
+                        PixelType_Gvsp_HB_BayerBG8,\
+                        PixelType_Gvsp_HB_BayerRBGG8,\
+                        PixelType_Gvsp_HB_BayerGB10,\
+                        PixelType_Gvsp_HB_BayerGB10_Packed,\
+                        PixelType_Gvsp_HB_BayerBG10,\
+                        PixelType_Gvsp_HB_BayerBG10_Packed,\
+                        PixelType_Gvsp_HB_BayerRG10,\
+                        PixelType_Gvsp_HB_BayerRG10_Packed,\
+                        PixelType_Gvsp_HB_BayerGR10,\
+                        PixelType_Gvsp_HB_BayerGR10_Packed,\
+                        PixelType_Gvsp_HB_BayerGB12,\
+                        PixelType_Gvsp_HB_BayerGB12_Packed,\
+                        PixelType_Gvsp_HB_BayerBG12,\
+                        PixelType_Gvsp_HB_BayerBG12_Packed,\
+                        PixelType_Gvsp_HB_BayerRG12,\
+                        PixelType_Gvsp_HB_BayerRG12_Packed,\
+                        PixelType_Gvsp_HB_BayerGR12,\
+                        PixelType_Gvsp_HB_BayerGR12_Packed):
+        return True
+    else:
+        return False
+    
+
+def IsMonoPixelFormat(enPixelType = 0):
+    if enPixelType in (PixelType_Gvsp_Mono8, \
+                        PixelType_Gvsp_Mono10, \
+                        PixelType_Gvsp_Mono10_Packed, \
+                        PixelType_Gvsp_Mono12, \
+                        PixelType_Gvsp_Mono12_Packed, \
+                        PixelType_Gvsp_Mono14, \
+                        PixelType_Gvsp_Mono16):
+        return True
+    else:
+        return False
+
+# 为线程定义一个函数
+def work_thread(cam=0):
+    stOutFrame = MV_FRAME_OUT()  
+    memset(byref(stOutFrame), 0, sizeof(stOutFrame))
+     
+    
+    #执行1次
+    SaveImageOnce = False
+    while True:
+    
+        if g_bExit == True:
+            break
+            
+        ret = cam.MV_CC_GetImageBuffer(stOutFrame, 1000)
+        if None != stOutFrame.pBufAddr and 0 == ret:
+            print ("get one frame: Width[%d], Height[%d], nFrameNum[%d], nLostPacket[%d]"  % (stOutFrame.stFrameInfo.nWidth, stOutFrame.stFrameInfo.nHeight, stOutFrame.stFrameInfo.nFrameNum, stOutFrame.stFrameInfo.nLostPacket))
+            
+            stDecodeParam = MV_CC_HB_DECODE_PARAM()
+            stConvertParam = MV_CC_PIXEL_CONVERT_PARAM_EX()
+            memset(byref(stConvertParam), 0, sizeof(stConvertParam))
+            
+            # 如果是HB图像，需要进行HB解码
+            result = IsHBPixelFormat(stOutFrame.stFrameInfo.enPixelType)
+            if True == result :
+                DecodeNeedBufferlen = stOutFrame.stFrameInfo.nWidth * stOutFrame.stFrameInfo.nHeight * 3
+                DecodeBuffer = (c_ubyte * DecodeNeedBufferlen)()
+                
+                stDecodeParam.pSrcBuf = stOutFrame.pBufAddr
+                stDecodeParam.nSrcLen = stOutFrame.stFrameInfo.nFrameLen
+                stDecodeParam.pDstBuf = DecodeBuffer
+                stDecodeParam.nDstBufSize = DecodeNeedBufferlen
+                ret = cam.MV_CC_HBDecode(stDecodeParam)
+                if ret != 0:
+                    print("HB Decode fail! ret[0x%x]" % ret)
+                    cam.MV_CC_FreeImageBuffer(stOutFrame)
+                    continue
+
+                stConvertParam.pSrcData = stDecodeParam.pDstBuf
+                stConvertParam.nSrcDataLen = stDecodeParam.nDstBufLen
+                stConvertParam.enSrcPixelType = stDecodeParam.enDstPixelType  
+            else:
+                stConvertParam.pSrcData = stOutFrame.pBufAddr
+                stConvertParam.nSrcDataLen = stOutFrame.stFrameInfo.nFrameLen
+                stConvertParam.enSrcPixelType = stOutFrame.stFrameInfo.enPixelType  
+           
+            
+            # 图像进行格式转换 
+            enDstPixelType = PixelType_Gvsp_Undefined
+            nChannelNum = 1
+            bMono = IsMonoPixelFormat(stConvertParam.enSrcPixelType)
+            if True == bMono :
+                enDstPixelType = PixelType_Gvsp_Mono8
+                nChannelNum = 1
+            else:
+                enDstPixelType = PixelType_Gvsp_RGB8_Packed
+                nChannelNum = 3
+            
+            convertdestBufflen = nChannelNum *stOutFrame.stFrameInfo.nWidth * stOutFrame.stFrameInfo.nHeight 
+            DstBuffer = (c_ubyte * convertdestBufflen)()
+            
+            stConvertParam.nWidth = stOutFrame.stFrameInfo.nWidth
+            stConvertParam.nHeight = stOutFrame.stFrameInfo.nHeight
+
+            stConvertParam.enDstPixelType = enDstPixelType
+            stConvertParam.pDstBuffer = DstBuffer
+            stConvertParam.nDstBufferSize = convertdestBufflen
+
+            ret = cam.MV_CC_ConvertPixelTypeEx(stConvertParam)
+            if ret != 0:
+                print ("convert pixel fail! ret[0x%x]" % ret)
+                cam.MV_CC_FreeImageBuffer(stOutFrame)
+                continue
+        
+            #转换 numpy 格式  
+            if nChannelNum == 1:
+                numpy_image = numpy.frombuffer(DstBuffer, dtype=numpy.ubyte, count=convertdestBufflen). \
+                    reshape(stOutFrame.stFrameInfo.nHeight, stOutFrame.stFrameInfo.nWidth)
+                
+                # 执行1次, 只保存1张图
+                if SaveImageOnce == False:
+                    output_path = "output_mono_image.bmp"
+                    cv2.imwrite(output_path, numpy_image)  
+                    print("save output_mono_image.bmp success")
+                    
+                    SaveImageOnce = True
+            else:
+                numpy_image = numpy.frombuffer(DstBuffer, dtype=numpy.ubyte, count=convertdestBufflen). \
+                    reshape(stOutFrame.stFrameInfo.nHeight, stOutFrame.stFrameInfo.nWidth, 3)
+                
+                # 执行1次, 只保存1张图
+                if SaveImageOnce == False:
+                    output_path = "output_color_image.bmp"
+                    cv2.imwrite(output_path, numpy_image)  
+                    print("save output_color_image.bmp success")
+       
+                    SaveImageOnce = True
+
+            nRet = cam.MV_CC_FreeImageBuffer(stOutFrame)
+        else:
+            print ("no data[0x%x]" % ret)
+            
+
+
+if __name__ == "__main__":
+
+    # ch:初始化SDK | en: initialize SDK
+    MvCamera.MV_CC_Initialize()
+
+    deviceList = MV_CC_DEVICE_INFO_LIST()
+    # ch:选择枚举的传输层协议  (根据需求和系统支持情况选择)    | en: Select the Transport Layer Protocol (based on your requirements and system support).
+    tlayerType = (MV_GIGE_DEVICE | MV_USB_DEVICE | MV_GENTL_CAMERALINK_DEVICE
+                  | MV_GENTL_CXP_DEVICE | MV_GENTL_XOF_DEVICE)
+    
+    # ch:枚举设备 | en:Enum device
+    ret = MvCamera.MV_CC_EnumDevices(tlayerType, deviceList)
+    if ret != 0:
+        print ("enum devices fail! ret[0x%x]" % ret)
+        sys.exit()
+
+    if deviceList.nDeviceNum == 0:
+        print ("find no device!")
+        sys.exit()
+
+    print ("Find %d devices!" % deviceList.nDeviceNum)
+
+    for i in range(0, deviceList.nDeviceNum):
+        mvcc_dev_info = cast(deviceList.pDeviceInfo[i], POINTER(MV_CC_DEVICE_INFO)).contents
+        if mvcc_dev_info.nTLayerType == MV_GIGE_DEVICE or mvcc_dev_info.nTLayerType == MV_GENTL_GIGE_DEVICE:
+            print ("\ngige device: [%d]" % i)
+            strModeName = ''.join([chr(c) for c in mvcc_dev_info.SpecialInfo.stGigEInfo.chModelName if c != 0])
+            print ("device model name: %s" % strModeName)
+
+            nip1 = ((mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp & 0xff000000) >> 24)
+            nip2 = ((mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp & 0x00ff0000) >> 16)
+            nip3 = ((mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp & 0x0000ff00) >> 8)
+            nip4 = (mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp & 0x000000ff)
+            print ("current ip: %d.%d.%d.%d\n" % (nip1, nip2, nip3, nip4))
+        elif mvcc_dev_info.nTLayerType == MV_USB_DEVICE:
+            print ("\nu3v device: [%d]" % i)
+            strModeName = ''.join([chr(c) for c in mvcc_dev_info.SpecialInfo.stUsb3VInfo.chModelName if c != 0])
+            print ("device model name: %s" % strModeName)
+
+            strSerialNumber =  ''.join([chr(c) for c in mvcc_dev_info.SpecialInfo.stUsb3VInfo.chSerialNumber if c != 0])                
+            print ("user serial number: %s" % strSerialNumber)
+        elif mvcc_dev_info.nTLayerType == MV_GENTL_CAMERALINK_DEVICE:
+            print ("\nCML device: [%d]" % i)
+            strModeName = ''.join([chr(c) for c in mvcc_dev_info.SpecialInfo.stCMLInfo.chModelName if c != 0])
+            print ("device model name: %s" % strModeName)
+
+            strSerialNumber = ''.join([chr(c) for c in mvcc_dev_info.SpecialInfo.stCMLInfo.chSerialNumber if c != 0])
+            print ("user serial number: %s" % strSerialNumber)
+        elif mvcc_dev_info.nTLayerType == MV_GENTL_CXP_DEVICE:
+            print ("\nCXP device: [%d]" % i)
+            strModeName =  ''.join([chr(c) for c in mvcc_dev_info.SpecialInfo.stCXPInfo.chModelName if c != 0])
+            print ("device model name: %s" % strModeName)
+            
+            strSerialNumber =  ''.join([chr(c) for c in mvcc_dev_info.SpecialInfo.stCXPInfo.chSerialNumber if c != 0])
+            print ("user serial number: %s" % strSerialNumber)
+        elif mvcc_dev_info.nTLayerType == MV_GENTL_XOF_DEVICE:
+            print ("\nXoF device: [%d]" % i)
+            strModeName =  ''.join([chr(c) for c in mvcc_dev_info.SpecialInfo.stXoFInfo.chModelName if c != 0])
+            print ("device model name: %s" % strModeName)
+
+            strSerialNumber =  ''.join([chr(c) for c in mvcc_dev_info.SpecialInfo.stXoFInfo.chSerialNumber if c != 0])
+            print ("user serial number: %s" % strSerialNumber)
+
+    nConnectionNum = input_func("please input_func the number of the device to connect:")
+
+    if int(nConnectionNum) >= deviceList.nDeviceNum:
+        print ("intput error!")
+        sys.exit()
+
+    # ch:创建相机实例 | en:Creat Camera Object
+    cam = MvCamera()
+    
+    # ch:选择设备并创建句柄 | en:Select device and create handle
+    stDeviceList = cast(deviceList.pDeviceInfo[int(nConnectionNum)], POINTER(MV_CC_DEVICE_INFO)).contents
+
+    ret = cam.MV_CC_CreateHandle(stDeviceList)
+    if ret != 0:
+        print ("create handle fail! ret[0x%x]" % ret)
+        sys.exit()
+
+    # ch:打开设备 | en:Open device
+    ret = cam.MV_CC_OpenDevice(MV_ACCESS_Exclusive, 0)
+    if ret != 0:
+        print ("open device fail! ret[0x%x]" % ret)
+        sys.exit()
+    
+    # ch:探测网络最佳包大小(只对GigE相机有效) | en:Detection network optimal package size(It only works for the GigE camera)
+    if stDeviceList.nTLayerType == MV_GIGE_DEVICE or stDeviceList.nTLayerType == MV_GENTL_GIGE_DEVICE:
+        nPacketSize = cam.MV_CC_GetOptimalPacketSize()
+        if int(nPacketSize) > 0:
+            ret = cam.MV_CC_SetIntValue("GevSCPSPacketSize",nPacketSize)
+            if ret != 0:
+                print ("Warning: Set Packet Size fail! ret[0x%x]" % ret)
+        else:
+            print ("Warning: Get Packet Size fail! ret[0x%x]" % nPacketSize)
+
+    # ch:设置触发模式为off | en:Set trigger mode as off
+    ret = cam.MV_CC_SetEnumValue("TriggerMode", MV_TRIGGER_MODE_OFF)
+    if ret != 0:
+        print ("set trigger mode fail! ret[0x%x]" % ret)
+        sys.exit()
+
+    # ch:开始取流 | en:Start grab image
+    ret = cam.MV_CC_StartGrabbing()
+    if ret != 0:
+        print ("start grabbing fail! ret[0x%x]" % ret)
+        sys.exit()
+
+    try:
+        hThreadHandle = threading.Thread(target=work_thread, args=(cam,))
+        hThreadHandle.start()
+    except:
+        print ("error: unable to start thread")
+        
+    print ("press Enter key to stop grabbing.")
+    input_func()
+
+    g_bExit = True
+    hThreadHandle.join()
+
+    # ch:停止取流 | en:Stop grab image
+    ret = cam.MV_CC_StopGrabbing()
+    if ret != 0:
+        print ("stop grabbing fail! ret[0x%x]" % ret)
+        sys.exit()
+
+    # ch:关闭设备 | Close device
+    ret = cam.MV_CC_CloseDevice()
+    if ret != 0:
+        print ("close deivce fail! ret[0x%x]" % ret)
+        sys.exit()
+
+    # ch:销毁句柄 | Destroy handle
+    ret = cam.MV_CC_DestroyHandle()
+    if ret != 0:
+        print ("destroy handle fail! ret[0x%x]" % ret)
+        sys.exit()
+
+    # ch:反初始化SDK | en: finalize SDK
+    MvCamera.MV_CC_Finalize()
+
+
+===== IMAGE SAVE SAMPLE =====
+# -- coding: utf-8 --
+
+import sys
+import os
+import platform
+from ctypes import *
+
+# 兼容不同操作系统加载 动态库
+currentsystem = platform.system()
+if currentsystem == 'Windows':
+    sys.path.append(os.path.join(os.getenv('MVCAM_COMMON_RUNENV'), "Samples", "Python", "MvImport"))
+else:
+    sys.path.append(os.path.join("..", "..", "MvImport"))
+from MvCameraControl_class import *
+
+# 兼容Python 2.x和3.x的输入处理
+if sys.version_info[0] < 3: 
+    # Python 2.x
+    input_func = raw_input
+else: 
+    # Python 3.x
+    input_func = input
+
+# Decoding Characters
+def decoding_char(ctypes_char_array):
+    """
+    安全地从 ctypes 字符数组中解码出字符串。
+    适用于 Python 2.x 和 3.x，以及 32/64 位环境。
+    """
+    byte_str = memoryview(ctypes_char_array).tobytes()
+    
+    # 在第一个空字符处截断
+    null_index = byte_str.find(b'\x00')
+    if null_index != -1:
+        byte_str = byte_str[:null_index]
+    
+    # 多编码尝试解码
+    for encoding in ['gbk', 'utf-8', 'latin-1']:
+        try:
+            return byte_str.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    
+    # 如果所有编码都失败，使用替换策略
+    return byte_str.decode('latin-1', errors='replace')
+
+
+HB_format_list = [
+    PixelType_Gvsp_HB_Mono8,
+    PixelType_Gvsp_HB_Mono10,
+    PixelType_Gvsp_HB_Mono10_Packed,
+    PixelType_Gvsp_HB_Mono12,
+    PixelType_Gvsp_HB_Mono12_Packed,
+    PixelType_Gvsp_HB_Mono16,
+    PixelType_Gvsp_HB_BayerGR8,
+    PixelType_Gvsp_HB_BayerRG8,
+    PixelType_Gvsp_HB_BayerGB8,
+    PixelType_Gvsp_HB_BayerBG8,
+    PixelType_Gvsp_HB_BayerRBGG8,
+    PixelType_Gvsp_HB_BayerGR10,
+    PixelType_Gvsp_HB_BayerRG10,
+    PixelType_Gvsp_HB_BayerGB10,
+    PixelType_Gvsp_HB_BayerBG10,
+    PixelType_Gvsp_HB_BayerGR12,
+    PixelType_Gvsp_HB_BayerRG12,
+    PixelType_Gvsp_HB_BayerGB12,
+    PixelType_Gvsp_HB_BayerBG12,
+    PixelType_Gvsp_HB_BayerGR10_Packed,
+    PixelType_Gvsp_HB_BayerRG10_Packed,
+    PixelType_Gvsp_HB_BayerGB10_Packed,
+    PixelType_Gvsp_HB_BayerBG10_Packed,
+    PixelType_Gvsp_HB_BayerGR12_Packed,
+    PixelType_Gvsp_HB_BayerRG12_Packed,
+    PixelType_Gvsp_HB_BayerGB12_Packed,
+    PixelType_Gvsp_HB_BayerBG12_Packed,
+    PixelType_Gvsp_HB_YUV422_Packed,
+    PixelType_Gvsp_HB_YUV422_YUYV_Packed,
+    PixelType_Gvsp_HB_RGB8_Packed,
+    PixelType_Gvsp_HB_BGR8_Packed,
+    PixelType_Gvsp_HB_RGBA8_Packed,
+    PixelType_Gvsp_HB_BGRA8_Packed,
+    PixelType_Gvsp_HB_RGB16_Packed,
+    PixelType_Gvsp_HB_BGR16_Packed,
+    PixelType_Gvsp_HB_RGBA16_Packed,
+    PixelType_Gvsp_HB_BGRA16_Packed]
+
+def save_non_raw_image(save_type, frame_info, cam_instance):
+
+
+    if save_type == 1:
+        mv_image_type = MV_Image_Jpeg
+        file_path = "Image_w%d_h%d_fn%d.jpg" % (
+            frame_info.stFrameInfo.nWidth, frame_info.stFrameInfo.nHeight, frame_info.stFrameInfo.nFrameNum)
+    elif save_type == 2:
+        mv_image_type = MV_Image_Bmp
+        file_path = "Image_w%d_h%d_fn%d.bmp" % (
+            frame_info.stFrameInfo.nWidth, frame_info.stFrameInfo.nHeight, frame_info.stFrameInfo.nFrameNum)
+    elif save_type == 3:
+        mv_image_type = MV_Image_Tif
+        file_path = "Image_w%d_h%d_fn%d.tif" % (
+            frame_info.stFrameInfo.nWidth, frame_info.stFrameInfo.nHeight, frame_info.stFrameInfo.nFrameNum)
+    else:
+        file_path = "Image_w%d_h%d_fn%d.png" % (
+            frame_info.stFrameInfo.nWidth, frame_info.stFrameInfo.nHeight, frame_info.stFrameInfo.nFrameNum)
+        mv_image_type = MV_Image_Png
+
+    stImage = MV_CC_IMAGE()
+    memset(byref(stImage), 0, sizeof(MV_CC_IMAGE))
+    stImage.nWidth = frame_info.stFrameInfo.nExtendWidth  # ch:相机对应的宽 | en:Width
+    stImage.nHeight = frame_info.stFrameInfo.nExtendHeight  # ch:相机对应的宽 | en:Height
+    stImage.enPixelType = frame_info.stFrameInfo.enPixelType  # ch:相机对应的像素格式 | en:Camera pixel type
+    stImage.pImageBuf = frame_info.pBufAddr
+    stImage.nImageBufSize = frame_info.stFrameInfo.nFrameLenEx
+    stImage.nImageLen = frame_info.stFrameInfo.nFrameLenEx
+
+    stSaveImageParam = MV_CC_SAVE_IMAGE_PARAM()   
+    memset(byref(stSaveImageParam), 0, sizeof(MV_CC_SAVE_IMAGE_PARAM))
+    stSaveImageParam.enImageType = mv_image_type  # ch:需要保存的图像类型 | en:Image format to save
+    stSaveImageParam.iMethodValue = 1
+    stSaveImageParam.nQuality = 80           # ch: JPG: (50,99], invalid in other format
+    stSaveImageParam.nEndian = 0             #Tiff 图像时字节序 (默认:小端存储)
+
+    mv_ret = cam_instance.MV_CC_SaveImageToFileEx2(stImage, stSaveImageParam, file_path)
+    return mv_ret
+
+
+def save_raw(frame_info, cam_instance):
+    if frame_info.stFrameInfo.enPixelType in HB_format_list:
+
+        # ch:解码参数 | en: decode parameters
+        stDecodeParam = MV_CC_HB_DECODE_PARAM()
+        memset(byref(stDecodeParam), 0, sizeof(stDecodeParam))
+
+        # 获取设备payload大小
+        nDevPayloadSize = c_uint64()
+        nMemAlignment = c_uint()
+        ret = cam_instance.MV_CC_GetPayloadSize(nDevPayloadSize, nMemAlignment)
+        if 0 != ret:
+            print("Get PayloadSize fail! ret[0x%x]" % ret)
+            return ret
+        nPayloadSize = nDevPayloadSize.value
+        stDecodeParam.pSrcBuf = frame_info.pBufAddr
+        stDecodeParam.nSrcLen = frame_info.stFrameInfo.nFrameLen
+        stDecodeParam.pDstBuf = (c_ubyte * nPayloadSize)()
+        stDecodeParam.nDstBufSize = nPayloadSize
+        ret = cam_instance.MV_CC_HBDecode(stDecodeParam)
+        if ret != 0:
+            print("HB Decode fail! ret[0x%x]" % ret)
+            return ret
+        else:
+            file_path = "Image_w%d_h%d_fn%d.raw" % (stDecodeParam.nWidth, stDecodeParam.nHeight,
+                                                    frame_info.stFrameInfo.nFrameNum)
+            try:
+                file_open = open(file_path.encode('ascii'), 'wb+')
+                img_save = (c_ubyte * stDecodeParam.nDstBufLen)()
+                memmove(byref(img_save), stDecodeParam.pDstBuf, stDecodeParam.nDstBufLen)
+                file_open.write(img_save)
+            except PermissionError:
+                file_open.close()
+                print("save error raw file executed failed!")
+                return MV_E_OPENFILE
+            file_open.close()
+    else:
+        file_path = "Image_w%d_h%d_fn%d.raw" % (
+            frame_info.stFrameInfo.nWidth, frame_info.stFrameInfo.nHeight, frame_info.stFrameInfo.nFrameNum)
+        try:
+            file_open = open(file_path.encode('ascii'), 'wb+')
+            img_save = (c_ubyte * frame_info.stFrameInfo.nFrameLen)()
+            memmove(byref(img_save), frame_info.pBufAddr, frame_info.stFrameInfo.nFrameLen)
+            file_open.write(img_save)
+        except PermissionError:
+            file_open.close()
+            print("save error raw file executed failed!")
+            return MV_E_OPENFILE
+        file_open.close()
+    return 0
+
+
+if __name__ == "__main__":
+
+    try:
+        # ch:初始化SDK | en: initialize SDK
+        MvCamera.MV_CC_Initialize()
+        SDKVersion = MvCamera.MV_CC_GetSDKVersion()
+        print ("SDKVersion[0x%x]" % SDKVersion)
+
+        deviceList = MV_CC_DEVICE_INFO_LIST()
+        tlayerType = (MV_GIGE_DEVICE | MV_USB_DEVICE)
+
+        # ch:枚举设备 | en:Enum device
+        ret = MvCamera.MV_CC_EnumDevices(tlayerType, deviceList)
+        if ret != 0:
+            print("enum devices fail! ret[0x%x]" % ret)
+            sys.exit()
+
+        if deviceList.nDeviceNum == 0:
+            print("find no device!")
+            sys.exit()
+
+        print("Find %d devices!" % deviceList.nDeviceNum)
+
+        for i in range(0, deviceList.nDeviceNum):
+            mvcc_dev_info = cast(deviceList.pDeviceInfo[i], POINTER(MV_CC_DEVICE_INFO)).contents
+            if mvcc_dev_info.nTLayerType == MV_GIGE_DEVICE or mvcc_dev_info.nTLayerType == MV_GENTL_GIGE_DEVICE:
+                print("\ngige device: [%d]" % i)
+                strModeName = decoding_char(mvcc_dev_info.SpecialInfo.stGigEInfo.chModelName)
+                print("device model name: %s" % strModeName)
+                strSerialNumber = decoding_char(mvcc_dev_info.SpecialInfo.stGigEInfo.chSerialNumber)
+                print("device serial number: %s" % strSerialNumber)
+                nip1 = ((mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp & 0xff000000) >> 24)
+                nip2 = ((mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp & 0x00ff0000) >> 16)
+                nip3 = ((mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp & 0x0000ff00) >> 8)
+                nip4 = (mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp & 0x000000ff)
+                print("current ip: %d.%d.%d.%d\n" % (nip1, nip2, nip3, nip4))
+            elif mvcc_dev_info.nTLayerType == MV_USB_DEVICE:
+                print("\nu3v device: [%d]" % i)
+                strModeName = decoding_char(mvcc_dev_info.SpecialInfo.stUsb3VInfo.chModelName)
+                print ("device model name: %s" % strModeName)
+
+                strSerialNumber = decoding_char(mvcc_dev_info.SpecialInfo.stUsb3VInfo.chSerialNumber)                
+                print ("device serial number: %s" % strSerialNumber)
+
+
+
+        nConnectionNum = input_func("please input the number of the device to connect:")
+
+        if int(nConnectionNum) >= deviceList.nDeviceNum:
+            print("input error!")
+            sys.exit()
+
+        nSaveImageType = input_func("please input number (0-raw, 1-Jpeg, 2-Bmp, 3-Tiff, 4-Png):")
+        if int(nSaveImageType) not in {0, 1, 2, 3, 4}:
+            print("input error!")
+            sys.exit()
+
+        # ch:创建相机实例 | en:Create Camera Object
+        cam = MvCamera()
+
+        # ch:选择设备并创建句柄 | en:Select device and create handle
+        stDeviceList = cast(deviceList.pDeviceInfo[int(nConnectionNum)], POINTER(MV_CC_DEVICE_INFO)).contents
+
+        ret = cam.MV_CC_CreateHandle(stDeviceList)
+        if ret != 0:
+            raise Exception("create handle fail! ret[0x%x]" % ret)
+
+        # ch:打开设备 | en:Open device
+        ret = cam.MV_CC_OpenDevice(MV_ACCESS_Exclusive, 0)
+        if ret != 0:
+            raise Exception("open device fail! ret[0x%x]" % ret)
+
+        # ch:探测网络最佳包大小(只对GigE相机有效) | en:Detection network optimal package size(It only works for the GigE camera)
+        if stDeviceList.nTLayerType == MV_GIGE_DEVICE:
+            nPacketSize = cam.MV_CC_GetOptimalPacketSize()
+            if int(nPacketSize) > 0:
+                ret = cam.MV_CC_SetIntValue("GevSCPSPacketSize", nPacketSize)
+                if ret != 0:
+                    print("Warning: Set Packet Size fail! ret[0x%x]" % ret)
+            else:
+                print("Warning: Get Packet Size fail! ret[0x%x]" % nPacketSize)
+
+        # ch:设置触发模式为off | en:Set trigger mode as off
+        ret = cam.MV_CC_SetEnumValue("TriggerMode", MV_TRIGGER_MODE_OFF)
+        if ret != 0:
+            raise Exception("set trigger mode fail! ret[0x%x]" % ret)
+
+        # ch:开始取流 | en:Start grab image
+        ret = cam.MV_CC_StartGrabbing()
+        if ret != 0:
+            raise Exception("start grabbing fail! ret[0x%x]" % ret)
+
+        # ch:获取的帧信息 | en: frame from device
+        stOutFrame = MV_FRAME_OUT()
+        memset(byref(stOutFrame), 0, sizeof(stOutFrame))
+
+        ret = cam.MV_CC_GetImageBuffer(stOutFrame, 20000)
+        if None != stOutFrame.pBufAddr and 0 == ret:
+            print("get one frame: Width[%d], Height[%d], nFrameNum[%d]" % (
+            stOutFrame.stFrameInfo.nWidth, stOutFrame.stFrameInfo.nHeight, stOutFrame.stFrameInfo.nFrameNum))
+
+            # ch:如果图像是HB格式，存raw需要先解码 | en:If save raw,and the image is HB format, should to be decoded first
+            if int(nSaveImageType) == 0:
+                ret = save_raw(stOutFrame, cam)
+            else:
+                ret = save_non_raw_image(int(nSaveImageType), stOutFrame, cam)
+            if ret != 0:
+                cam.MV_CC_FreeImageBuffer(stOutFrame)
+                raise Exception("save image fail! ret[0x%x]" % ret)
+            else:
+                print("Save image success!")
+
+            cam.MV_CC_FreeImageBuffer(stOutFrame)
+        else:
+            raise Exception("no data[0x%x]" % ret)
+
+        # ch:停止取流 | en:Stop grab image
+        ret = cam.MV_CC_StopGrabbing()
+        if ret != 0:
+            raise Exception("stop grabbing fail! ret[0x%x]" % ret)
+
+        # ch:关闭设备 | Close device
+        ret = cam.MV_CC_CloseDevice()
+        if ret != 0:
+            raise Exception("close device fail! ret[0x%x]" % ret)
+
+        # ch:销毁句柄 | Destroy handle0
+        cam.MV_CC_DestroyHandle()
+
+    except Exception as e:
+        print(e)
+        cam.MV_CC_CloseDevice()
+        cam.MV_CC_DestroyHandle()
+    finally:
+        # ch:反初始化SDK | en: finalize SDK
+        MvCamera.MV_CC_Finalize()
+
+===== PYTHON METHOD SOURCES =====
+
+========================================================================
+MV_CC_EnumDevices
+signature: (nTLayerType, stDevList)
+    @staticmethod
+    def MV_CC_EnumDevices(nTLayerType, stDevList):
+        MvCamCtrldll.MV_CC_EnumDevices.argtype = (c_uint, c_void_p)
+        MvCamCtrldll.MV_CC_EnumDevices.restype = c_uint
+        return MvCamCtrldll.MV_CC_EnumDevices(c_uint(nTLayerType), byref(stDevList))
+
+
+========================================================================
+MV_CC_CreateHandle
+signature: (self, stDevInfo)
+    def MV_CC_CreateHandle(self, stDevInfo):
+        MvCamCtrldll.MV_CC_CreateHandle.argtype = (c_void_p, c_void_p)
+        MvCamCtrldll.MV_CC_CreateHandle.restype = c_uint
+        return MvCamCtrldll.MV_CC_CreateHandle(byref(self.handle), byref(stDevInfo))
+
+
+========================================================================
+MV_CC_OpenDevice
+signature: (self, nAccessMode=1, nSwitchoverKey=0)
+    def MV_CC_OpenDevice(self, nAccessMode=MV_ACCESS_Exclusive, nSwitchoverKey=0):
+        MvCamCtrldll.MV_CC_OpenDevice.argtype = (c_void_p, c_uint32, c_uint16)
+        MvCamCtrldll.MV_CC_OpenDevice.restype = c_uint
+        return MvCamCtrldll.MV_CC_OpenDevice(self.handle, nAccessMode, nSwitchoverKey)
+
+
+========================================================================
+MV_CC_CloseDevice
+signature: (self)
+    def MV_CC_CloseDevice(self):
+        MvCamCtrldll.MV_CC_CloseDevice.argtype = c_void_p
+        MvCamCtrldll.MV_CC_CloseDevice.restype = c_uint
+        return MvCamCtrldll.MV_CC_CloseDevice(self.handle)
+
+
+========================================================================
+MV_CC_DestroyHandle
+signature: (self)
+    def MV_CC_DestroyHandle(self):
+        MvCamCtrldll.MV_CC_DestroyHandle.argtype = c_void_p
+        MvCamCtrldll.MV_CC_DestroyHandle.restype = c_uint
+        return MvCamCtrldll.MV_CC_DestroyHandle(self.handle)
+
+
+========================================================================
+MV_CC_StartGrabbing
+signature: (self)
+    def MV_CC_StartGrabbing(self):
+        MvCamCtrldll.MV_CC_StartGrabbing.argtype = c_void_p
+        MvCamCtrldll.MV_CC_StartGrabbing.restype = c_uint
+        return MvCamCtrldll.MV_CC_StartGrabbing(self.handle)
+
+
+========================================================================
+MV_CC_StopGrabbing
+signature: (self)
+    def MV_CC_StopGrabbing(self):
+        MvCamCtrldll.MV_CC_StopGrabbing.argtype = c_void_p
+        MvCamCtrldll.MV_CC_StopGrabbing.restype = c_uint
+        return MvCamCtrldll.MV_CC_StopGrabbing(self.handle)
+
+
+========================================================================
+MV_CC_GetImageBuffer
+signature: (self, stFrame, nMsec)
+    def MV_CC_GetImageBuffer(self, stFrame, nMsec):
+        MvCamCtrldll.MV_CC_GetImageBuffer.argtype = (c_void_p, c_void_p, c_uint)
+        MvCamCtrldll.MV_CC_GetImageBuffer.restype = c_uint
+        return MvCamCtrldll.MV_CC_GetImageBuffer(self.handle, byref(stFrame), nMsec)
+
+
+========================================================================
+MV_CC_FreeImageBuffer
+signature: (self, stFrame)
+    def MV_CC_FreeImageBuffer(self, stFrame):
+        MvCamCtrldll.MV_CC_FreeImageBuffer.argtype = (c_void_p, c_void_p)
+        MvCamCtrldll.MV_CC_FreeImageBuffer.restype = c_uint
+        return MvCamCtrldll.MV_CC_FreeImageBuffer(self.handle, byref(stFrame))
+
+
+========================================================================
+MV_CC_GetOneFrameTimeout
+signature: (self, pData, nDataSize, stFrameInfo, nMsec=1000)
+    def MV_CC_GetOneFrameTimeout(self, pData, nDataSize, stFrameInfo, nMsec=1000):
+        MvCamCtrldll.MV_CC_GetOneFrameTimeout.argtype = (c_void_p, c_void_p, c_uint, c_void_p, c_uint)
+        MvCamCtrldll.MV_CC_GetOneFrameTimeout.restype = c_uint
+        return MvCamCtrldll.MV_CC_GetOneFrameTimeout(self.handle, pData, nDataSize, byref(stFrameInfo), nMsec)
+
+
+========================================================================
+MV_CC_SetEnumValueByString
+signature: (self, strKey, sValue)
+    def MV_CC_SetEnumValueByString(self, strKey, sValue):
+        MvCamCtrldll.MV_CC_SetEnumValueByString.argtype = (c_void_p, c_void_p, c_void_p)
+        MvCamCtrldll.MV_CC_SetEnumValueByString.restype = c_uint
+        return MvCamCtrldll.MV_CC_SetEnumValueByString(self.handle, strKey.encode('ascii'), sValue.encode('ascii'))
+
+
+========================================================================
+MV_CC_SetIntValue
+signature: (self, strKey, nValue)
+    def MV_CC_SetIntValue(self, strKey, nValue):
+        MvCamCtrldll.MV_CC_SetIntValue.argtype = (c_void_p, c_void_p, c_uint32)
+        MvCamCtrldll.MV_CC_SetIntValue.restype = c_uint
+        # C原型:int MV_CC_SetIntValue(void* handle, char* strKey, unsigned int nValue)
+        return MvCamCtrldll.MV_CC_SetIntValue(self.handle, strKey.encode('ascii'), c_uint32(nValue))
+
+
+========================================================================
+MV_CC_SetFloatValue
+signature: (self, strKey, fValue)
+    def MV_CC_SetFloatValue(self, strKey, fValue):
+        MvCamCtrldll.MV_CC_SetFloatValue.argtype = (c_void_p, c_void_p, c_float)
+        MvCamCtrldll.MV_CC_SetFloatValue.restype = c_uint
+        return MvCamCtrldll.MV_CC_SetFloatValue(self.handle, strKey.encode('ascii'), c_float(fValue))
+
+
+===== FRAME STRUCTURES =====
+
+========================================================================
+MV_FRAME_OUT
+('pBufAddr', <class 'CameraParams_header.LP_c_ubyte'>)
+('stFrameInfo', <class 'CameraParams_header._MV_FRAME_OUT_INFO_EX_'>)
+('nRes', <class 'CameraParams_header.c_uint_Array_16'>)
+
+========================================================================
+MV_FRAME_OUT_INFO_EX
+('nWidth', <class 'ctypes.c_ushort'>)
+('nHeight', <class 'ctypes.c_ushort'>)
+('enPixelType', <class 'ctypes.c_long'>)
+('nFrameNum', <class 'ctypes.c_uint'>)
+('nDevTimeStampHigh', <class 'ctypes.c_uint'>)
+('nDevTimeStampLow', <class 'ctypes.c_uint'>)
+('nReserved0', <class 'ctypes.c_uint'>)
+('nHostTimeStamp', <class 'ctypes.c_long'>)
+('nFrameLen', <class 'ctypes.c_uint'>)
+('nSecondCount', <class 'ctypes.c_uint'>)
+('nCycleCount', <class 'ctypes.c_uint'>)
+('nCycleOffset', <class 'ctypes.c_uint'>)
+('fGain', <class 'ctypes.c_float'>)
+('fExposureTime', <class 'ctypes.c_float'>)
+('nAverageBrightness', <class 'ctypes.c_uint'>)
+('nRed', <class 'ctypes.c_uint'>)
+('nGreen', <class 'ctypes.c_uint'>)
+('nBlue', <class 'ctypes.c_uint'>)
+('nFrameCounter', <class 'ctypes.c_uint'>)
+('nTriggerIndex', <class 'ctypes.c_uint'>)
+('nInput', <class 'ctypes.c_uint'>)
+('nOutput', <class 'ctypes.c_uint'>)
+('nOffsetX', <class 'ctypes.c_ushort'>)
+('nOffsetY', <class 'ctypes.c_ushort'>)
+('nChunkWidth', <class 'ctypes.c_ushort'>)
+('nChunkHeight', <class 'ctypes.c_ushort'>)
+('nLostPacket', <class 'ctypes.c_uint'>)
+('nUnparsedChunkNum', <class 'ctypes.c_uint'>)
+('UnparsedChunkList', <class 'CameraParams_header.N22_MV_FRAME_OUT_INFO_EX_3DOT_1E'>)
+('nExtendWidth', <class 'ctypes.c_uint'>)
+('nExtendHeight', <class 'ctypes.c_uint'>)
+('nFrameLenEx', <class 'ctypes.c_ulong'>)
+('nExtraType', <class 'ctypes.c_uint'>)
+('nSubImageNum', <class 'ctypes.c_uint'>)
+('SubImageList', <class 'CameraParams_header.N22_MV_FRAME_OUT_INFO_EX_3DOT_2E'>)
+('UserPtr', <class 'CameraParams_header.N22_MV_FRAME_OUT_INFO_EX_3DOT_3E'>)
+('nFirstLineEncoderCount', <class 'ctypes.c_uint'>)
+('nLastLineEncoderCount', <class 'ctypes.c_uint'>)
+('nLastFrameFlag', <class 'ctypes.c_uint'>)
+('nReserved', <class 'CameraParams_header.c_uint_Array_23'>)
+
+========================================================================
+MV_CC_DEVICE_INFO
+('nMajorVer', <class 'ctypes.c_ushort'>)
+('nMinorVer', <class 'ctypes.c_ushort'>)
+('nMacAddrHigh', <class 'ctypes.c_uint'>)
+('nMacAddrLow', <class 'ctypes.c_uint'>)
+('nTLayerType', <class 'ctypes.c_uint'>)
+('nDevTypeInfo', <class 'ctypes.c_uint'>)
+('nReserved', <class 'CameraParams_header.c_uint_Array_3'>)
+('SpecialInfo', <class 'CameraParams_header.N19_MV_CC_DEVICE_INFO_3DOT_0E'>)
+
+========================================================================
+MV_CC_DEVICE_INFO_LIST
+('nDeviceNum', <class 'ctypes.c_uint'>)
+('pDeviceInfo', <class 'CameraParams_header.LP__MV_CC_DEVICE_INFO__Array_256'>)
+
+===== ERROR CONSTANTS =====
+MV_E_ABNORMAL_IMAGE = 0x8000000b
+MV_E_ACCESS_DENIED = 0x80000203
+MV_E_BUFOVER = 0x80000002
+MV_E_BUF_INVALID = 0x80000011
+MV_E_BUF_IN_USE = 0x80000010
+MV_E_BUSY = 0x80000204
+MV_E_CALLORDER = 0x80000003
+MV_E_CHANNEL_INDEX = 0x80000024
+MV_E_DEV_ACCESS_DENIED = 0x80000046
+MV_E_DEV_BAD_ALIGNMENT = 0x80000045
+MV_E_DEV_BUSY = 0x80000047
+MV_E_DEV_CRC = 0x8000004d
+MV_E_DEV_DISCONNECT = 0x80000211
+MV_E_DEV_INVALID_ADDRESS = 0x80000043
+MV_E_DEV_INVALID_HEADER = 0x80000049
+MV_E_DEV_INVALID_PARAMETER = 0x80000042
+MV_E_DEV_INVALID_PARAMS = 0x8000004b
+MV_E_DEV_MSG_TIMEOUT = 0x80000048
+MV_E_DEV_NOT_IMPLEMENTED = 0x80000041
+MV_E_DEV_OFFLINE = 0x80000020
+MV_E_DEV_SUPPORT = 0x80000021
+MV_E_DEV_UNKNOWN = 0x8000004a
+MV_E_DEV_WRITE_PROTECT = 0x80000044
+MV_E_DEV_WRONG_CONFIG = 0x8000004c
+MV_E_DRIVERATTACH = 0x80000207
+MV_E_ENCRYPT = 0x8000000e
+MV_E_FILELENGTH = 0x8000001d
+MV_E_GC_ACCESS = 0x80000106
+MV_E_GC_ARGUMENT = 0x80000101
+MV_E_GC_DYNAMICCAST = 0x80000108
+MV_E_GC_FILE = 0x8000010b
+MV_E_GC_GENERIC = 0x80000100
+MV_E_GC_LOGICAL = 0x80000105
+MV_E_GC_NODE_NOT_FOUND = 0x80000109
+MV_E_GC_NODE_VERIFY = 0x8000010a
+MV_E_GC_PROPERTY = 0x80000103
+MV_E_GC_RANGE = 0x80000102
+MV_E_GC_RUNTIME = 0x80000104
+MV_E_GC_TIMEOUT = 0x80000107
+MV_E_GC_UNKNOW = 0x800001ff
+MV_E_GC_URL_DESC = 0x8000010c
+MV_E_HANDLE = 0x80000000
+MV_E_IMAGE_BUFFER_OVERFLOW = 0x80000209
+MV_E_IMAGE_DECODEC = 0x80000015
+MV_E_IMAGE_HEIGHT = 0x80000017
+MV_E_IMAGE_INFO_INVALID = 0x80000027
+MV_E_INTERNAL = 0x800000fe
+MV_E_INVALID_ADDRESS = 0x80000201
+MV_E_IP_CONFLICT = 0x80000221
+MV_E_KEY_VERIFICATION = 0x8000020f
+MV_E_LIQUIDLENS_ACK_DATA_LENGTH_ERROR = 0x80000634
+MV_E_LIQUIDLENS_AF_IMAGE_ABNORMAL = 0x80000633
+MV_E_LIQUIDLENS_AF_IMAGE_LOST = 0x80000639
+MV_E_LIQUIDLENS_AF_NOT_CONVERGED = 0x8000063a
+MV_E_LIQUIDLENS_AF_SHARPNESS_CALC_FAILED = 0x8000063e
+MV_E_LIQUIDLENS_CHECKSUM_ERROR = 0x80000604
+MV_E_LIQUIDLENS_CMD_NOT_SUPPORT = 0x80000601
+MV_E_LIQUIDLENS_COMMANDTIMEOUT = 0x80000631
+MV_E_LIQUIDLENS_DATA_FOAMAT_ERROR = 0x80000606
+MV_E_LIQUIDLENS_DATA_INCORRECT_ORDER = 0x8000060a
+MV_E_LIQUIDLENS_DATA_OUT_RANGE = 0x80000607
+MV_E_LIQUIDLENS_DEVICE_BUSY = 0x80000609
+MV_E_LIQUIDLENS_DEVICE_NOT_GRABBING = 0x80000637
+MV_E_LIQUIDLENS_INIT_FAILED = 0x8000063c
+MV_E_LIQUIDLENS_NOT_SOFT_TRIGGER_MODE = 0x80000636
+MV_E_LIQUIDLENS_OFFLINE = 0x80000632
+MV_E_LIQUIDLENS_PACKET_FORMAT_ERROR = 0x80000605
+MV_E_LIQUIDLENS_PERMISSION_DENIED = 0x80000603
+MV_E_LIQUIDLENS_REGISTER_NOT_EXIST = 0x80000602
+MV_E_LIQUIDLENS_RUN_COND_NOT_MET = 0x8000060b
+MV_E_LIQUIDLENS_SERIAL_PORT_PARAMS_FAIL = 0x8000063b
+MV_E_LIQUIDLENS_STRATEGY_NOT_ONEBYONE = 0x80000638
+MV_E_LIQUIDLENS_TASK_EXECUTING = 0x8000063d
+MV_E_LIQUIDLENS_TRIGGER_MODE_NOT_OPEN = 0x80000635
+MV_E_LIQUIDLENS_UNDEFINED_ERROR = 0x800006ff
+MV_E_LIQUIDLENS_WRITE_DATA_LENGTH_ERROR = 0x80000608
+MV_E_LOAD_LIBRARY = 0x8000000c
+MV_E_MULTICAST_ADD_DEVICE = 0x80000217
+MV_E_MULTICAST_IP_INVALID = 0x80000218
+MV_E_NETER = 0x80000206
+MV_E_NET_TRANSMISSION_TYPE_ERR = 0x8000020d
+MV_E_NOALIGN_BUF = 0x80000012
+MV_E_NODATA = 0x80000007
+MV_E_NOENOUGH_BUF = 0x8000000a
+MV_E_NOENOUGH_BUF_NUM = 0x80000013
+MV_E_NOENOUGH_DDR = 0x80000018
+MV_E_NOENOUGH_INPUT_DATA = 0x80000502
+MV_E_NOENOUGH_STREAM = 0x80000019
+MV_E_NOOUTBUF = 0x8000000d
+MV_E_NORESPONSE = 0x8000001a
+MV_E_NOT_IMPLEMENTED = 0x80000200
+MV_E_NO_BUFFER_FOR_USE = 0x8000020a
+MV_E_OPENFILE = 0x8000000f
+MV_E_PACKET = 0x80000205
+MV_E_PACKET_ID_MISMATCH = 0x80000208
+MV_E_PARAMETER = 0x80000004
+MV_E_PARAMETER_RANGE = 0x80000025
+MV_E_PLATFORM_SUPPORT = 0x80000022
+MV_E_PORT_IN_USE = 0x80000014
+MV_E_PRECONDITION = 0x80000008
+MV_E_READFILE = 0x8000001c
+MV_E_RESOURCE = 0x80000006
+MV_E_RESOURCE_EVENT = 0x8000001e
+MV_E_RESOURCE_IN_USE = 0x80000028
+MV_E_RESOURCE_IO = 0x80000026
+MV_E_RESOURCE_THREAD = 0x8000001f
+MV_E_SERIAL_BUFFER_FULL = 0x80000023
+MV_E_SR_CONTEXT = 0x80000541
+MV_E_SR_D3D_RESOURCE = 0x8000053b
+MV_E_SR_FONT = 0x8000053e
+MV_E_SR_INVALID_COLOR = 0x80000545
+MV_E_SR_INVALID_FLOAT = 0x80000544
+MV_E_SR_INVALID_POINT = 0x80000546
+MV_E_SR_INVALID_RECT = 0x80000543
+MV_E_SR_LOAD_LIBRARY = 0x8000053f
+MV_E_SR_NOT_INITIAL = 0x80000530
+MV_E_SR_OPENGL_RESOURCE = 0x80000540
+MV_E_SR_PORT_USING = 0x8000053a
+MV_E_SR_PRESENT = 0x80000542
+MV_E_SR_RUNTIME = 0x80000547
+MV_E_SR_SHADER = 0x8000053d
+MV_E_SR_SUBPORT = 0x80000539
+MV_E_SR_SUPPORT_EFFECT = 0x80000536
+MV_E_SR_SUPPORT_ENGINE = 0x80000532
+MV_E_SR_SUPPORT_FUNCTION = 0x80000531
+MV_E_SR_SUPPORT_PIXELTYPE = 0x80000533
+MV_E_SR_SUPPORT_STATE = 0x80000538
+MV_E_SR_SUPPORT_TEXTURESIZE = 0x80000534
+MV_E_SR_SUPPORT_VIEWTYPE = 0x80000537
+MV_E_SR_SUPPORT_WND = 0x80000535
+MV_E_SR_SWAPCHAIN = 0x8000053c
+MV_E_SUPPORT = 0x80000001
+MV_E_SUPPORT_IMAGE_TYPE = 0x80000501
+MV_E_SUPPORT_MODIFY_DEVICE_IP = 0x8000020e
+MV_E_SUPPORT_PIXEL_FORMAT = 0x80000500
+MV_E_TIMEOUT = 0x8000020c
+MV_E_UDP_CONNECT = 0x80000215
+MV_E_UDP_INIT = 0x80000212
+MV_E_UDP_RECV_DATA = 0x80000214
+MV_E_UDP_RESET_CONNECT = 0x80000216
+MV_E_UDP_SEND_DATA = 0x80000213
+MV_E_UINT32_LIMIT = 0x80000016
+MV_E_UNKNOW = 0x800000ff
+MV_E_UPG_CONFLICT = 0x80000402
+MV_E_UPG_FILE_MISMATCH = 0x80000400
+MV_E_UPG_INNER_ERR = 0x80000403
+MV_E_UPG_LANGUSGE_MISMATCH = 0x80000401
+MV_E_UPG_UNKNOW = 0x800004ff
+MV_E_USB_BANDWIDTH = 0x80000304
+MV_E_USB_DEVICE = 0x80000302
+MV_E_USB_DRIVER = 0x80000305
+MV_E_USB_GENICAM = 0x80000303
+MV_E_USB_READ = 0x80000300
+MV_E_USB_UNKNOW = 0x800003ff
+MV_E_USB_WRITE = 0x80000301
+MV_E_VALUE_NOT_EXPECTED = 0x80000210
+MV_E_VERSION = 0x80000009
+MV_E_WRITEFILE = 0x8000001b
+MV_E_WRITE_PROTECT = 0x80000202
+MV_E_XML_INFO_PACKET_ERR = 0x8000020b
+
+===== PIXEL CONSTANTS =====
+PixelType_Gvsp_Mono8 = 0x01080001
+PixelType_Gvsp_BayerGR8 = 0x01080008
+PixelType_Gvsp_BayerRG8 = 0x01080009
+PixelType_Gvsp_BayerGB8 = 0x0108000a
+PixelType_Gvsp_BayerBG8 = 0x0108000b
+PixelType_Gvsp_RGB8_Packed = 0x02180014
+PixelType_Gvsp_BGR8_Packed = 0x02180015
