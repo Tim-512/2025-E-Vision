@@ -289,6 +289,47 @@ def test_capture_cleanup_does_not_remove_replacement_directory(
     assert (tmp_path / "captures" / "20260714_010203_456-moved").exists()
 
 
+def test_capture_cleanup_survives_swap_after_identity_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = make_storage(tmp_path)
+    snapshot = make_capture_snapshot()
+    capture_name = "20260714_010203_456"
+    original_write = storage._write_capture_png
+    original_lstat = Path.lstat
+    cleanup_started = False
+    swapped = False
+
+    def fail_second_write(temporary: Path, target: Path, image: object) -> None:
+        nonlocal cleanup_started
+        if target.name == "overlay.png":
+            cleanup_started = True
+            raise OSError("simulated capture failure")
+        original_write(temporary, target, image)
+
+    def swap_after_lstat(path: Path):
+        nonlocal swapped
+        result = original_lstat(path)
+        if cleanup_started and not swapped and path.name == capture_name:
+            swapped = True
+            moved = path.with_name(f"{capture_name}-moved")
+            path.rename(moved)
+            path.mkdir()
+            (path / "sentinel.txt").write_text("do not delete", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(storage, "_write_capture_png", fail_second_write)
+    monkeypatch.setattr(Path, "lstat", swap_after_lstat)
+
+    with pytest.raises(OSError, match="simulated capture failure"):
+        storage.save_capture(snapshot, snapshot.frame.image)
+
+    replacement = tmp_path / "captures" / capture_name
+    assert swapped
+    assert (replacement / "sentinel.txt").read_text(encoding="utf-8") == "do not delete"
+    assert (tmp_path / "captures" / f"{capture_name}-moved").exists()
+
+
 def test_capture_wraps_non_opencv_encoding_exceptions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

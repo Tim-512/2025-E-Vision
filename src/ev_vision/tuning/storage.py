@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 import os
 from pathlib import Path
 import re
-import shutil
 import stat
 from typing import Any, IO
 from uuid import uuid4
@@ -590,10 +589,61 @@ def _unlink_if_regular_file(path: Path) -> None:
 def _remove_directory_if_identity_matches(
     path: Path, expected: _PathIdentity
 ) -> bool:
+    """Best-effort cleanup without recursively deleting a public path."""
+    known_files = (
+        "original.tmp.png",
+        "original.png",
+        "overlay.tmp.png",
+        "overlay.png",
+        "metadata.yaml",
+    )
     try:
         current = path.lstat()
-    except FileNotFoundError:
+    except OSError:
         return False
+    if (
+        not expected.same_object(current)
+        or _is_link_or_reparse(current)
+        or not stat.S_ISDIR(current.st_mode)
+    ):
+        return False
+
+    if os.name == "posix":
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            directory_fd = os.open(path, flags)
+        except OSError:
+            return False
+        try:
+            if _PathIdentity.from_stat(os.fstat(directory_fd)) != expected:
+                return False
+            for name in known_files:
+                try:
+                    os.unlink(name, dir_fd=directory_fd)
+                except OSError:
+                    pass
+        finally:
+            os.close(directory_fd)
+    else:
+        for name in known_files:
+            try:
+                current = path.lstat()
+            except OSError:
+                return False
+            if (
+                not expected.same_object(current)
+                or _is_link_or_reparse(current)
+                or not stat.S_ISDIR(current.st_mode)
+            ):
+                return False
+            _unlink_if_regular_file(path / name)
+
+    try:
+        current = path.lstat()
     except OSError:
         return False
     if (
@@ -603,7 +653,7 @@ def _remove_directory_if_identity_matches(
     ):
         return False
     try:
-        shutil.rmtree(path)
+        path.rmdir()
     except OSError:
         return False
     return True
