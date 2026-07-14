@@ -1,4 +1,4 @@
-"""Immutable domain models for the camera tuning dashboard."""
+"""Public camera-tuning service and immutable domain models."""
 
 from .models import (
     CameraIdentity,
@@ -10,14 +10,18 @@ from .models import (
     ParameterBounds,
     RuntimeSnapshot,
 )
+from .service import CameraTuningService, ParameterApplyError, TuningService
 
 __all__ = [
     "CameraIdentity",
+    "CameraTuningService",
     "CaptureSnapshot",
     "DetectionSnapshot",
     "EditableCameraParameters",
     "ImageDiagnostics",
     "OverlayOptions",
+    "ParameterApplyError",
     "ParameterBounds",
     "RuntimeSnapshot",
+    "TuningService",
 ]
