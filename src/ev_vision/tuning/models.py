@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 import math
-from typing import Any
 
 from ev_vision.config import CameraConfig
 from ev_vision.models import BoardObservation, Frame
@@ -72,10 +71,21 @@ class ParameterBounds:
             ),
         )
         for name, value, minimum, maximum in ranges:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"{name} must be an int or float")
             if not math.isfinite(value):
                 raise ValueError(f"{name} must be finite")
             if not minimum <= value <= maximum:
                 raise ValueError(f"{name} must be within [{minimum}, {maximum}]")
+
+        boolean_fields = (
+            ("auto_exposure", parameters.auto_exposure),
+            ("auto_gain", parameters.auto_gain),
+            ("auto_white_balance", parameters.auto_white_balance),
+        )
+        for name, value in boolean_fields:
+            if not isinstance(value, bool):
+                raise ValueError(f"{name} must be a bool")
         return parameters
 
 
@@ -129,6 +139,12 @@ class RuntimeSnapshot:
 
 
 @dataclass(frozen=True)
+class CameraIdentity:
+    model: str
+    serial: str
+
+
+@dataclass(frozen=True)
 class CaptureSnapshot:
     frame: Frame
     parameters: EditableCameraParameters
@@ -137,4 +153,4 @@ class CaptureSnapshot:
     detection: DetectionSnapshot
     overlay_options: OverlayOptions
     camera_config: CameraConfig
-    camera_identity: dict[str, Any] | None = None
+    camera_identity: CameraIdentity

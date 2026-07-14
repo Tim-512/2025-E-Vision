@@ -1,13 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError, fields, replace
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
-import tomli as tomllib
+from typing import get_type_hints
+
+try:
+    import tomllib
+except ImportError:  # pragma: no cover - exercised on Python 3.10
+    import tomli as tomllib
 
 import pytest
 
 from ev_vision.config import CameraConfig
 from ev_vision.models import BoardObservation, Frame
+from ev_vision.tuning import CameraIdentity
 from ev_vision.tuning.models import (
     CaptureSnapshot,
     DetectionSnapshot,
@@ -24,6 +30,7 @@ def test_tuning_dependencies_and_static_package_data_are_declared() -> None:
 
     optional = project["project"]["optional-dependencies"]
     assert "httpx>=0.27" in optional["dev"]
+    assert "tomli>=2.0; python_version < '3.11'" in optional["dev"]
     assert optional["tuning"] == ["fastapi>=0.110", "uvicorn>=0.27"]
     assert project["tool"]["setuptools"]["package-data"]["ev_vision.web"] == [
         "static/*"
@@ -97,19 +104,50 @@ def test_parameter_bounds_reject_non_finite_and_out_of_range_values(
         ParameterBounds().validate(candidate)
 
 
-def test_parameter_bounds_accept_inclusive_defaults() -> None:
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("exposure_us", "800"),
+        ("gain_db", None),
+        ("acquisition_fps", True),
+    ],
+)
+def test_parameter_bounds_reject_invalid_numeric_runtime_types(
+    field_name: str, value: object
+) -> None:
+    candidate = replace(
+        EditableCameraParameters.from_camera_config(CameraConfig()),
+        **{field_name: value},
+    )
+
+    with pytest.raises(ValueError, match=field_name):
+        ParameterBounds().validate(candidate)
+
+
+def test_parameter_bounds_reject_non_boolean_auto_fields() -> None:
+    candidate = replace(
+        EditableCameraParameters.from_camera_config(CameraConfig()),
+        auto_exposure="false",
+    )
+
+    with pytest.raises(ValueError, match="auto_exposure"):
+        ParameterBounds().validate(candidate)
+
+
+def test_parameter_bounds_accept_inclusive_defaults_and_integer_values() -> None:
     bounds = ParameterBounds()
-    low = EditableCameraParameters(20.0, 0.0, 1.0, False, False, False)
-    high = EditableCameraParameters(1_000_000.0, 24.0, 120.0, True, True, True)
+    low = EditableCameraParameters(20, 0, 1, False, False, False)
+    high = EditableCameraParameters(1_000_000, 24, 120, True, True, True)
 
     assert bounds.validate(low) is low
     assert bounds.validate(high) is high
 
 
-def test_snapshot_models_are_frozen_and_reference_existing_domain_types() -> None:
+def test_snapshot_models_are_frozen_and_reference_exact_domain_types() -> None:
     model_types = (
         EditableCameraParameters,
         ParameterBounds,
+        CameraIdentity,
         ImageDiagnostics,
         DetectionSnapshot,
         OverlayOptions,
@@ -118,22 +156,16 @@ def test_snapshot_models_are_frozen_and_reference_existing_domain_types() -> Non
     )
     assert all(model.__dataclass_params__.frozen for model in model_types)
 
-    capture_field_types = {field.name: field.type for field in fields(CaptureSnapshot)}
-    detection_field_types = {field.name: field.type for field in fields(DetectionSnapshot)}
-    assert "Frame" in str(capture_field_types["frame"])
-    assert "BoardObservation" in str(detection_field_types["observation"])
+    capture_hints = get_type_hints(CaptureSnapshot)
+    detection_hints = get_type_hints(DetectionSnapshot)
+    assert capture_hints["frame"] is Frame
+    assert capture_hints["camera_identity"] is CameraIdentity
+    assert detection_hints["observation"] == BoardObservation | None
 
     options = OverlayOptions()
     with pytest.raises(FrozenInstanceError):
         options.show_corners = False
 
-    frame = Frame(sequence=1, captured_ns=2, image=None)
-    observation = BoardObservation(
-        captured_ns=2,
-        corners_px=((0.0, 0.0),) * 4,
-        center_px=(0.0, 0.0),
-        confidence=1.0,
-        homography_valid=True,
-    )
-    assert frame.sequence == 1
-    assert observation.homography_valid is True
+    identity = CameraIdentity(model="MV-CA013-21UC", serial="00G02809155")
+    with pytest.raises(FrozenInstanceError):
+        identity.serial = "changed"
