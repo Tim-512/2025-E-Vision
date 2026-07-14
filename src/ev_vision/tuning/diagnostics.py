@@ -81,8 +81,8 @@ def _valid_observation(
     if observation is None:
         return None
     try:
-        corners = np.asarray(observation.corners_px, dtype=np.float64)
-        center = np.asarray(observation.center_px, dtype=np.float64)
+        corners = np.array(observation.corners_px, dtype=np.float64, copy=True)
+        center = np.array(observation.center_px, dtype=np.float64, copy=True)
     except (TypeError, ValueError, OverflowError):
         return None
     if corners.shape != (4, 2) or center.shape != (2,):
@@ -94,10 +94,36 @@ def _valid_observation(
     if np.abs(corners).max() > safe_limit or np.abs(center).max() > safe_limit:
         return None
 
+    x_coordinates = corners[:, 0]
+    y_coordinates = corners[:, 1]
+    area = 0.5 * abs(
+        np.dot(x_coordinates, np.roll(y_coordinates, -1))
+        - np.dot(y_coordinates, np.roll(x_coordinates, -1))
+    )
+    minimum_area = max(1.0, image_width * image_height * 1e-6)
+    contour = corners.astype(np.float32)
+    if area < minimum_area or not cv2.isContourConvex(contour):
+        return None
+
+    image_bounds = np.array(
+        [
+            [0.0, 0.0],
+            [image_width - 1.0, 0.0],
+            [image_width - 1.0, image_height - 1.0],
+            [0.0, image_height - 1.0],
+        ],
+        dtype=np.float32,
+    )
+    try:
+        intersection_area, _ = cv2.intersectConvexConvex(contour, image_bounds)
+    except cv2.error:
+        return None
+    if intersection_area <= 0.0:
+        return None
+
     corners[:, 0] = np.clip(corners[:, 0], 0, image_width - 1)
     corners[:, 1] = np.clip(corners[:, 1], 0, image_height - 1)
-    center[0] = np.clip(center[0], 0, image_width - 1)
-    center[1] = np.clip(center[1], 0, image_height - 1)
+    center = np.clip(center, (0, 0), (image_width - 1, image_height - 1))
     return np.rint(corners).astype(np.int32), (
         int(round(float(center[0]))),
         int(round(float(center[1]))),

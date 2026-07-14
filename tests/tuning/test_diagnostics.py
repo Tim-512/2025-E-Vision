@@ -205,6 +205,117 @@ def test_render_overlay_skips_invalid_observation_geometry_and_reports_not_detec
     assert np.array_equal(output, image)
 
 
+def test_render_overlay_accepts_read_only_float64_observation_arrays() -> None:
+    image = np.zeros((20, 20, 3), dtype=np.uint8)
+    corners = np.array(
+        [[-2.0, 2.0], [17.0, 2.0], [17.0, 17.0], [2.0, 17.0]],
+        dtype=np.float64,
+    )
+    center = np.array([9.5, 9.5], dtype=np.float64)
+    corners.setflags(write=False)
+    center.setflags(write=False)
+    observation = BoardObservation(
+        captured_ns=123,
+        corners_px=corners,
+        center_px=center,
+        confidence=0.9,
+        homography_valid=True,
+    )
+
+    output = render_overlay(
+        image,
+        source_sequence=7,
+        detection=replace(detection_snapshot(), observation=observation),
+        options=geometry_only_options(),
+    )
+
+    assert np.any(output != image)
+    assert not corners.flags.writeable
+    assert not center.flags.writeable
+    assert corners[0, 0] == -2.0
+
+
+@pytest.mark.parametrize(
+    "corners",
+    [
+        ((2.0, 2.0), (17.0, 2.0), (17.0, 2.0), (2.0, 17.0)),
+        ((2.0, 2.0), (7.0, 7.0), (12.0, 12.0), (17.0, 17.0)),
+        ((2.0, 2.0), (17.0, 2.0), (17.0, 2.000001), (2.0, 2.000001)),
+    ],
+    ids=("duplicate-point", "collinear", "near-zero-area"),
+)
+def test_render_overlay_rejects_degenerate_quadrilateral(
+    monkeypatch: pytest.MonkeyPatch,
+    corners: tuple[tuple[float, float], ...],
+) -> None:
+    image = np.zeros((20, 20, 3), dtype=np.uint8)
+    drawn_text: list[str] = []
+
+    def record_text(*args, **kwargs):
+        drawn_text.append(args[1])
+        return args[0]
+
+    monkeypatch.setattr(cv2, "putText", record_text)
+    observation = replace(detection_snapshot().observation, corners_px=corners)
+    options = replace(geometry_only_options(), show_detection_text=True)
+
+    output = render_overlay(
+        image,
+        source_sequence=7,
+        detection=replace(detection_snapshot(), observation=observation),
+        options=options,
+    )
+
+    assert drawn_text == ["not-detected"]
+    assert np.array_equal(output, image)
+
+
+def test_render_overlay_rejects_quadrilateral_fully_outside_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = np.zeros((20, 20, 3), dtype=np.uint8)
+    drawn_text: list[str] = []
+
+    def record_text(*args, **kwargs):
+        drawn_text.append(args[1])
+        return args[0]
+
+    monkeypatch.setattr(cv2, "putText", record_text)
+    observation = replace(
+        detection_snapshot().observation,
+        corners_px=((-10.0, 2.0), (-2.0, 2.0), (-2.0, 17.0), (-10.0, 17.0)),
+        center_px=(-6.0, 9.5),
+    )
+    options = replace(geometry_only_options(), show_detection_text=True)
+
+    output = render_overlay(
+        image,
+        source_sequence=7,
+        detection=replace(detection_snapshot(), observation=observation),
+        options=options,
+    )
+
+    assert drawn_text == ["not-detected"]
+    assert np.array_equal(output, image)
+
+
+def test_render_overlay_allows_partially_outside_quadrilateral_with_image_intersection() -> None:
+    image = np.zeros((20, 20, 3), dtype=np.uint8)
+    observation = replace(
+        detection_snapshot().observation,
+        corners_px=((-2.0, 2.0), (17.0, 2.0), (17.0, 17.0), (-2.0, 17.0)),
+        center_px=(7.5, 9.5),
+    )
+
+    output = render_overlay(
+        image,
+        source_sequence=7,
+        detection=replace(detection_snapshot(), observation=observation),
+        options=geometry_only_options(),
+    )
+
+    assert np.any(output != image)
+
 def test_render_overlay_error_takes_priority_and_suppresses_geometry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
