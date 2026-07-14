@@ -234,6 +234,7 @@ class CameraTuningService:
                         error=None,
                         mutation_generation=mutation_generation,
                     )
+                    self._raise_if_mutation_cancelled(mutation_generation)
                 except BaseException as exc:
                     if not isinstance(exc, _MutationCancelled):
                         with self._lock:
@@ -430,6 +431,7 @@ class CameraTuningService:
                         apply_error=apply_error,
                     ) from apply_error
 
+                installed = False
                 try:
                     self._install_session(
                         camera,
@@ -438,8 +440,11 @@ class CameraTuningService:
                         error=None,
                         mutation_generation=mutation_generation,
                     )
+                    installed = True
+                    self._raise_if_mutation_cancelled(mutation_generation)
                 except _MutationCancelled as cancelled:
-                    self._close_uninstalled_camera(camera, cancelled)
+                    if not installed:
+                        self._close_uninstalled_camera(camera, cancelled)
                     error = RuntimeError("camera apply was cancelled by shutdown")
                     raise ParameterApplyError(
                         f"apply failed: {error}", apply_error=error
@@ -715,7 +720,22 @@ class CameraTuningService:
             requested = self._shutdown_requested
         if not requested:
             return
-        self._stop_analysis_workers(timeout_s=self._shutdown_timeout_s)
+
+        deadline = time.monotonic() + self._shutdown_timeout_s
+        acquisition_stopped = self._stop_acquisition(
+            "camera acquisition did not stop before shutdown timeout",
+            timeout_s=self._remaining(deadline),
+        )
+        self._stop_analysis_workers(timeout_s=self._remaining(deadline))
+        if not acquisition_stopped:
+            return
+
+        close_completed, close_error = self._close_camera(
+            deadline=deadline,
+            pending_error="camera close cleanup is still in progress",
+        )
+        if not close_completed or close_error is not None:
+            return
         with self._lock:
             if self._shutdown_cleanup_complete_locked():
                 self._state = "Stopped"
@@ -949,13 +969,19 @@ class CameraTuningService:
                         computed_ns=self._clock_ns(),
                     )
                 except BaseException as exc:
-                    self._record_analysis_error("diagnostics", exc, key[0])
+                    self._record_analysis_error("diagnostics", exc, key)
                 else:
                     now_ns = self._clock_ns()
                     with self._lock:
-                        if self._session_active and key[0] == self._session_generation:
+                        if self._diagnostics_key_is_current_locked(key):
                             self._latest_diagnostics = result
                             self._diagnostics_rate.record(now_ns)
+                            if (
+                                self._state == "Connected"
+                                and self._last_error is not None
+                                and self._last_error.startswith("diagnostics failed:")
+                            ):
+                                self._last_error = None
                             last_key = key
             elapsed_s = (self._clock_ns() - started_ns) / 1_000_000_000.0
             if stop_event.is_set():
@@ -1078,6 +1104,14 @@ class CameraTuningService:
             else:
                 wakeup.condition.wait_for(stop_event.is_set, timeout_s)
 
+    def _diagnostics_key_is_current_locked(self, key: tuple[int, int]) -> bool:
+        return (
+            self._session_active
+            and self._latest_frame is not None
+            and key[0] == self._session_generation
+            and key[1] == self._latest_frame.sequence
+        )
+
     def _detection_key_is_current_locked(self, key: tuple[int, int, int]) -> bool:
         return (
             self._session_active
@@ -1148,10 +1182,10 @@ class CameraTuningService:
             self._last_error = None
 
     def _record_analysis_error(
-        self, worker: str, error: BaseException, generation: int
+        self, worker: str, error: BaseException, key: tuple[int, int]
     ) -> None:
         with self._lock:
-            if generation == self._session_generation:
+            if worker == "diagnostics" and self._diagnostics_key_is_current_locked(key):
                 self._last_error = f"{worker} failed: {error}"
 
     def _runtime_snapshot_locked(self, now_ns: int) -> RuntimeSnapshot:

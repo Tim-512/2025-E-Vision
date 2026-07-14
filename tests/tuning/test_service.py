@@ -204,6 +204,51 @@ def test_detector_error_is_reported_without_stopping_acquisition() -> None:
         service.stop()
 
 
+def test_stale_diagnostics_failure_does_not_pollute_newer_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ev_vision.tuning.service as service_module
+
+    first_started = threading.Event()
+    release_first = threading.Event()
+    calls: list[int] = []
+    real_compute = service_module.compute_diagnostics
+
+    def controlled_compute(image, *, source_sequence, computed_ns):
+        calls.append(source_sequence)
+        if source_sequence == 1:
+            first_started.set()
+            assert release_first.wait(1.0)
+            raise RuntimeError("old diagnostics boom")
+        return real_compute(
+            image,
+            source_sequence=source_sequence,
+            computed_ns=computed_ns,
+        )
+
+    monkeypatch.setattr(service_module, "compute_diagnostics", controlled_compute)
+    camera = FakeCamera([frame(1)])
+    service = make_service(FakeFactory([camera]), diagnostics_fps=100.0)
+    service.start()
+    try:
+        assert first_started.wait(0.5)
+        with camera._lock:
+            camera.items.append(frame(2))
+        wait_until(
+            lambda: service.latest_frame() is not None
+            and service.latest_frame().sequence == 2
+        )
+        release_first.set()
+        wait_until(
+            lambda: service.latest_diagnostics() is not None
+            and service.latest_diagnostics().source_sequence == 2
+        )
+        assert calls[:2] == [1, 2]
+        assert service.runtime_snapshot().last_error is None
+    finally:
+        release_first.set()
+        service.stop()
+
 
 def test_slow_detection_does_not_block_diagnostics_or_acquisition() -> None:
     class SlowDetector(FakeDetector):
@@ -451,6 +496,160 @@ def test_stop_is_bounded_and_cancels_apply_blocked_in_candidate_open() -> None:
     try:
         assert service.latest_frame() is not None
         assert service.latest_frame().sequence == 30
+    finally:
+        service.stop()
+    assert replacement.close_count == 1
+
+
+def test_start_installed_before_stop_timeout_finishes_shutdown_without_second_stop() -> None:
+    installed = FakeCamera([frame(10)])
+    replacement = FakeCamera([frame(20)])
+    factory = FakeFactory([installed, replacement])
+    service = CameraTuningService(
+        camera_factory=factory,
+        base_config=config(),
+        read_timeout_ms=2,
+        confirm_timeout_s=0.05,
+        diagnostics_fps=100.0,
+        detection_fps=100.0,
+        shutdown_timeout_s=0.03,
+        disconnect_timeout_threshold=1000,
+    )
+    entered_after_install = threading.Event()
+    release_install = threading.Event()
+    original_install = service._install_session
+
+    def gated_install(
+        camera, confirming_frame, *, parameters, error, mutation_generation
+    ):
+        result = original_install(
+            camera,
+            confirming_frame,
+            parameters=parameters,
+            error=error,
+            mutation_generation=mutation_generation,
+        )
+        entered_after_install.set()
+        assert release_install.wait(1.0)
+        return result
+
+    service._install_session = gated_install  # type: ignore[method-assign]
+    start_errors: list[BaseException] = []
+
+    def start() -> None:
+        try:
+            service.start()
+        except BaseException as exc:
+            start_errors.append(exc)
+
+    start_thread = threading.Thread(target=start, daemon=True)
+    start_thread.start()
+    assert entered_after_install.wait(0.5)
+
+    started = time.monotonic()
+    service.stop()
+    assert time.monotonic() - started < 0.12
+    assert service.runtime_snapshot().state == "Disconnected"
+
+    release_install.set()
+    start_thread.join(1.0)
+    assert not start_thread.is_alive()
+    assert len(start_errors) == 1
+    assert isinstance(start_errors[0], RuntimeError)
+    assert "shutdown" in str(start_errors[0])
+    wait_until(
+        lambda: service._camera is None
+        and service._acquisition_thread is None
+        and service._diagnostics_thread is None
+        and service._detection_thread is None
+        and service.runtime_snapshot().state == "Stopped",
+        timeout_s=1.0,
+    )
+    assert installed.close_count == 1
+
+    service.start()
+    try:
+        assert service.latest_frame() is not None
+        assert service.latest_frame().sequence == 20
+    finally:
+        service.stop()
+    assert replacement.close_count == 1
+
+
+def test_apply_installed_before_stop_timeout_finishes_shutdown_without_second_stop() -> None:
+    original = FakeCamera([frame(1)])
+    candidate_camera = FakeCamera([frame(10)])
+    replacement = FakeCamera([frame(20)])
+    factory = FakeFactory([original, candidate_camera, replacement])
+    service = CameraTuningService(
+        camera_factory=factory,
+        base_config=config(),
+        read_timeout_ms=2,
+        confirm_timeout_s=0.05,
+        diagnostics_fps=100.0,
+        detection_fps=100.0,
+        shutdown_timeout_s=0.03,
+        disconnect_timeout_threshold=1000,
+    )
+    service.start()
+    entered_after_install = threading.Event()
+    release_install = threading.Event()
+    original_install = service._install_session
+
+    def gated_install(
+        camera, confirming_frame, *, parameters, error, mutation_generation
+    ):
+        result = original_install(
+            camera,
+            confirming_frame,
+            parameters=parameters,
+            error=error,
+            mutation_generation=mutation_generation,
+        )
+        if camera is candidate_camera:
+            entered_after_install.set()
+            assert release_install.wait(1.0)
+        return result
+
+    service._install_session = gated_install  # type: ignore[method-assign]
+    apply_errors: list[BaseException] = []
+
+    def apply() -> None:
+        try:
+            service.apply_parameters(parameters(exposure_us=1700.0))
+        except BaseException as exc:
+            apply_errors.append(exc)
+
+    apply_thread = threading.Thread(target=apply, daemon=True)
+    apply_thread.start()
+    assert entered_after_install.wait(0.5)
+
+    started = time.monotonic()
+    service.stop()
+    assert time.monotonic() - started < 0.12
+    assert service.runtime_snapshot().state == "Disconnected"
+
+    release_install.set()
+    apply_thread.join(1.0)
+    assert not apply_thread.is_alive()
+    assert len(apply_errors) == 1
+    assert isinstance(apply_errors[0], ParameterApplyError)
+    assert "shutdown" in str(apply_errors[0])
+    wait_until(
+        lambda: service._camera is None
+        and service._acquisition_thread is None
+        and service._diagnostics_thread is None
+        and service._detection_thread is None
+        and service.runtime_snapshot().state == "Stopped",
+        timeout_s=1.0,
+    )
+    assert original.close_count == 1
+    assert candidate_camera.close_count == 1
+
+    service.start()
+    try:
+        assert service.latest_frame() is not None
+        assert service.latest_frame().sequence == 20
     finally:
         service.stop()
     assert replacement.close_count == 1
