@@ -1,4 +1,4 @@
-﻿# Local assistant/session caches
+# Local assistant/session caches
 .superpowers/
 
 # Generated PDF intermediates
@@ -17,6 +17,7 @@ venv/
 build/
 dist/
 runs/
+artifacts/
 *.engine
 *.onnx
 
@@ -25,12 +26,9 @@ runs/
 .idea/
 .DS_Store
 Thumbs.db
-<<<<<<< HEAD
 
 # Isolated development worktrees
 .worktrees/
 
 # Python package metadata
 *.egg-info/
-=======
->>>>>>> origin/main
