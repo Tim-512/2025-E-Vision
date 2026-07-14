@@ -632,18 +632,7 @@ def _remove_directory_if_identity_matches(
         finally:
             os.close(directory_fd)
     else:
-        for name in known_files:
-            try:
-                current = path.lstat()
-            except OSError:
-                return False
-            if (
-                not expected.same_object(current)
-                or _is_link_or_reparse(current)
-                or not stat.S_ISDIR(current.st_mode)
-            ):
-                return False
-            _unlink_if_regular_file(path / name)
+        return False
 
     return True
 

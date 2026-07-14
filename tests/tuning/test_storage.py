@@ -370,6 +370,7 @@ def test_capture_cleanup_survives_swap_after_identity_validation(
     assert (tmp_path / "captures" / f"{capture_name}-moved").exists()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX cleanup uses a verified dir_fd")
 def test_capture_cleanup_never_removes_public_directory_after_validation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -523,6 +524,69 @@ def test_capture_directories_are_unique_for_same_millisecond(tmp_path: Path) -> 
     ]
 
 
+@pytest.mark.skipif(os.name == "posix", reason="Windows fallback behavior")
+def test_capture_failure_preserves_all_partial_files_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = make_storage(tmp_path)
+    snapshot = make_capture_snapshot()
+    original_write = storage._write_capture_png
+
+    def fail_second_write(temporary: Path, target: Path, image: object) -> None:
+        if target.name == "overlay.png":
+            temporary.write_bytes(b"partial overlay")
+            raise OSError("simulated capture failure")
+        original_write(temporary, target, image)
+
+    monkeypatch.setattr(storage, "_write_capture_png", fail_second_write)
+
+    with pytest.raises(OSError, match="simulated capture failure"):
+        storage.save_capture(snapshot, snapshot.frame.image)
+
+    partial = tmp_path / "captures" / "20260714_010203_456"
+    assert (partial / "original.png").is_file()
+    assert (partial / "overlay.tmp.png").read_bytes() == b"partial overlay"
+
+
+@pytest.mark.skipif(os.name == "posix", reason="Windows fallback behavior")
+def test_capture_cleanup_does_not_unlink_swapped_known_file_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = make_storage(tmp_path)
+    snapshot = make_capture_snapshot()
+    original_write = storage._write_capture_png
+    cleanup_started = False
+    swapped = False
+    original_unlink = Path.unlink
+
+    def fail_second_write(temporary: Path, target: Path, image: object) -> None:
+        nonlocal cleanup_started
+        if target.name == "overlay.png":
+            cleanup_started = True
+            raise OSError("simulated capture failure")
+        original_write(temporary, target, image)
+
+    def swap_before_known_file_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        nonlocal swapped
+        if cleanup_started and not swapped and path.name == "original.png":
+            swapped = True
+            path.replace(path.with_name("original-created.png"))
+            path.write_bytes(b"replacement")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(storage, "_write_capture_png", fail_second_write)
+    monkeypatch.setattr(Path, "unlink", swap_before_known_file_unlink)
+
+    with pytest.raises(OSError, match="simulated capture failure"):
+        storage.save_capture(snapshot, snapshot.frame.image)
+
+    partial = tmp_path / "captures" / "20260714_010203_456"
+    assert not swapped
+    assert (partial / "original.png").is_file()
+    assert not (partial / "original-created.png").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX cleanup uses a verified dir_fd")
 def test_capture_cleans_partial_directory_when_opencv_write_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
