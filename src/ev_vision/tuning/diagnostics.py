@@ -3,6 +3,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
+from ev_vision.models import BoardObservation
 from ev_vision.tuning.models import (
     DetectionSnapshot,
     ImageDiagnostics,
@@ -16,6 +17,18 @@ _CENTER_COLOR = (0, 200, 0)
 _GUIDE_COLOR = (255, 255, 0)
 _TEXT_COLOR = (255, 255, 255)
 _ERROR_COLOR = (0, 0, 255)
+
+
+def _validate_bgr_image(image: np.ndarray) -> None:
+    if (
+        not isinstance(image, np.ndarray)
+        or image.dtype != np.uint8
+        or image.ndim != 3
+        or image.shape[2] != 3
+        or image.shape[0] == 0
+        or image.shape[1] == 0
+    ):
+        raise ValueError("image must be a non-empty uint8 HxWx3 BGR array")
 
 
 def _center_roi(width: int, height: int) -> tuple[int, int, int, int]:
@@ -39,6 +52,7 @@ def compute_diagnostics(
     source_sequence: int,
     computed_ns: int,
 ) -> ImageDiagnostics:
+    _validate_bgr_image(image)
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blue, green, red = cv2.split(image)
     x, y, width, height = _center_roi(image.shape[1], image.shape[0])
@@ -58,8 +72,36 @@ def compute_diagnostics(
     )
 
 
-def _point(point: tuple[float, float]) -> tuple[int, int]:
-    return int(round(point[0])), int(round(point[1]))
+def _valid_observation(
+    observation: BoardObservation | None,
+    *,
+    image_width: int,
+    image_height: int,
+) -> tuple[np.ndarray, tuple[int, int]] | None:
+    if observation is None:
+        return None
+    try:
+        corners = np.asarray(observation.corners_px, dtype=np.float64)
+        center = np.asarray(observation.center_px, dtype=np.float64)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if corners.shape != (4, 2) or center.shape != (2,):
+        return None
+    if not np.isfinite(corners).all() or not np.isfinite(center).all():
+        return None
+
+    safe_limit = float(max(image_width, image_height) * 4)
+    if np.abs(corners).max() > safe_limit or np.abs(center).max() > safe_limit:
+        return None
+
+    corners[:, 0] = np.clip(corners[:, 0], 0, image_width - 1)
+    corners[:, 1] = np.clip(corners[:, 1], 0, image_height - 1)
+    center[0] = np.clip(center[0], 0, image_width - 1)
+    center[1] = np.clip(center[1], 0, image_height - 1)
+    return np.rint(corners).astype(np.int32), (
+        int(round(float(center[0]))),
+        int(round(float(center[1]))),
+    )
 
 
 def render_overlay(
@@ -69,6 +111,7 @@ def render_overlay(
     detection: DetectionSnapshot,
     options: OverlayOptions = OverlayOptions(),
 ) -> np.ndarray:
+    _validate_bgr_image(image)
     output = image.copy()
     if not options.enabled:
         return output
@@ -95,22 +138,31 @@ def render_overlay(
             cv2.LINE_AA,
         )
 
-    observation = detection.observation
-    geometry_is_current = (
-        detection.enabled
+    geometry_is_compatible = (
+        detection.error is None
+        and detection.enabled
         and detection.detected
-        and observation is not None
         and detection.source_sequence == source_sequence
     )
+    geometry = (
+        _valid_observation(
+            detection.observation,
+            image_width=width,
+            image_height=height,
+        )
+        if geometry_is_compatible
+        else None
+    )
+    geometry_is_current = geometry is not None
     if geometry_is_current:
-        corners = np.rint(np.asarray(observation.corners_px, dtype=np.float32)).astype(np.int32)
+        corners, center = geometry
         if options.show_board_outline:
             cv2.polylines(output, [corners], True, _OUTLINE_COLOR, 2, cv2.LINE_AA)
         if options.show_corners:
             for corner in corners:
                 cv2.circle(output, tuple(int(value) for value in corner), 4, _CORNER_COLOR, -1, cv2.LINE_AA)
         if options.show_center:
-            cv2.circle(output, _point(observation.center_px), 5, _CENTER_COLOR, -1, cv2.LINE_AA)
+            cv2.circle(output, center, 5, _CENTER_COLOR, -1, cv2.LINE_AA)
 
     if options.show_detection_text:
         if detection.error is not None:
