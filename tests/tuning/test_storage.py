@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+import errno
 import os
 from pathlib import Path
 from typing import Callable
@@ -142,6 +143,7 @@ def test_profile_name_rejects_unsafe_or_invalid_slugs(tmp_path: Path, name: str)
     ("change", "message"),
     [
         (lambda payload: payload.update(schema_version=2), "schema_version"),
+        (lambda payload: payload.update(schema_version=True), "schema_version"),
         (lambda payload: payload.update(unexpected=True), "profile keys"),
         (lambda payload: payload["parameters"].pop("gain_db"), "parameter keys"),
         (lambda payload: payload["parameters"].update(extra=1), "parameter keys"),
@@ -161,6 +163,57 @@ def test_profile_load_validates_schema_exact_keys_types_and_bounds(
 
     with pytest.raises(ValueError, match=message):
         storage.load_profile("invalid")
+
+
+@pytest.mark.parametrize("operation", ["save", "load", "delete"])
+def test_profile_operations_reject_target_swapped_after_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    storage = make_storage(tmp_path)
+    storage.save_profile("race", PARAMETERS, display_name="before")
+    target = tmp_path / "profiles" / "race.yaml"
+    moved = tmp_path / "profiles" / "race-old.yaml"
+    sentinel = target / "sentinel.txt"
+    original_hook = storage._profile_operation_hook
+    swapped = False
+
+    def swap_target(stage: str, path: Path) -> None:
+        nonlocal swapped
+        original_hook(stage, path)
+        if stage == {
+            "save": "save:before-replace",
+            "load": "load:before-open",
+            "delete": "delete:before-unlink",
+        }[operation] and not swapped:
+            swapped = True
+            target.rename(moved)
+            target.mkdir()
+            sentinel.write_text("safe", encoding="utf-8")
+
+    monkeypatch.setattr(storage, "_profile_operation_hook", swap_target)
+
+    with pytest.raises(ValueError, match="profile path changed|symbolic link|regular file"):
+        if operation == "save":
+            storage.save_profile("race", PARAMETERS, display_name="after")
+        elif operation == "load":
+            storage.load_profile("race")
+        else:
+            storage.delete_profile("race")
+
+    assert sentinel.read_text(encoding="utf-8") == "safe"
+    assert moved.exists()
+
+
+def test_profile_save_atomically_overwrites_existing_regular_file(tmp_path: Path) -> None:
+    storage = make_storage(tmp_path)
+    storage.save_profile("overwrite", PARAMETERS, display_name="before")
+    updated = replace(PARAMETERS, exposure_us=900.0)
+
+    storage.save_profile("overwrite", updated, display_name="after")
+
+    profile = storage.load_profile("overwrite")
+    assert profile.display_name == "after"
+    assert profile.parameters == updated
 
 
 def test_profile_save_is_atomic_and_preserves_previous_file_on_replace_failure(
@@ -196,15 +249,76 @@ def test_profile_symlink_cannot_escape_profile_directory(tmp_path: Path) -> None
         storage.load_profile("linked")
 
 
-def test_profile_save_rejects_symbolic_link_target(
+
+def test_capture_rejects_naive_created_datetime(tmp_path: Path) -> None:
+    storage = make_storage(tmp_path, now=datetime(2026, 7, 14, 1, 2, 3, 456789))
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        storage.save_capture(
+            make_capture_snapshot(), np.zeros((12, 16, 3), dtype=np.uint8)
+        )
+
+
+def test_capture_cleanup_does_not_remove_replacement_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     storage = make_storage(tmp_path)
-    target = tmp_path / "profiles" / "linked.yaml"
-    monkeypatch.setattr(Path, "is_symlink", lambda path: path == target)
+    snapshot = make_capture_snapshot()
+    original_write = storage._write_capture_png
+    calls = 0
 
-    with pytest.raises(ValueError, match="profile path"):
-        storage.save_profile("linked", PARAMETERS)
+    def replace_capture_directory(temporary: Path, target: Path, image: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            capture_dir = target.parent
+            moved = capture_dir.with_name(f"{capture_dir.name}-moved")
+            capture_dir.rename(moved)
+            capture_dir.mkdir()
+            (capture_dir / "sentinel.txt").write_text("do not delete", encoding="utf-8")
+            raise OSError("simulated capture failure")
+        original_write(temporary, target, image)
+
+    monkeypatch.setattr(storage, "_write_capture_png", replace_capture_directory)
+
+    with pytest.raises(OSError, match="simulated capture failure"):
+        storage.save_capture(snapshot, snapshot.frame.image)
+
+    replacement = tmp_path / "captures" / "20260714_010203_456"
+    assert (replacement / "sentinel.txt").read_text(encoding="utf-8") == "do not delete"
+    assert (tmp_path / "captures" / "20260714_010203_456-moved").exists()
+
+
+def test_capture_wraps_non_opencv_encoding_exceptions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = make_storage(tmp_path)
+
+    def fail_encode(extension: str, image: object) -> object:
+        raise TypeError("bad image")
+
+    monkeypatch.setattr(cv2, "imencode", fail_encode)
+
+    with pytest.raises(OSError, match="OpenCV failed to encode"):
+        storage.save_capture(make_capture_snapshot(), object())
+
+
+def test_yaml_value_recursively_converts_ndarrays(tmp_path: Path) -> None:
+    storage = make_storage(tmp_path)
+    snapshot = make_capture_snapshot()
+    snapshot = replace(
+        snapshot,
+        detection=replace(
+            snapshot.detection,
+            observation=None,
+            error=np.array([["left", "right"]], dtype=object),
+        ),
+    )
+
+    capture_dir = storage.save_capture(snapshot, snapshot.frame.image)
+    metadata = yaml.safe_load((capture_dir / "metadata.yaml").read_text(encoding="utf-8"))
+
+    assert metadata["detection"]["error"] == [["left", "right"]]
 
 
 def test_capture_creates_png_pair_and_complete_yaml_metadata(tmp_path: Path) -> None:
