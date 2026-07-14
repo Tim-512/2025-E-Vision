@@ -165,7 +165,9 @@ def test_profile_load_validates_schema_exact_keys_types_and_bounds(
         storage.load_profile("invalid")
 
 
-@pytest.mark.parametrize("operation", ["save", "load", "delete"])
+@pytest.mark.parametrize(
+    "operation", ["save", "load"] + (["delete"] if os.name == "posix" else [])
+)
 def test_profile_operations_reject_target_swapped_after_validation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
 ) -> None:
@@ -192,7 +194,14 @@ def test_profile_operations_reject_target_swapped_after_validation(
 
     monkeypatch.setattr(storage, "_profile_operation_hook", swap_target)
 
-    with pytest.raises(ValueError, match="profile path changed|symbolic link|regular file"):
+    error_type = (ValueError, OSError) if os.name != "posix" else ValueError
+    with pytest.raises(
+        error_type,
+        match=(
+            "profile path changed|symbolic link|regular file|"
+            "does not overwrite existing profiles"
+        ),
+    ):
         if operation == "save":
             storage.save_profile("race", PARAMETERS, display_name="after")
         elif operation == "load":
@@ -204,6 +213,7 @@ def test_profile_operations_reject_target_swapped_after_validation(
     assert moved.exists()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="safe overwrite is POSIX-only")
 def test_profile_save_atomically_overwrites_existing_regular_file(tmp_path: Path) -> None:
     storage = make_storage(tmp_path)
     storage.save_profile("overwrite", PARAMETERS, display_name="before")
@@ -216,6 +226,7 @@ def test_profile_save_atomically_overwrites_existing_regular_file(tmp_path: Path
     assert profile.parameters == updated
 
 
+@pytest.mark.skipif(os.name != "posix", reason="safe overwrite is POSIX-only")
 def test_profile_save_is_atomic_and_preserves_previous_file_on_replace_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -233,6 +244,35 @@ def test_profile_save_is_atomic_and_preserves_previous_file_on_replace_failure(
 
     assert target.read_bytes() == before
     assert not [path for path in target.parent.iterdir() if path.name.endswith(".tmp")]
+
+
+
+@pytest.mark.skipif(os.name == "posix", reason="Windows fallback behavior")
+def test_profile_save_fallback_rejects_overwrite_and_preserves_existing_file(
+    tmp_path: Path,
+) -> None:
+    storage = make_storage(tmp_path)
+    storage.save_profile("stable", PARAMETERS, display_name="before")
+    target = tmp_path / "profiles" / "stable.yaml"
+    before = target.read_bytes()
+
+    with pytest.raises(OSError, match="does not overwrite existing profiles"):
+        storage.save_profile("stable", PARAMETERS, display_name="after")
+
+    assert target.read_bytes() == before
+    assert not [path for path in target.parent.iterdir() if path.name.endswith(".tmp")]
+
+@pytest.mark.skipif(os.name == "posix", reason="Windows fallback behavior")
+def test_profile_delete_fallback_is_disabled_and_preserves_file(tmp_path: Path) -> None:
+    storage = make_storage(tmp_path)
+    storage.save_profile("stable", PARAMETERS)
+    target = tmp_path / "profiles" / "stable.yaml"
+    before = target.read_bytes()
+
+    with pytest.raises(OSError, match="profile deletion is disabled"):
+        storage.delete_profile("stable")
+
+    assert target.read_bytes() == before
 
 
 def test_profile_symlink_cannot_escape_profile_directory(tmp_path: Path) -> None:
@@ -328,6 +368,50 @@ def test_capture_cleanup_survives_swap_after_identity_validation(
     assert swapped
     assert (replacement / "sentinel.txt").read_text(encoding="utf-8") == "do not delete"
     assert (tmp_path / "captures" / f"{capture_name}-moved").exists()
+
+
+def test_capture_cleanup_never_removes_public_directory_after_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = make_storage(tmp_path)
+    snapshot = make_capture_snapshot()
+    capture_name = "20260714_010203_456"
+    original_write = storage._write_capture_png
+    original_lstat = Path.lstat
+    cleanup_started = False
+    validations = 0
+    swapped = False
+
+    def fail_second_write(temporary: Path, target: Path, image: object) -> None:
+        nonlocal cleanup_started
+        if target.name == "overlay.png":
+            cleanup_started = True
+            raise OSError("simulated capture failure")
+        original_write(temporary, target, image)
+
+    def swap_after_final_validation(path: Path):
+        nonlocal validations, swapped
+        result = original_lstat(path)
+        if cleanup_started and path.name == capture_name:
+            validations += 1
+            if validations == 2 and not swapped:
+                swapped = True
+                moved = path.with_name(f"{capture_name}-moved-final")
+                path.rename(moved)
+                path.mkdir()
+                (path / "sentinel.txt").write_text("do not delete", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(storage, "_write_capture_png", fail_second_write)
+    monkeypatch.setattr(Path, "lstat", swap_after_final_validation)
+
+    with pytest.raises(OSError, match="simulated capture failure"):
+        storage.save_capture(snapshot, snapshot.frame.image)
+
+    replacement = tmp_path / "captures" / capture_name
+    assert swapped
+    assert (replacement / "sentinel.txt").read_text(encoding="utf-8") == "do not delete"
+    assert (tmp_path / "captures" / f"{capture_name}-moved-final").is_dir()
 
 
 def test_capture_wraps_non_opencv_encoding_exceptions(
@@ -459,5 +543,7 @@ def test_capture_cleans_partial_directory_when_opencv_write_fails(
         storage.save_capture(snapshot, snapshot.frame.image)
 
     captures = tmp_path / "captures"
+    partial = captures / "20260714_010203_456"
     assert captures.is_dir()
-    assert list(captures.iterdir()) == []
+    assert partial.is_dir()
+    assert list(partial.iterdir()) == []

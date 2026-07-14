@@ -444,12 +444,18 @@ def _replace_verified_profile(
     _require_directory_identity(directory, expected_directory, "profile directory")
     if _identity_if_regular_file(temporary) != temporary_identity:
         raise ValueError("temporary profile path changed during operation")
-    if _identity_if_regular_file(target) != expected_target:
+    if expected_target is not None:
+        raise OSError("Windows fallback does not overwrite existing profiles")
+    if _identity_if_regular_file(target) is not None:
         raise ValueError("profile path changed during operation")
-    os.replace(temporary, target)
+    try:
+        os.link(temporary, target)
+    except FileExistsError as exc:
+        raise OSError("Windows fallback does not overwrite existing profiles") from exc
     _require_directory_identity(directory, expected_directory, "profile directory")
     if _identity_if_regular_file(target) != temporary_identity:
         raise ValueError("profile path changed during save")
+    _unlink_if_regular_file(temporary)
 
 
 def _unlink_verified_profile(
@@ -482,10 +488,7 @@ def _unlink_verified_profile(
         finally:
             os.close(directory_fd)
     else:
-        _require_directory_identity(directory, expected_directory, "profile directory")
-        if _identity_if_regular_file(target) != expected_target:
-            raise ValueError("profile path changed during operation")
-        target.unlink()
+        raise OSError("profile deletion is disabled on the Windows fallback")
 
     _require_directory_identity(directory, expected_directory, "profile directory")
     try:
@@ -642,20 +645,6 @@ def _remove_directory_if_identity_matches(
                 return False
             _unlink_if_regular_file(path / name)
 
-    try:
-        current = path.lstat()
-    except OSError:
-        return False
-    if (
-        not expected.same_object(current)
-        or _is_link_or_reparse(current)
-        or not stat.S_ISDIR(current.st_mode)
-    ):
-        return False
-    try:
-        path.rmdir()
-    except OSError:
-        return False
     return True
 
 
