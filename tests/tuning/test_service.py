@@ -368,14 +368,17 @@ def test_blocked_detection_cannot_deadlock_stop_or_publish_into_restarted_sessio
     assert not stop_thread.is_alive()
     assert first.close_count == 1
 
+    with pytest.raises(RuntimeError, match="analysis"):
+        service.start()
+    release_first.set()
+    wait_until(lambda: service._detection_thread is None or not service._detection_thread.is_alive())
+
     service.start()
     try:
-        release_first.set()
         wait_until(lambda: service.latest_detection().source_sequence == 20)
         time.sleep(0.03)
         assert service.latest_detection().source_sequence == 20
     finally:
-        release_first.set()
         service.stop()
 
 
@@ -567,6 +570,7 @@ def test_apply_fails_boundedly_without_reopen_when_read_owner_is_stuck() -> None
     finally:
         blocked.release_read.set()
         wait_until(lambda: blocked.close_count == 1)
+        service.stop()
 
 
 def test_close_failure_retains_handle_disconnects_and_prevents_reopen() -> None:
@@ -637,7 +641,7 @@ def test_session_switch_atomically_clears_diagnostics_and_detection_for_same_seq
         wait_until(lambda: service.latest_diagnostics() is not None)
         service.set_detection_enabled(False)
         service._diagnostics_period_s = 10.0
-        service.set_detection_enabled(False)
+        service._stop_analysis_workers()
         service.apply_parameters(parameters(exposure_us=1200.0))
         assert service.latest_diagnostics() is None
         detection = service.latest_detection()
@@ -799,5 +803,205 @@ def test_disabled_detection_does_not_copy_latest_frame_for_detector_worker() -> 
         time.sleep(0.03)
         assert "camera-tuning-detection" not in copying_threads
         assert detector.calls == []
+    finally:
+        service.stop()
+
+
+class HandoffRaceThread:
+    """Thread proxy that exits exactly between is_alive and cleanup handoff."""
+
+    def __init__(self, real: threading.Thread, release_read: threading.Event) -> None:
+        self.real = real
+        self.release_read = release_read
+        self._first_alive = True
+
+    def join(self, timeout: float | None = None) -> None:
+        return None
+
+    def is_alive(self) -> bool:
+        if self._first_alive:
+            self._first_alive = False
+            self.release_read.set()
+            self.real.join(0.5)
+            return True
+        return self.real.is_alive()
+
+
+def test_deferred_cleanup_handoff_closes_if_owner_exits_during_alive_observation() -> None:
+    blocked = BlockingReadCamera(frame(1))
+    replacement = FakeCamera([frame(2)])
+    service = CameraTuningService(
+        camera_factory=FakeFactory([blocked, replacement]),
+        base_config=config(),
+        read_timeout_ms=2,
+        confirm_timeout_s=0.05,
+        diagnostics_fps=100.0,
+        detection_fps=100.0,
+        shutdown_timeout_s=0.01,
+    )
+    service.start()
+    assert blocked.read_started.wait(0.5)
+    real_thread = service._acquisition_thread
+    assert real_thread is not None
+    service._acquisition_thread = HandoffRaceThread(  # type: ignore[assignment]
+        real_thread, blocked.release_read
+    )
+
+    service.stop()
+
+    assert blocked.close_count == 1
+    assert service.runtime_snapshot().state == "Stopped"
+    service.start()
+    service.stop()
+    wait_until(lambda: replacement.close_count == 1)
+
+
+def analysis_thread_count() -> int:
+    return sum(
+        thread.name in {"camera-tuning-diagnostics", "camera-tuning-detection"}
+        for thread in threading.enumerate()
+    )
+
+
+def test_stop_terminates_analysis_workers_and_restart_creates_only_one_pair() -> None:
+    before = analysis_thread_count()
+    service = make_service(FakeFactory([FakeCamera([frame(1)]), FakeCamera([frame(2)])]))
+    service.start()
+    wait_until(lambda: analysis_thread_count() == before + 2)
+    service.stop()
+    wait_until(lambda: analysis_thread_count() == before)
+
+    service.start()
+    try:
+        wait_until(lambda: analysis_thread_count() == before + 2)
+        assert analysis_thread_count() == before + 2
+    finally:
+        service.stop()
+    wait_until(lambda: analysis_thread_count() == before)
+
+
+def test_blocked_detector_worker_is_not_replaced_or_run_concurrently_on_restart() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    lock = threading.Lock()
+    active = 0
+    maximum = 0
+
+    class BlockingDetector:
+        def detect(self, image: np.ndarray, *, captured_ns: int) -> BoardObservation | None:
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+                started.set()
+            try:
+                assert release.wait(2.0)
+                return observation(captured_ns)
+            finally:
+                with lock:
+                    active -= 1
+
+    factory = FakeFactory([FakeCamera([frame(1)]), FakeCamera([frame(2)])])
+    service = make_service(factory, detector=BlockingDetector())
+    service.start()
+    assert started.wait(0.5)
+    service.stop()
+    assert service.runtime_snapshot().state == "Stopped"
+    with pytest.raises(RuntimeError, match="analysis"):
+        service.start()
+    assert len(factory.created) == 1
+    assert maximum == 1
+
+    release.set()
+    wait_until(lambda: analysis_thread_count() == 0 or active == 0)
+    service.start()
+    try:
+        time.sleep(0.03)
+        assert maximum == 1
+    finally:
+        service.stop()
+
+
+def test_timeout_streak_does_not_carry_into_successfully_applied_camera() -> None:
+    original = FakeCamera([frame(1), TimeoutError("old timeout")])
+    candidate_camera = FakeCamera([frame(10), TimeoutError("new timeout")])
+    service = CameraTuningService(
+        camera_factory=FakeFactory([original, candidate_camera]),
+        base_config=config(),
+        read_timeout_ms=2,
+        confirm_timeout_s=0.05,
+        diagnostics_fps=100.0,
+        detection_fps=100.0,
+        disconnect_timeout_threshold=2,
+    )
+    service.start()
+    try:
+        wait_until(lambda: service.runtime_snapshot().timeout_count >= 1)
+        service.apply_parameters(parameters(exposure_us=1200.0))
+        wait_until(lambda: service.runtime_snapshot().timeout_count >= 2)
+        assert service.runtime_snapshot().state == "Connected"
+        assert service.runtime_snapshot().last_error is None
+    finally:
+        service.stop()
+
+
+def test_first_rollback_session_frame_does_not_clear_rollback_message() -> None:
+    original = FakeCamera([frame(1), RuntimeError("old read fault")])
+    failed_candidate = FakeCamera(open_error=RuntimeError("candidate rejected"))
+    rollback = FakeCamera([frame(10), frame(11)])
+    service = make_service(FakeFactory([original, failed_candidate, rollback]))
+    service.start()
+    wait_until(lambda: service.runtime_snapshot().state == "Disconnected")
+
+    with pytest.raises(ParameterApplyError):
+        service.apply_parameters(parameters(exposure_us=1400.0))
+    wait_until(lambda: service.latest_frame() is not None and service.latest_frame().sequence == 11)
+    runtime = service.runtime_snapshot()
+    assert runtime.state == "Connected"
+    assert runtime.last_error is not None and "apply failed and rolled back" in runtime.last_error
+    service.stop()
+
+
+def test_apply_commits_candidate_parameters_and_frame_atomically() -> None:
+    original = FakeCamera([frame(1, 1)])
+    candidate_camera = FakeCamera([frame(20, 20)])
+    service = make_service(FakeFactory([original, candidate_camera]))
+    candidate = parameters(exposure_us=1500.0)
+    service.start()
+
+    entered_install = threading.Event()
+    allow_install = threading.Event()
+    original_install = service._install_session
+
+    def gated_install(camera, confirming_frame, *, parameters, error):
+        entered_install.set()
+        assert allow_install.wait(1.0)
+        return original_install(
+            camera, confirming_frame, parameters=parameters, error=error
+        )
+
+    service._install_session = gated_install  # type: ignore[method-assign]
+    apply_errors: list[BaseException] = []
+
+    def apply() -> None:
+        try:
+            service.apply_parameters(candidate)
+        except BaseException as exc:
+            apply_errors.append(exc)
+
+    apply_thread = threading.Thread(target=apply)
+    apply_thread.start()
+    assert entered_install.wait(0.5)
+    observed = service.capture_snapshot()
+    allow_install.set()
+    apply_thread.join(1.0)
+    try:
+        assert apply_errors == []
+        assert not (
+            observed.parameters == candidate and observed.frame.sequence == 1
+        )
+        final = service.capture_snapshot()
+        assert final.parameters == candidate
+        assert final.frame.sequence == 20
     finally:
         service.stop()
