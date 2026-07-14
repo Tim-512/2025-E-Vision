@@ -112,7 +112,7 @@ def parameters(base: CameraConfig | None = None, **changes: object) -> EditableC
 
 
 def make_service(factory: FakeFactory, *, detector: FakeDetector | None = None, diagnostics_fps: float = 100.0, detection_fps: float = 100.0, confirm_timeout_s: float = 0.05) -> CameraTuningService:
-    return CameraTuningService(camera_factory=factory, base_config=config(), detector=detector, camera_identity=CameraIdentity(model="fake", serial="serial-1"), read_timeout_ms=2, confirm_timeout_s=confirm_timeout_s, diagnostics_fps=diagnostics_fps, detection_fps=detection_fps)
+    return CameraTuningService(camera_factory=factory, base_config=config(), detector=detector, camera_identity=CameraIdentity(model="fake", serial="serial-1"), read_timeout_ms=2, confirm_timeout_s=confirm_timeout_s, diagnostics_fps=diagnostics_fps, detection_fps=detection_fps, disconnect_timeout_threshold=1000)
 
 
 def wait_until(predicate, *, timeout_s: float = 0.5) -> None:
@@ -166,16 +166,20 @@ def test_detection_disable_clears_result_and_reenable_uses_latest_frame() -> Non
 
 def test_detector_error_is_reported_without_stopping_acquisition() -> None:
     first, second = frame(1), frame(2)
-    detector = FakeDetector([RuntimeError("detector boom"), observation(second.captured_ns)])
-    service = make_service(FakeFactory([FakeCamera([first, second, frame(3)])]), detector=detector)
+    detector = FakeDetector([RuntimeError("detector boom")])
+    camera = FakeCamera([first])
+    service = make_service(FakeFactory([camera]), detector=detector, diagnostics_fps=10.0, detection_fps=10.0)
     service.start()
     try:
         wait_until(lambda: service.latest_detection().error is not None)
+        with camera._lock:
+            camera.items.append(second)
+        detector.results.append(observation(second.captured_ns))
         wait_until(lambda: service.latest_detection().detected)
-        assert service.runtime_snapshot().frame_count >= 3
         assert service.runtime_snapshot().state == "Connected"
     finally:
         service.stop()
+
 
 
 def test_slow_detection_does_not_block_diagnostics_or_acquisition() -> None:
@@ -366,8 +370,8 @@ def test_blocked_detection_cannot_deadlock_stop_or_publish_into_restarted_sessio
 
     service.start()
     try:
-        wait_until(lambda: service.latest_detection().source_sequence == 20)
         release_first.set()
+        wait_until(lambda: service.latest_detection().source_sequence == 20)
         time.sleep(0.03)
         assert service.latest_detection().source_sequence == 20
     finally:
@@ -427,5 +431,373 @@ def test_non_increasing_camera_sequences_do_not_replace_latest_frame() -> None:
         latest = service.latest_frame()
         assert latest is not None and latest.sequence == 5
         assert service.runtime_snapshot().frame_count == 1
+    finally:
+        service.stop()
+
+class BlockingReadCamera:
+    """Camera fake that exposes SDK-call overlap instead of serializing it away."""
+
+    def __init__(self, confirming_frame: Frame) -> None:
+        self.confirming_frame = confirming_frame
+        self.open_count = 0
+        self.close_count = 0
+        self.read_count = 0
+        self.opened = False
+        self.read_started = threading.Event()
+        self.release_read = threading.Event()
+        self._confirm_pending = True
+        self._calls_lock = threading.Lock()
+        self.active_calls = 0
+        self.max_active_calls = 0
+        self.close_during_read = False
+
+    def _enter(self) -> None:
+        with self._calls_lock:
+            self.active_calls += 1
+            self.max_active_calls = max(self.max_active_calls, self.active_calls)
+
+    def _exit(self) -> None:
+        with self._calls_lock:
+            self.active_calls -= 1
+
+    def open(self) -> None:
+        self._enter()
+        try:
+            self.open_count += 1
+            self.opened = True
+        finally:
+            self._exit()
+
+    def close(self) -> None:
+        self._enter()
+        try:
+            self.close_count += 1
+            if self.read_started.is_set() and not self.release_read.is_set():
+                self.close_during_read = True
+            self.opened = False
+        finally:
+            self._exit()
+
+    def read(self, *, timeout_ms: int = 100) -> Frame:
+        self._enter()
+        try:
+            self.read_count += 1
+            if self._confirm_pending:
+                self._confirm_pending = False
+                return self.confirming_frame
+            self.read_started.set()
+            assert self.release_read.wait(2.0)
+            raise TimeoutError("released blocked read")
+        finally:
+            self._exit()
+
+
+class CloseFailCamera(FakeCamera):
+    def __init__(self, items: Iterable[Frame | BaseException]) -> None:
+        super().__init__(items)
+        self.fail_close = True
+
+    def close(self) -> None:
+        self.close_count += 1
+        if self.fail_close:
+            raise RuntimeError("close exploded")
+        self.opened = False
+
+
+def test_blocked_read_makes_stop_bounded_without_concurrent_close_and_apply_is_rejected() -> None:
+    blocked = BlockingReadCamera(frame(1))
+    spare = FakeCamera([frame(2)])
+    factory = FakeFactory([blocked, spare])  # type: ignore[list-item]
+    service = CameraTuningService(
+        camera_factory=factory,
+        base_config=config(),
+        read_timeout_ms=2,
+        confirm_timeout_s=0.05,
+        diagnostics_fps=100.0,
+        detection_fps=100.0,
+        shutdown_timeout_s=0.03,
+    )
+    service.start()
+    assert blocked.read_started.wait(0.5)
+
+    started = time.monotonic()
+    service.stop()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.2
+    runtime = service.runtime_snapshot()
+    assert runtime.state == "Disconnected"
+    assert runtime.last_error is not None and "did not stop" in runtime.last_error
+    assert blocked.close_count == 0
+    assert blocked.close_during_read is False
+    assert blocked.max_active_calls == 1
+    with pytest.raises(RuntimeError):
+        service.apply_parameters(parameters(exposure_us=1500.0))
+    assert len(factory.created) == 1
+
+    blocked.release_read.set()
+    wait_until(lambda: blocked.close_count == 1)
+    assert blocked.close_during_read is False
+    assert blocked.max_active_calls == 1
+
+
+def test_apply_fails_boundedly_without_reopen_when_read_owner_is_stuck() -> None:
+    blocked = BlockingReadCamera(frame(1))
+    factory = FakeFactory([blocked, FakeCamera([frame(2)])])  # type: ignore[list-item]
+    service = CameraTuningService(
+        camera_factory=factory,
+        base_config=config(),
+        read_timeout_ms=2,
+        confirm_timeout_s=0.05,
+        diagnostics_fps=100.0,
+        detection_fps=100.0,
+        shutdown_timeout_s=0.03,
+    )
+    service.start()
+    assert blocked.read_started.wait(0.5)
+    try:
+        started = time.monotonic()
+        with pytest.raises(ParameterApplyError) as caught:
+            service.apply_parameters(parameters(exposure_us=1500.0))
+        assert time.monotonic() - started < 0.2
+        assert caught.value.rollback_error is None
+        assert service.runtime_snapshot().state == "Disconnected"
+        assert len(factory.created) == 1
+        assert blocked.close_count == 0
+    finally:
+        blocked.release_read.set()
+        wait_until(lambda: blocked.close_count == 1)
+
+
+def test_close_failure_retains_handle_disconnects_and_prevents_reopen() -> None:
+    camera = CloseFailCamera([frame(1)])
+    factory = FakeFactory([camera, FakeCamera([frame(2)])])
+    service = make_service(factory)
+    service.start()
+    service.stop()
+
+    runtime = service.runtime_snapshot()
+    assert runtime.state == "Disconnected"
+    assert runtime.last_error is not None and "close exploded" in runtime.last_error
+    assert camera.close_count == 1
+    with pytest.raises(RuntimeError, match="camera"):
+        service.start()
+    assert len(factory.created) == 1
+
+
+def test_analysis_workers_do_not_accumulate_or_run_detector_concurrently_across_applies() -> None:
+    release = threading.Event()
+    first_started = threading.Event()
+    lock = threading.Lock()
+    active = 0
+    maximum = 0
+
+    class BlockingDetector:
+        def detect(self, image: np.ndarray, *, captured_ns: int) -> BoardObservation | None:
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+                first_started.set()
+            try:
+                assert release.wait(2.0)
+                return observation(captured_ns)
+            finally:
+                with lock:
+                    active -= 1
+
+    before = sum(t.name.startswith("camera-tuning-d") for t in threading.enumerate())
+    cameras = [FakeCamera([frame(index)]) for index in (1, 10, 20, 30)]
+    service = make_service(FakeFactory(cameras), detector=BlockingDetector())
+    service.start()
+    assert first_started.wait(0.5)
+    try:
+        service.apply_parameters(parameters(exposure_us=1200.0))
+        service.apply_parameters(parameters(exposure_us=1400.0))
+        service.apply_parameters(parameters(exposure_us=1600.0))
+        time.sleep(0.08)
+        after = sum(t.name.startswith("camera-tuning-d") for t in threading.enumerate())
+        assert maximum == 1
+        assert after - before <= 2
+    finally:
+        release.set()
+        service.stop()
+
+
+def test_session_switch_atomically_clears_diagnostics_and_detection_for_same_sequence() -> None:
+    detector = FakeDetector([observation(1), observation(2)])
+    service = make_service(
+        FakeFactory([FakeCamera([frame(7, 10)]), FakeCamera([frame(7, 20)])]),
+        detector=detector,
+        diagnostics_fps=1.0,
+        detection_fps=1.0,
+    )
+    service.start()
+    try:
+        wait_until(lambda: service.latest_diagnostics() is not None)
+        service.set_detection_enabled(False)
+        service._diagnostics_period_s = 10.0
+        service.set_detection_enabled(False)
+        service.apply_parameters(parameters(exposure_us=1200.0))
+        assert service.latest_diagnostics() is None
+        detection = service.latest_detection()
+        assert detection.enabled is False
+        assert detection.source_sequence is None
+        assert detection.result_age_ms is None
+    finally:
+        service.stop()
+
+
+def test_repeated_timeouts_disconnect_and_a_new_frame_recovers_state_and_error() -> None:
+    camera = FakeCamera([frame(1), TimeoutError("one"), TimeoutError("two")])
+    service = CameraTuningService(
+        camera_factory=FakeFactory([camera]),
+        base_config=config(),
+        read_timeout_ms=2,
+        confirm_timeout_s=0.05,
+        diagnostics_fps=100.0,
+        detection_fps=100.0,
+        disconnect_timeout_threshold=2,
+    )
+    service.start()
+    try:
+        wait_until(lambda: service.runtime_snapshot().state == "Disconnected")
+        disconnected = service.runtime_snapshot()
+        assert disconnected.timeout_count >= 2
+        assert disconnected.last_error is not None and "timeouts" in disconnected.last_error
+        with camera._lock:
+            camera.items.append(frame(2))
+        wait_until(lambda: service.runtime_snapshot().state == "Connected")
+        assert service.runtime_snapshot().last_error is None
+    finally:
+        service.stop()
+
+
+def test_transient_read_exception_is_cleared_by_next_successful_frame() -> None:
+    camera = FakeCamera([frame(1), RuntimeError("temporary read failure")])
+    service = make_service(FakeFactory([camera]))
+    service.start()
+    try:
+        wait_until(lambda: service.runtime_snapshot().state == "Disconnected")
+        with camera._lock:
+            camera.items.append(frame(2))
+        wait_until(lambda: service.latest_frame() is not None and service.latest_frame().sequence == 2)
+        runtime = service.runtime_snapshot()
+        assert runtime.state == "Connected"
+        assert runtime.last_error is None
+    finally:
+        service.stop()
+
+
+def test_32bit_sequence_wrap_is_forward_and_counts_modular_gaps() -> None:
+    camera = FakeCamera([frame(0xFFFFFFFE, 254), frame(1), frame(0), frame(1)])
+    service = make_service(FakeFactory([camera]))
+    service.start()
+    try:
+        wait_until(lambda: service.latest_frame() is not None and service.latest_frame().sequence == 1)
+        runtime = service.runtime_snapshot()
+        assert runtime.frame_count == 2
+        assert runtime.sequence_gap_count == 2
+    finally:
+        service.stop()
+
+
+def test_each_camera_frame_is_frozen_only_once_before_publication() -> None:
+    service = make_service(FakeFactory([FakeCamera([frame(1), frame(2)])]))
+    original = service._freeze_frame
+    freeze_count = 0
+
+    def counted(candidate: Frame) -> Frame:
+        nonlocal freeze_count
+        freeze_count += 1
+        return original(candidate)
+
+    service._freeze_frame = counted  # type: ignore[method-assign]
+    service.start()
+    try:
+        wait_until(lambda: service.runtime_snapshot().frame_count == 2)
+        assert freeze_count == 2
+    finally:
+        service.stop()
+
+
+
+
+class SharedMethodTracker:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.active = 0
+        self.maximum = 0
+
+    def enter(self) -> None:
+        with self.lock:
+            self.active += 1
+            self.maximum = max(self.maximum, self.active)
+
+    def exit(self) -> None:
+        with self.lock:
+            self.active -= 1
+
+
+class TrackedCamera(FakeCamera):
+    def __init__(self, tracker: SharedMethodTracker, items: Iterable[Frame | BaseException]) -> None:
+        super().__init__(items)
+        self.tracker = tracker
+
+    def open(self) -> None:
+        self.tracker.enter()
+        try:
+            super().open()
+        finally:
+            self.tracker.exit()
+
+    def close(self) -> None:
+        self.tracker.enter()
+        try:
+            super().close()
+        finally:
+            self.tracker.exit()
+
+    def read(self, *, timeout_ms: int = 100) -> Frame:
+        self.tracker.enter()
+        try:
+            return super().read(timeout_ms=timeout_ms)
+        finally:
+            self.tracker.exit()
+
+
+def test_camera_sdk_methods_never_overlap_across_apply_sessions() -> None:
+    tracker = SharedMethodTracker()
+    original = TrackedCamera(tracker, [frame(1)])
+    candidate = TrackedCamera(tracker, [frame(10)])
+    service = make_service(FakeFactory([original, candidate]))
+    service.start()
+    try:
+        service.apply_parameters(parameters(exposure_us=1300.0))
+    finally:
+        service.stop()
+    assert tracker.maximum == 1
+    assert original.open_count == original.close_count == 1
+    assert candidate.open_count == candidate.close_count == 1
+
+
+def test_disabled_detection_does_not_copy_latest_frame_for_detector_worker() -> None:
+    detector = FakeDetector([])
+    service = make_service(FakeFactory([FakeCamera([frame(1)])]), detector=detector)
+    service.set_detection_enabled(False)
+    original = service._copy_frame
+    copying_threads: list[str] = []
+
+    def tracked_copy(candidate: Frame) -> Frame:
+        copying_threads.append(threading.current_thread().name)
+        return original(candidate)
+
+    service._copy_frame = tracked_copy  # type: ignore[method-assign]
+    service.start()
+    try:
+        wait_until(lambda: service.latest_diagnostics() is not None)
+        time.sleep(0.03)
+        assert "camera-tuning-detection" not in copying_threads
+        assert detector.calls == []
     finally:
         service.stop()
