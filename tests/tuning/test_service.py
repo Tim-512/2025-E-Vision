@@ -94,6 +94,29 @@ class BlockingOpenCamera(FakeCamera):
         super().open()
 
 
+class QueuedStartOperationLock:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.start_waiting = threading.Event()
+        self.allow_start = threading.Event()
+
+    def __enter__(self):
+        if threading.current_thread().name == "queued-start":
+            self.start_waiting.set()
+            assert self.allow_start.wait(1.0)
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self._lock.release()
+
+    def acquire(self, *, timeout: float = -1.0) -> bool:
+        return self._lock.acquire(timeout=timeout)
+
+    def release(self) -> None:
+        self._lock.release()
+
+
 def frame(sequence: int, value: int | None = None) -> Frame:
     pixel = sequence if value is None else value
     return Frame(sequence=sequence, captured_ns=time.monotonic_ns(), image=np.full((8, 10, 3), pixel, dtype=np.uint8))
@@ -304,6 +327,55 @@ def test_stop_is_idempotent_closes_once_and_service_can_restart() -> None:
     assert second.close_count == 1
 
 
+def test_queued_start_cannot_consume_a_newer_completed_shutdown_intent() -> None:
+    camera = FakeCamera([frame(7)])
+    factory = FakeFactory([camera])
+    service = make_service(factory)
+    service.stop()
+    initial_generation = service._shutdown_generation
+    assert service._shutdown_requested
+
+    operation_lock = QueuedStartOperationLock()
+    service._operation_lock = operation_lock  # type: ignore[assignment]
+    start_errors: list[BaseException] = []
+
+    def queued_start() -> None:
+        try:
+            service.start()
+        except BaseException as exc:
+            start_errors.append(exc)
+
+    start_thread = threading.Thread(
+        target=queued_start, name="queued-start", daemon=True
+    )
+    start_thread.start()
+    assert operation_lock.start_waiting.wait(0.5)
+
+    service.stop()
+    newer_generation = service._shutdown_generation
+    assert newer_generation == initial_generation + 1
+    assert service._shutdown_requested
+
+    operation_lock.allow_start.set()
+    start_thread.join(1.0)
+    assert not start_thread.is_alive()
+    assert len(start_errors) == 1
+    assert isinstance(start_errors[0], RuntimeError)
+    assert "cancelled by shutdown" in str(start_errors[0])
+    assert factory.created == []
+    assert service.runtime_snapshot().state == "Stopped"
+    assert service._shutdown_requested
+    assert service._shutdown_generation == newer_generation
+
+    service.start()
+    try:
+        assert service.latest_frame() is not None
+        assert service.latest_frame().sequence == 7
+    finally:
+        service.stop()
+    assert camera.close_count == 1
+
+
 def test_stop_is_bounded_and_cancels_apply_blocked_in_candidate_open() -> None:
     original = FakeCamera([frame(1)])
     candidate_camera = BlockingOpenCamera([frame(20)])
@@ -345,6 +417,8 @@ def test_stop_is_bounded_and_cancels_apply_blocked_in_candidate_open() -> None:
         runtime = service.runtime_snapshot()
         assert runtime.state == "Disconnected"
         assert runtime.last_error is not None and "shutdown" in runtime.last_error
+        shutdown_generation = service._shutdown_generation
+        assert service._shutdown_requested
         with pytest.raises(RuntimeError, match="shutdown|cleanup|camera"):
             service.start()
 
@@ -363,6 +437,8 @@ def test_stop_is_bounded_and_cancels_apply_blocked_in_candidate_open() -> None:
     assert candidate_camera.read_count == 0
     assert candidate_camera.close_count == 1
     assert original.close_count == 1
+    assert service._shutdown_requested
+    assert service._shutdown_generation == shutdown_generation
     wait_until(
         lambda: service._camera is None
         and service._acquisition_thread is None

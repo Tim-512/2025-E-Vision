@@ -199,6 +199,8 @@ class CameraTuningService:
             mutation_registered = False
             try:
                 with self._lock:
+                    if invocation_generation != self._shutdown_generation:
+                        raise RuntimeError("camera start was cancelled by shutdown")
                     if self._shutdown_requested:
                         if (
                             not invocation_saw_shutdown
@@ -209,8 +211,6 @@ class CameraTuningService:
                             )
                         self._shutdown_requested = False
                         self._shutdown_generation += 1
-                    elif invocation_generation != self._shutdown_generation:
-                        raise RuntimeError("camera start was cancelled by shutdown")
                     if self._running:
                         return
                     if self._camera is not None or self._acquisition_thread is not None:
