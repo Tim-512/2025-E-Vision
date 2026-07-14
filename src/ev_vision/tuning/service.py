@@ -127,13 +127,16 @@ class CameraTuningService:
         self._acquisition_thread: threading.Thread | None = None
         self._deferred_cleanup = False
         self._cleanup_claimed = False
+        self._acquisition_target_done: threading.Event | None = None
+        self._cleanup_thread: threading.Thread | None = None
         self._session_generation = 0
         self._session_active = False
         self._running = False
 
         # Analysis workers are one bounded pair per running lifecycle. A blocked
         # worker prevents replacement, so detector calls cannot overlap on restart.
-        self._analysis_wakeup = threading.Event()
+        self._diagnostics_wakeup = threading.Condition()
+        self._detection_wakeup = threading.Condition()
         self._analysis_stop = threading.Event()
         self._diagnostics_thread: threading.Thread | None = None
         self._detection_thread: threading.Thread | None = None
@@ -329,7 +332,7 @@ class CameraTuningService:
             self._detection_generation += 1
             self._detection_computed_ns = None
             self._latest_detection = DetectionSnapshot(enabled=enabled, detected=False)
-        self._analysis_wakeup.set()
+        self._notify_analysis_worker(self._detection_wakeup)
 
     def capture_snapshot(
         self, overlay_options: OverlayOptions | None = None
@@ -393,7 +396,8 @@ class CameraTuningService:
             stop_event = self._analysis_stop
             threads = (self._diagnostics_thread, self._detection_thread)
         stop_event.set()
-        self._analysis_wakeup.set()
+        self._notify_analysis_worker(self._diagnostics_wakeup)
+        self._notify_analysis_worker(self._detection_wakeup)
         current = threading.current_thread()
         for thread in threads:
             if thread is not None and thread is not current:
@@ -447,18 +451,21 @@ class CameraTuningService:
         error: str | None,
     ) -> None:
         stop_event = threading.Event()
+        target_done = threading.Event()
         with self._lock:
             self._session_generation += 1
             generation = self._session_generation
             acquisition = threading.Thread(
                 target=self._acquisition_loop,
-                args=(camera, stop_event, generation),
+                args=(camera, stop_event, generation, target_done),
                 name="camera-tuning-acquisition",
                 daemon=True,
             )
             self._camera = camera
             self._camera_stop = stop_event
             self._acquisition_thread = acquisition
+            self._acquisition_target_done = target_done
+            self._cleanup_thread = None
             self._deferred_cleanup = False
             self._cleanup_claimed = False
             self._running = True
@@ -471,7 +478,7 @@ class CameraTuningService:
             self._state = "Connected"
             self._last_error = error
         acquisition.start()
-        self._analysis_wakeup.set()
+        self._wake_analysis_workers()
 
     def _stop_acquisition(self, timeout_error: str) -> bool:
         with self._lock:
@@ -480,14 +487,14 @@ class CameraTuningService:
             self._session_active = False
             self._session_generation += 1
             self._reset_derived_locked()
-        self._analysis_wakeup.set()
+        self._wake_analysis_workers()
         if stop_event is not None:
             stop_event.set()
         current = threading.current_thread()
         if acquisition is not None and acquisition is not current:
             acquisition.join(timeout=self._shutdown_timeout_s)
 
-        close_here = False
+        start_cleanup_waiter = False
         timed_out = acquisition is not None and acquisition.is_alive()
         with self._lock:
             if timed_out:
@@ -495,17 +502,25 @@ class CameraTuningService:
                 self._deferred_cleanup = True
                 self._state = "Disconnected"
                 self._last_error = timeout_error
-                # Cleanup intent is now visible before the second liveness check.
-                if not acquisition.is_alive() and not self._cleanup_claimed:
-                    self._cleanup_claimed = True
-                    close_here = True
-                else:
-                    return False
-            elif self._acquisition_thread is acquisition:
-                self._acquisition_thread = None
-                self._camera_stop = None
-        if close_here:
-            self._close_deferred_camera(thread=acquisition)
+                target_done = self._acquisition_target_done
+                if target_done is not None and target_done.is_set():
+                    if not self._cleanup_claimed:
+                        self._cleanup_claimed = True
+                        start_cleanup_waiter = True
+                elif not self._cleanup_claimed:
+                    # The acquisition target still owns cleanup through its finally.
+                    pass
+                return_after_handoff = True
+            else:
+                return_after_handoff = False
+                if self._acquisition_thread is acquisition:
+                    self._acquisition_thread = None
+                    self._camera_stop = None
+                    self._acquisition_target_done = None
+        if start_cleanup_waiter:
+            self._start_deferred_cleanup_waiter(acquisition)
+        if return_after_handoff:
+            return False
         return True
 
     def _close_camera(self) -> BaseException | None:
@@ -522,12 +537,35 @@ class CameraTuningService:
                 self._camera = None
         return None
 
+    def _start_deferred_cleanup_waiter(
+        self, acquisition: threading.Thread | None
+    ) -> None:
+        if acquisition is None:
+            self._close_deferred_camera(thread=None)
+            return
+        cleanup = threading.Thread(
+            target=self._deferred_cleanup_waiter,
+            args=(acquisition,),
+            name="camera-tuning-cleanup",
+            daemon=True,
+        )
+        with self._lock:
+            self._cleanup_thread = cleanup
+        cleanup.start()
+
+    def _deferred_cleanup_waiter(self, acquisition: threading.Thread) -> None:
+        acquisition.join()
+        self._close_deferred_camera(thread=acquisition)
+
     def _close_deferred_camera(self, *, thread: threading.Thread | None) -> None:
         close_error = self._close_camera()
         with self._lock:
             if self._acquisition_thread is thread:
                 self._acquisition_thread = None
                 self._camera_stop = None
+                self._acquisition_target_done = None
+            if self._cleanup_thread is threading.current_thread():
+                self._cleanup_thread = None
             self._deferred_cleanup = False
             self._cleanup_claimed = False
             if close_error is not None:
@@ -538,7 +576,11 @@ class CameraTuningService:
                 self._last_error = None
 
     def _acquisition_loop(
-        self, camera: CameraPort, stop_event: threading.Event, generation: int
+        self,
+        camera: CameraPort,
+        stop_event: threading.Event,
+        generation: int,
+        target_done: threading.Event,
     ) -> None:
         try:
             while not stop_event.is_set():
@@ -560,7 +602,7 @@ class CameraTuningService:
                         break
                     self._record_camera_success_locked()
                     self._publish_frozen_frame_locked(frozen)
-                self._analysis_wakeup.set()
+                self._wake_analysis_workers()
         finally:
             claim_close = False
             current = threading.current_thread()
@@ -576,6 +618,7 @@ class CameraTuningService:
                 elif self._acquisition_thread is current and not self._deferred_cleanup:
                     # Keep the reference for the stop/apply caller to close synchronously.
                     pass
+                target_done.set()
             if claim_close:
                 self._close_deferred_camera(thread=current)
 
@@ -611,10 +654,13 @@ class CameraTuningService:
                             self._diagnostics_rate.record(now_ns)
                             last_key = key
             elapsed_s = (self._clock_ns() - started_ns) / 1_000_000_000.0
-            self._analysis_wakeup.wait(
-                max(0.0, self._diagnostics_period_s - elapsed_s)
+            if stop_event.is_set():
+                break
+            self._wait_for_analysis(
+                stop_event,
+                self._diagnostics_wakeup,
+                max(0.0, self._diagnostics_period_s - elapsed_s),
             )
-            self._analysis_wakeup.clear()
 
     def _detection_loop(self, stop_event: threading.Event) -> None:
         last_key: tuple[int, int, int] | None = None
@@ -658,7 +704,7 @@ class CameraTuningService:
                                 error=str(exc),
                             )
                             self._detection_computed_ns = now_ns
-                    self._record_analysis_error("detection", exc, key[0])
+                            self._last_error = f"detection failed: {exc}"
                 else:
                     now_ns = self._clock_ns()
                     with self._lock:
@@ -679,10 +725,32 @@ class CameraTuningService:
                                 self._last_error = None
                             last_key = key
             elapsed_s = (self._clock_ns() - started_ns) / 1_000_000_000.0
-            self._analysis_wakeup.wait(
-                max(0.0, self._detection_period_s - elapsed_s)
+            if stop_event.is_set():
+                break
+            self._wait_for_analysis(
+                stop_event,
+                self._detection_wakeup,
+                max(0.0, self._detection_period_s - elapsed_s),
             )
-            self._analysis_wakeup.clear()
+
+    def _wake_analysis_workers(self) -> None:
+        self._notify_analysis_worker(self._diagnostics_wakeup)
+        self._notify_analysis_worker(self._detection_wakeup)
+
+    @staticmethod
+    def _notify_analysis_worker(wakeup: threading.Condition) -> None:
+        with wakeup:
+            wakeup.notify()
+
+    @staticmethod
+    def _wait_for_analysis(
+        stop_event: threading.Event,
+        wakeup: threading.Condition,
+        timeout_s: float,
+    ) -> None:
+        with wakeup:
+            if not stop_event.is_set():
+                wakeup.wait(timeout_s)
 
     def _detection_key_is_current_locked(self, key: tuple[int, int, int]) -> bool:
         return (

@@ -807,27 +807,37 @@ def test_disabled_detection_does_not_copy_latest_frame_for_detector_worker() -> 
         service.stop()
 
 
-class HandoffRaceThread:
-    """Thread proxy that exits exactly between is_alive and cleanup handoff."""
+class TargetReturnPauseThread(threading.Thread):
+    """Pause a real acquisition thread after its target has returned."""
 
-    def __init__(self, real: threading.Thread, release_read: threading.Event) -> None:
-        self.real = real
-        self.release_read = release_read
-        self._first_alive = True
+    pause_next_acquisition = False
+    target_returned = threading.Event()
+    allow_thread_exit = threading.Event()
 
-    def join(self, timeout: float | None = None) -> None:
-        return None
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._pause_after_target = (
+            self.name == "camera-tuning-acquisition"
+            and type(self).pause_next_acquisition
+        )
+        if self._pause_after_target:
+            type(self).pause_next_acquisition = False
 
-    def is_alive(self) -> bool:
-        if self._first_alive:
-            self._first_alive = False
-            self.release_read.set()
-            self.real.join(0.5)
-            return True
-        return self.real.is_alive()
+    def run(self) -> None:
+        super().run()
+        if self._pause_after_target:
+            type(self).target_returned.set()
+            assert type(self).allow_thread_exit.wait(2.0)
 
 
-def test_deferred_cleanup_handoff_closes_if_owner_exits_during_alive_observation() -> None:
+def test_deferred_cleanup_closes_after_real_thread_target_return_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_thread = threading.Thread
+    TargetReturnPauseThread.pause_next_acquisition = True
+    TargetReturnPauseThread.target_returned = threading.Event()
+    TargetReturnPauseThread.allow_thread_exit = threading.Event()
+    monkeypatch.setattr(threading, "Thread", TargetReturnPauseThread)
     blocked = BlockingReadCamera(frame(1))
     replacement = FakeCamera([frame(2)])
     service = CameraTuningService(
@@ -841,19 +851,34 @@ def test_deferred_cleanup_handoff_closes_if_owner_exits_during_alive_observation
     )
     service.start()
     assert blocked.read_started.wait(0.5)
-    real_thread = service._acquisition_thread
-    assert real_thread is not None
-    service._acquisition_thread = HandoffRaceThread(  # type: ignore[assignment]
-        real_thread, blocked.release_read
-    )
+    acquisition = service._acquisition_thread
+    assert isinstance(acquisition, original_thread)
 
-    service.stop()
+    assert service._camera_stop is not None
+    service._camera_stop.set()
+    blocked.release_read.set()
+    assert TargetReturnPauseThread.target_returned.wait(0.5)
+    assert acquisition.is_alive()
 
-    assert blocked.close_count == 1
-    assert service.runtime_snapshot().state == "Stopped"
-    service.start()
+    started = time.monotonic()
     service.stop()
-    wait_until(lambda: replacement.close_count == 1)
+    assert time.monotonic() - started < 0.2
+    assert blocked.close_count == 0
+
+    TargetReturnPauseThread.allow_thread_exit.set()
+    try:
+        wait_until(lambda: blocked.close_count == 1)
+        wait_until(
+            lambda: service._camera is None
+            and service._acquisition_thread is None
+            and service._camera_stop is None
+        )
+        service.start()
+        service.stop()
+        wait_until(lambda: replacement.close_count == 1)
+    finally:
+        TargetReturnPauseThread.allow_thread_exit.set()
+        service.stop()
 
 
 def analysis_thread_count() -> int:
@@ -912,12 +937,93 @@ def test_blocked_detector_worker_is_not_replaced_or_run_concurrently_on_restart(
     assert len(factory.created) == 1
     assert maximum == 1
 
+    old_diagnostics = service._diagnostics_thread
+    old_detection = service._detection_thread
+    assert old_diagnostics is not None and old_detection is not None
     release.set()
-    wait_until(lambda: analysis_thread_count() == 0 or active == 0)
+    wait_until(lambda: not old_diagnostics.is_alive() and not old_detection.is_alive())
     service.start()
     try:
         time.sleep(0.03)
         assert maximum == 1
+    finally:
+        service.stop()
+
+
+def test_low_fps_analysis_workers_exit_immediately_after_blocked_detector_returns() -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingDetector:
+        def detect(self, image: np.ndarray, *, captured_ns: int) -> BoardObservation | None:
+            started.set()
+            assert release.wait(2.0)
+            return observation(captured_ns)
+
+    factory = FakeFactory([FakeCamera([frame(1)]), FakeCamera([frame(2)])])
+    service = CameraTuningService(
+        camera_factory=factory,
+        base_config=config(),
+        detector=BlockingDetector(),
+        read_timeout_ms=2,
+        confirm_timeout_s=0.05,
+        diagnostics_fps=0.01,
+        detection_fps=0.01,
+        shutdown_timeout_s=0.01,
+        disconnect_timeout_threshold=1000,
+    )
+    service.start()
+    assert started.wait(0.5)
+    old_diagnostics = service._diagnostics_thread
+    old_detection = service._detection_thread
+    assert old_diagnostics is not None and old_detection is not None
+
+    service.stop()
+    assert old_detection.is_alive()
+    release.set()
+    wait_until(
+        lambda: not old_diagnostics.is_alive() and not old_detection.is_alive(),
+        timeout_s=0.2,
+    )
+
+    service.start()
+    try:
+        assert service._diagnostics_thread is not old_diagnostics
+        assert service._detection_thread is not old_detection
+        assert service.runtime_snapshot().state == "Connected"
+    finally:
+        service.stop()
+
+
+def test_stale_detection_exception_after_disable_does_not_publish_error() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    detector_returned = threading.Event()
+
+    class FailingDetector:
+        def detect(self, image: np.ndarray, *, captured_ns: int) -> BoardObservation | None:
+            started.set()
+            try:
+                assert release.wait(2.0)
+                raise RuntimeError("stale detector failure")
+            finally:
+                detector_returned.set()
+
+    service = make_service(
+        FakeFactory([FakeCamera([frame(1)])]), detector=FailingDetector()
+    )
+    service.start()
+    assert started.wait(0.5)
+    service.set_detection_enabled(False)
+    release.set()
+    try:
+        assert detector_returned.wait(0.5)
+        detection = service.latest_detection()
+        assert detection.enabled is False
+        assert detection.detected is False
+        assert detection.source_sequence is None
+        assert detection.error is None
+        assert service.runtime_snapshot().last_error is None
     finally:
         service.stop()
 
