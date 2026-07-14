@@ -77,6 +77,10 @@ class _RateWindow:
             self._events.popleft()
 
 
+class _MutationCancelled(RuntimeError):
+    """An in-flight start/apply was invalidated by a shutdown request."""
+
+
 class _AnalysisWakeup:
     def __init__(self) -> None:
         self.condition = threading.Condition()
@@ -145,6 +149,9 @@ class CameraTuningService:
         self._session_generation = 0
         self._session_active = False
         self._running = False
+        self._shutdown_requested = False
+        self._shutdown_generation = 0
+        self._active_mutations = 0
 
         # Analysis workers are one bounded pair per running lifecycle. A blocked
         # worker prevents replacement, so detector calls cannot overlap on restart.
@@ -179,39 +186,81 @@ class CameraTuningService:
         self._detection_rate = _RateWindow()
 
     def start(self) -> None:
+        with self._lock:
+            invocation_generation = self._shutdown_generation
+            invocation_saw_shutdown = self._shutdown_requested
+            if invocation_saw_shutdown and (
+                self._active_mutations > 0
+                or not self._shutdown_cleanup_complete_locked()
+            ):
+                raise RuntimeError("camera shutdown or cleanup is still in progress")
         with self._operation_lock:
-            with self._lock:
-                if self._running:
-                    return
-                if self._camera is not None or self._acquisition_thread is not None:
-                    raise RuntimeError("camera handle is still pending cleanup")
-                self._state = "Starting"
-                self._last_error = None
-            self._ensure_analysis_workers()
-
+            mutation_generation: int | None = None
+            mutation_registered = False
             try:
-                camera, confirming_frame = self._open_and_confirm(
-                    self._applied.to_camera_config(self._base_config)
-                )
-            except BaseException as exc:
-                self._stop_analysis_workers()
-                self._set_state("Disconnected", str(exc))
-                raise
+                with self._lock:
+                    if self._shutdown_requested:
+                        if (
+                            not invocation_saw_shutdown
+                            or not self._shutdown_cleanup_complete_locked()
+                        ):
+                            raise RuntimeError(
+                                "camera shutdown or cleanup is still in progress"
+                            )
+                        self._shutdown_requested = False
+                        self._shutdown_generation += 1
+                    elif invocation_generation != self._shutdown_generation:
+                        raise RuntimeError("camera start was cancelled by shutdown")
+                    if self._running:
+                        return
+                    if self._camera is not None or self._acquisition_thread is not None:
+                        raise RuntimeError("camera handle is still pending cleanup")
+                    self._active_mutations += 1
+                    mutation_registered = True
+                    mutation_generation = self._shutdown_generation
+                    self._state = "Starting"
+                    self._last_error = None
+                self._ensure_analysis_workers()
 
-            self._install_session(
-                camera, confirming_frame, parameters=self._applied, error=None
-            )
+                try:
+                    camera, confirming_frame = self._open_and_confirm(
+                        self._applied.to_camera_config(self._base_config),
+                        mutation_generation=mutation_generation,
+                    )
+                    self._install_session(
+                        camera,
+                        confirming_frame,
+                        parameters=self._applied,
+                        error=None,
+                        mutation_generation=mutation_generation,
+                    )
+                except BaseException as exc:
+                    if not isinstance(exc, _MutationCancelled):
+                        with self._lock:
+                            cancelled = self._mutation_cancelled_locked(
+                                mutation_generation
+                            )
+                        if not cancelled:
+                            self._set_state("Disconnected", str(exc))
+                    raise
+            finally:
+                if mutation_registered:
+                    with self._lock:
+                        self._active_mutations -= 1
+                self._finish_shutdown_after_mutation()
 
     def stop(self) -> None:
         deadline = time.monotonic() + self._shutdown_timeout_s
-        with self._operation_lock:
+        self._publish_shutdown_intent()
+        if not self._operation_lock.acquire(timeout=self._remaining(deadline)):
+            return
+        try:
             with self._lock:
                 already_stopped = (
                     self._state == "Stopped"
                     and self._camera is None
                     and self._acquisition_thread is None
                 )
-                self._running = False
             if already_stopped:
                 self._stop_analysis_workers(timeout_s=self._remaining(deadline))
                 return
@@ -241,107 +290,166 @@ class CameraTuningService:
                 if self._camera is None:
                     self._state = "Stopped"
                     self._last_error = None
+        finally:
+            self._operation_lock.release()
 
     def apply_parameters(
         self, candidate: EditableCameraParameters
     ) -> EditableCameraParameters:
         candidate = self._bounds.validate(candidate)
+        with self._lock:
+            mutation_generation = self._shutdown_generation
         with self._operation_lock:
-            with self._lock:
-                if not self._running or not self._session_active:
-                    raise RuntimeError("camera tuning service is not running")
-                if self._deferred_cleanup:
-                    raise RuntimeError("camera session is pending cleanup")
-                last_good = self._applied
-                self._state = "Applying"
-                self._last_error = None
-
-            shutdown_error = "camera acquisition did not stop before apply timeout"
-            if not self._stop_acquisition(shutdown_error):
-                error = RuntimeError(shutdown_error)
-                raise ParameterApplyError(
-                    f"apply failed: {error}", apply_error=error
-                ) from error
-
-            close_deadline = time.monotonic() + self._shutdown_timeout_s
-            close_completed, close_error = self._close_camera(
-                deadline=close_deadline,
-                pending_error="camera close cleanup is still in progress",
-            )
-            if not close_completed:
-                error = RuntimeError("camera close did not finish before apply timeout")
-                message = f"apply failed: {error}"
-                with self._lock:
-                    self._running = False
-                    self._state = "Disconnected"
-                    self._last_error = message
-                raise ParameterApplyError(message, apply_error=error) from error
-            if close_error is not None:
-                message = f"apply failed: camera close failed: {close_error}"
-                with self._lock:
-                    self._running = False
-                    self._state = "Disconnected"
-                    self._last_error = message
-                raise ParameterApplyError(
-                    message, apply_error=close_error
-                ) from close_error
-
-            apply_error: BaseException | None = None
+            mutation_registered = False
             try:
-                camera, confirming_frame = self._open_and_confirm(
-                    candidate.to_camera_config(self._base_config)
-                )
-            except BaseException as exc:
-                apply_error = exc
-
-            if apply_error is not None:
                 with self._lock:
-                    retained_handle = self._camera is not None
-                if retained_handle:
-                    message = f"apply failed: {apply_error}; camera cleanup failed"
-                    with self._lock:
-                        self._running = False
-                        self._state = "Disconnected"
-                        self._last_error = message
-                    raise ParameterApplyError(
-                        message, apply_error=apply_error
-                    ) from apply_error
+                    if self._mutation_cancelled_locked(mutation_generation):
+                        raise RuntimeError("camera mutation was cancelled by shutdown")
+                    self._active_mutations += 1
+                    mutation_registered = True
+                    if self._mutation_cancelled_locked(mutation_generation):
+                        raise RuntimeError("camera mutation was cancelled by shutdown")
+                    if not self._running or not self._session_active:
+                        raise RuntimeError("camera tuning service is not running")
+                    if self._deferred_cleanup:
+                        raise RuntimeError("camera session is pending cleanup")
+                    last_good = self._applied
+                    self._state = "Applying"
+                    self._last_error = None
 
-                self._set_state("Recovering", str(apply_error))
-                try:
-                    rollback_camera, rollback_frame = self._open_and_confirm(
-                        last_good.to_camera_config(self._base_config)
-                    )
-                except BaseException as rollback_error:
-                    message = (
-                        f"apply failed: {apply_error}; rollback failed: {rollback_error}"
-                    )
-                    with self._lock:
-                        self._running = False
-                        self._session_active = False
-                        self._state = "Disconnected"
-                        self._last_error = message
+                shutdown_error = "camera acquisition did not stop before apply timeout"
+                if not self._stop_acquisition(shutdown_error):
+                    error = RuntimeError(shutdown_error)
                     raise ParameterApplyError(
-                        message,
-                        apply_error=apply_error,
-                        rollback_error=rollback_error,
-                    ) from apply_error
+                        f"apply failed: {error}", apply_error=error
+                    ) from error
 
-                self._install_session(
-                    rollback_camera,
-                    rollback_frame,
-                    parameters=last_good,
-                    error=f"apply failed and rolled back: {apply_error}",
+                close_deadline = time.monotonic() + self._shutdown_timeout_s
+                close_completed, close_error = self._close_camera(
+                    deadline=close_deadline,
+                    pending_error="camera close cleanup is still in progress",
                 )
-                raise ParameterApplyError(
-                    f"apply failed and rolled back: {apply_error}",
-                    apply_error=apply_error,
-                ) from apply_error
+                if not close_completed:
+                    error = RuntimeError("camera close did not finish before apply timeout")
+                    message = f"apply failed: {error}"
+                    with self._lock:
+                        self._running = False
+                        self._state = "Disconnected"
+                        self._last_error = message
+                    raise ParameterApplyError(message, apply_error=error) from error
+                if close_error is not None:
+                    message = f"apply failed: camera close failed: {close_error}"
+                    with self._lock:
+                        self._running = False
+                        self._state = "Disconnected"
+                        self._last_error = message
+                    raise ParameterApplyError(
+                        message, apply_error=close_error
+                    ) from close_error
 
-            self._install_session(
-                camera, confirming_frame, parameters=candidate, error=None
-            )
-            return candidate
+                self._raise_if_mutation_cancelled(mutation_generation)
+                apply_error: BaseException | None = None
+                try:
+                    camera, confirming_frame = self._open_and_confirm(
+                        candidate.to_camera_config(self._base_config),
+                        mutation_generation=mutation_generation,
+                    )
+                except BaseException as exc:
+                    apply_error = exc
+
+                if apply_error is not None:
+                    with self._lock:
+                        cancelled = self._mutation_cancelled_locked(mutation_generation)
+                        retained_handle = self._camera is not None
+                    if cancelled:
+                        error = RuntimeError("camera apply was cancelled by shutdown")
+                        raise ParameterApplyError(
+                            f"apply failed: {error}", apply_error=error
+                        ) from apply_error
+                    if retained_handle:
+                        message = f"apply failed: {apply_error}; camera cleanup failed"
+                        with self._lock:
+                            self._running = False
+                            self._state = "Disconnected"
+                            self._last_error = message
+                        raise ParameterApplyError(
+                            message, apply_error=apply_error
+                        ) from apply_error
+
+                    self._set_state("Recovering", str(apply_error))
+                    self._raise_if_mutation_cancelled(mutation_generation)
+                    try:
+                        rollback_camera, rollback_frame = self._open_and_confirm(
+                            last_good.to_camera_config(self._base_config),
+                            mutation_generation=mutation_generation,
+                        )
+                    except BaseException as rollback_error:
+                        with self._lock:
+                            cancelled = self._mutation_cancelled_locked(
+                                mutation_generation
+                            )
+                        if cancelled:
+                            error = RuntimeError(
+                                "camera rollback was cancelled by shutdown"
+                            )
+                            raise ParameterApplyError(
+                                f"apply failed: {error}",
+                                apply_error=apply_error,
+                            ) from rollback_error
+                        message = (
+                            f"apply failed: {apply_error}; "
+                            f"rollback failed: {rollback_error}"
+                        )
+                        with self._lock:
+                            self._running = False
+                            self._session_active = False
+                            self._state = "Disconnected"
+                            self._last_error = message
+                        raise ParameterApplyError(
+                            message,
+                            apply_error=apply_error,
+                            rollback_error=rollback_error,
+                        ) from apply_error
+
+                    try:
+                        self._install_session(
+                            rollback_camera,
+                            rollback_frame,
+                            parameters=last_good,
+                            error=f"apply failed and rolled back: {apply_error}",
+                            mutation_generation=mutation_generation,
+                        )
+                    except _MutationCancelled as cancelled:
+                        self._close_uninstalled_camera(rollback_camera, cancelled)
+                        error = RuntimeError("camera rollback was cancelled by shutdown")
+                        raise ParameterApplyError(
+                            f"apply failed: {error}", apply_error=apply_error
+                        ) from cancelled
+                    raise ParameterApplyError(
+                        f"apply failed and rolled back: {apply_error}",
+                        apply_error=apply_error,
+                    ) from apply_error
+
+                try:
+                    self._install_session(
+                        camera,
+                        confirming_frame,
+                        parameters=candidate,
+                        error=None,
+                        mutation_generation=mutation_generation,
+                    )
+                except _MutationCancelled as cancelled:
+                    self._close_uninstalled_camera(camera, cancelled)
+                    error = RuntimeError("camera apply was cancelled by shutdown")
+                    raise ParameterApplyError(
+                        f"apply failed: {error}", apply_error=error
+                    ) from cancelled
+                return candidate
+            finally:
+                if mutation_registered:
+                    with self._lock:
+                        self._active_mutations -= 1
+                self._finish_shutdown_after_mutation()
 
     def applied_parameters(self) -> EditableCameraParameters:
         with self._lock:
@@ -459,45 +567,56 @@ class CameraTuningService:
                     self._detection_thread = None
             return not alive
 
-    def _open_and_confirm(self, config: CameraConfig) -> tuple[CameraPort, Frame]:
-        camera = self._camera_factory(config)
+    def _open_and_confirm(
+        self, config: CameraConfig, *, mutation_generation: int
+    ) -> tuple[CameraPort, Frame]:
+        camera: CameraPort | None = None
         try:
+            camera = self._camera_factory(config)
+            self._raise_if_mutation_cancelled(mutation_generation)
             camera.open()
+            self._raise_if_mutation_cancelled(mutation_generation)
             deadline_ns = self._clock_ns() + int(
                 self._confirm_timeout_s * 1_000_000_000
             )
             while True:
                 try:
                     candidate = camera.read(timeout_ms=self._read_timeout_ms)
+                    self._raise_if_mutation_cancelled(mutation_generation)
                     return camera, self._freeze_frame(candidate)
                 except TimeoutError:
                     with self._lock:
                         self._timeout_count += 1
+                    self._raise_if_mutation_cancelled(mutation_generation)
                     if self._clock_ns() >= deadline_ns:
                         raise TimeoutError(
                             "timed out waiting for a confirming camera frame"
                         )
         except BaseException as primary_error:
-            with self._lock:
-                if self._camera is not None:
-                    raise RuntimeError(
-                        f"{primary_error}; another camera handle is pending cleanup"
-                    ) from primary_error
-                self._camera = camera
-            deadline = time.monotonic() + self._shutdown_timeout_s
-            close_completed, close_error = self._close_camera(
-                deadline=deadline,
-                pending_error=f"{primary_error}; camera close cleanup is still in progress",
-            )
-            if not close_completed:
-                raise RuntimeError(
-                    f"{primary_error}; camera close did not finish before shutdown timeout"
-                ) from primary_error
-            if close_error is not None:
-                raise RuntimeError(
-                    f"{primary_error}; camera close failed: {close_error}"
-                ) from primary_error
+            if camera is not None:
+                self._close_uninstalled_camera(camera, primary_error)
             raise
+
+    def _close_uninstalled_camera(
+        self, camera: CameraPort, primary_error: BaseException
+    ) -> None:
+        with self._lock:
+            if self._camera is not None and self._camera is not camera:
+                raise RuntimeError(
+                    f"{primary_error}; another camera handle is pending cleanup"
+                ) from primary_error
+            self._camera = camera
+        deadline = time.monotonic() + self._shutdown_timeout_s
+        close_completed, close_error = self._close_camera(
+            deadline=deadline,
+            pending_error=f"{primary_error}; camera close cleanup is still in progress",
+        )
+        if not close_completed:
+            return
+        if close_error is not None:
+            raise RuntimeError(
+                f"{primary_error}; camera close failed: {close_error}"
+            ) from primary_error
 
     def _install_session(
         self,
@@ -506,10 +625,13 @@ class CameraTuningService:
         *,
         parameters: EditableCameraParameters,
         error: str | None,
+        mutation_generation: int,
     ) -> None:
         stop_event = threading.Event()
         target_done = threading.Event()
         with self._lock:
+            if self._mutation_cancelled_locked(mutation_generation):
+                raise _MutationCancelled("camera session install cancelled by shutdown")
             self._session_generation += 1
             generation = self._session_generation
             acquisition = threading.Thread(
@@ -534,8 +656,70 @@ class CameraTuningService:
             self._publish_frozen_frame_locked(confirming_frame, reset_sequence=True)
             self._state = "Connected"
             self._last_error = error
-        acquisition.start()
+            acquisition.start()
         self._wake_analysis_workers()
+
+    def _publish_shutdown_intent(self) -> None:
+        with self._lock:
+            self._shutdown_generation += 1
+            self._shutdown_requested = True
+            self._running = False
+            self._session_active = False
+            self._session_generation += 1
+            self._reset_derived_locked()
+            camera_stop = self._camera_stop
+            analysis_stop = self._analysis_stop
+            close_failed = (
+                self._camera_close_owner is not None
+                and self._camera_close_done is not None
+                and self._camera_close_done.is_set()
+                and self._camera_close_error is not None
+            )
+            if not close_failed and not self._shutdown_cleanup_complete_locked():
+                self._state = "Disconnected"
+                self._last_error = "camera shutdown is in progress"
+        if camera_stop is not None:
+            camera_stop.set()
+        analysis_stop.set()
+        self._wake_analysis_workers()
+
+    def _mutation_cancelled_locked(self, generation: int) -> bool:
+        return self._shutdown_requested or generation != self._shutdown_generation
+
+    def _raise_if_mutation_cancelled(self, generation: int) -> None:
+        with self._lock:
+            if self._mutation_cancelled_locked(generation):
+                raise _MutationCancelled("camera mutation cancelled by shutdown")
+
+    def _shutdown_cleanup_complete_locked(self) -> bool:
+        if self._active_mutations > 0:
+            return False
+        analysis_alive = any(
+            thread is not None and thread.is_alive()
+            for thread in (self._diagnostics_thread, self._detection_thread)
+        )
+        cleanup_alive = (
+            self._cleanup_thread is not None and self._cleanup_thread.is_alive()
+        )
+        return (
+            self._camera is None
+            and self._camera_close_owner is None
+            and self._acquisition_thread is None
+            and not self._deferred_cleanup
+            and not cleanup_alive
+            and not analysis_alive
+        )
+
+    def _finish_shutdown_after_mutation(self) -> None:
+        with self._lock:
+            requested = self._shutdown_requested
+        if not requested:
+            return
+        self._stop_analysis_workers(timeout_s=self._shutdown_timeout_s)
+        with self._lock:
+            if self._shutdown_cleanup_complete_locked():
+                self._state = "Stopped"
+                self._last_error = None
 
     def _stop_acquisition(
         self, timeout_error: str, *, timeout_s: float | None = None

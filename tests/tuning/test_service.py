@@ -304,10 +304,21 @@ def test_stop_is_idempotent_closes_once_and_service_can_restart() -> None:
     assert second.close_count == 1
 
 
-def test_stop_waits_for_apply_then_closes_new_camera_without_deadlock() -> None:
+def test_stop_is_bounded_and_cancels_apply_blocked_in_candidate_open() -> None:
     original = FakeCamera([frame(1)])
     candidate_camera = BlockingOpenCamera([frame(20)])
-    service = make_service(FakeFactory([original, candidate_camera]))
+    replacement = FakeCamera([frame(30)])
+    factory = FakeFactory([original, candidate_camera, replacement])
+    service = CameraTuningService(
+        camera_factory=factory,
+        base_config=config(),
+        read_timeout_ms=2,
+        confirm_timeout_s=0.05,
+        diagnostics_fps=100.0,
+        detection_fps=100.0,
+        shutdown_timeout_s=0.03,
+        disconnect_timeout_threshold=1000,
+    )
     service.start()
     apply_error: list[BaseException] = []
 
@@ -317,21 +328,56 @@ def test_stop_waits_for_apply_then_closes_new_camera_without_deadlock() -> None:
         except BaseException as exc:
             apply_error.append(exc)
 
-    apply_thread = threading.Thread(target=apply)
+    apply_thread = threading.Thread(target=apply, daemon=True)
     apply_thread.start()
     assert candidate_camera.open_started.wait(0.5)
-    stop_thread = threading.Thread(target=service.stop)
+
+    stop_returned = threading.Event()
+    stop_started = time.monotonic()
+    stop_thread = threading.Thread(
+        target=lambda: (service.stop(), stop_returned.set()), daemon=True
+    )
     stop_thread.start()
-    time.sleep(0.02)
-    assert stop_thread.is_alive()
-    candidate_camera.allow_open.set()
+    try:
+        assert stop_returned.wait(0.12), "stop waited without bound for operation lock"
+        assert time.monotonic() - stop_started < 0.12
+        assert apply_thread.is_alive()
+        runtime = service.runtime_snapshot()
+        assert runtime.state == "Disconnected"
+        assert runtime.last_error is not None and "shutdown" in runtime.last_error
+        with pytest.raises(RuntimeError, match="shutdown|cleanup|camera"):
+            service.start()
+
+        remaining = 0.16 - (time.monotonic() - stop_started)
+        if remaining > 0:
+            time.sleep(remaining)
+    finally:
+        candidate_camera.allow_open.set()
+
     apply_thread.join(1.0)
     stop_thread.join(1.0)
     assert not apply_thread.is_alive() and not stop_thread.is_alive()
-    assert apply_error == []
+    assert len(apply_error) == 1
+    assert isinstance(apply_error[0], ParameterApplyError)
+    assert candidate_camera.open_count == 1
+    assert candidate_camera.read_count == 0
     assert candidate_camera.close_count == 1
-    assert service.runtime_snapshot().state == "Stopped"
+    assert original.close_count == 1
+    wait_until(
+        lambda: service._camera is None
+        and service._acquisition_thread is None
+        and service._diagnostics_thread is None
+        and service._detection_thread is None
+        and service.runtime_snapshot().state == "Stopped"
+    )
 
+    service.start()
+    try:
+        assert service.latest_frame() is not None
+        assert service.latest_frame().sequence == 30
+    finally:
+        service.stop()
+    assert replacement.close_count == 1
 
 
 def test_service_is_exported_from_tuning_package() -> None:
@@ -368,7 +414,7 @@ def test_blocked_detection_cannot_deadlock_stop_or_publish_into_restarted_sessio
     assert not stop_thread.is_alive()
     assert first.close_count == 1
 
-    with pytest.raises(RuntimeError, match="analysis"):
+    with pytest.raises(RuntimeError, match="analysis|shutdown|cleanup"):
         service.start()
     release_first.set()
     wait_until(lambda: service._detection_thread is None or not service._detection_thread.is_alive())
@@ -1103,7 +1149,7 @@ def test_blocked_detector_worker_is_not_replaced_or_run_concurrently_on_restart(
     assert started.wait(0.5)
     service.stop()
     assert service.runtime_snapshot().state == "Stopped"
-    with pytest.raises(RuntimeError, match="analysis"):
+    with pytest.raises(RuntimeError, match="analysis|shutdown|cleanup"):
         service.start()
     assert len(factory.created) == 1
     assert maximum == 1
@@ -1365,11 +1411,17 @@ def test_apply_commits_candidate_parameters_and_frame_atomically() -> None:
     allow_install = threading.Event()
     original_install = service._install_session
 
-    def gated_install(camera, confirming_frame, *, parameters, error):
+    def gated_install(
+        camera, confirming_frame, *, parameters, error, mutation_generation
+    ):
         entered_install.set()
         assert allow_install.wait(1.0)
         return original_install(
-            camera, confirming_frame, parameters=parameters, error=error
+            camera,
+            confirming_frame,
+            parameters=parameters,
+            error=error,
+            mutation_generation=mutation_generation,
         )
 
     service._install_session = gated_install  # type: ignore[method-assign]
