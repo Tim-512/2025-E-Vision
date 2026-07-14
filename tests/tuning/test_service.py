@@ -906,6 +906,97 @@ class BlockingCloseCamera(BlockingReadCamera):
                 self.active_close -= 1
 
 
+def test_stop_returns_within_deadline_while_normal_camera_close_is_blocked() -> None:
+    blocked = BlockingCloseCamera(frame(1))
+    replacement = FakeCamera([frame(2)])
+    factory = FakeFactory([blocked, replacement])  # type: ignore[list-item]
+    service = CameraTuningService(
+        camera_factory=factory,
+        base_config=config(),
+        read_timeout_ms=2,
+        confirm_timeout_s=0.05,
+        diagnostics_fps=100.0,
+        detection_fps=100.0,
+        shutdown_timeout_s=0.02,
+    )
+    service.start()
+    assert blocked.read_started.wait(0.5)
+    assert service._camera_stop is not None
+    service._camera_stop.set()
+    blocked.release_read.set()
+    wait_until(
+        lambda: service._acquisition_thread is not None
+        and not service._acquisition_thread.is_alive()
+    )
+
+    stop_returned = threading.Event()
+    stop_thread = threading.Thread(
+        target=lambda: (service.stop(), stop_returned.set()), daemon=True
+    )
+    stop_thread.start()
+    assert blocked.close_entered.wait(0.5)
+    try:
+        assert stop_returned.wait(0.2), "stop blocked in camera.close()"
+        stop_thread.join(0.1)
+        assert not stop_thread.is_alive()
+        runtime = service.runtime_snapshot()
+        assert runtime.state == "Disconnected"
+        assert runtime.last_error is not None and "close" in runtime.last_error
+        assert blocked.close_count == 1
+        assert service._camera is blocked
+        with pytest.raises(RuntimeError, match="cleanup|camera"):
+            service.start()
+        with pytest.raises(RuntimeError):
+            service.apply_parameters(parameters(exposure_us=1500.0))
+        assert len(factory.created) == 1
+    finally:
+        blocked.release_close.set()
+        stop_thread.join(1.0)
+
+    wait_until(
+        lambda: service._camera is None
+        and service._camera_close_owner is None
+        and service.runtime_snapshot().state == "Stopped"
+    )
+    assert blocked.close_count == 1
+    service.start()
+    service.stop()
+    wait_until(lambda: replacement.close_count == 1)
+
+
+def test_failed_camera_close_is_terminal_and_never_retried_by_concurrent_stop() -> None:
+    camera = CloseFailCamera([frame(1)])
+    replacement = FakeCamera([frame(2)])
+    factory = FakeFactory([camera, replacement])
+    service = make_service(factory)
+    service.start()
+    service.stop()
+
+    first_error = service.runtime_snapshot().last_error
+    assert camera.close_count == 1
+    assert service._camera is camera
+    assert service._camera_close_owner is camera
+    assert first_error is not None and "close exploded" in first_error
+
+    callers = [threading.Thread(target=service.stop, daemon=True) for _ in range(2)]
+    for caller in callers:
+        caller.start()
+    for caller in callers:
+        caller.join(0.2)
+        assert not caller.is_alive(), "repeated stop was not bounded"
+
+    assert camera.close_count == 1
+    assert service.runtime_snapshot().state == "Disconnected"
+    assert service.runtime_snapshot().last_error == first_error
+    assert service._camera is camera
+    assert service._camera_close_owner is camera
+    with pytest.raises(RuntimeError, match="camera"):
+        service.start()
+    with pytest.raises(RuntimeError):
+        service.apply_parameters(parameters(exposure_us=1500.0))
+    assert len(factory.created) == 1
+
+
 def test_second_stop_does_not_duplicate_deferred_close_in_progress(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

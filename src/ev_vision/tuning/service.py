@@ -129,7 +129,13 @@ class CameraTuningService:
         self._lock = threading.RLock()
         self._operation_lock = threading.Lock()
         self._camera: CameraPort | None = None
+        # A claimed camera handle is closed exactly once by its dedicated worker.
+        # A failed operation deliberately retains its owner/result as a terminal
+        # marker so repeated stop calls cannot retry an uncertain native handle.
         self._camera_close_owner: CameraPort | None = None
+        self._camera_close_done: threading.Event | None = None
+        self._camera_close_thread: threading.Thread | None = None
+        self._camera_close_error: BaseException | None = None
         self._camera_stop: threading.Event | None = None
         self._acquisition_thread: threading.Thread | None = None
         self._deferred_cleanup = False
@@ -197,6 +203,7 @@ class CameraTuningService:
             )
 
     def stop(self) -> None:
+        deadline = time.monotonic() + self._shutdown_timeout_s
         with self._operation_lock:
             with self._lock:
                 already_stopped = (
@@ -206,23 +213,34 @@ class CameraTuningService:
                 )
                 self._running = False
             if already_stopped:
-                self._stop_analysis_workers()
+                self._stop_analysis_workers(timeout_s=self._remaining(deadline))
                 return
 
             acquisition_stopped = self._stop_acquisition(
-                "camera acquisition did not stop before shutdown timeout"
+                "camera acquisition did not stop before shutdown timeout",
+                timeout_s=self._remaining(deadline),
             )
-            self._stop_analysis_workers()
+            self._stop_analysis_workers(timeout_s=self._remaining(deadline))
             if not acquisition_stopped:
                 return
 
-            close_completed, close_error = self._close_camera()
+            close_completed, close_error = self._close_camera(
+                deadline=deadline,
+                pending_error="camera close cleanup is still in progress",
+            )
             if not close_completed:
+                with self._lock:
+                    done = self._camera_close_done
+                    if self._camera is not None and (done is None or not done.is_set()):
+                        self._state = "Disconnected"
+                        self._last_error = "camera close cleanup is still in progress"
                 return
             if close_error is not None:
-                self._set_state("Disconnected", f"camera close failed: {close_error}")
                 return
-            self._set_state("Stopped", None)
+            with self._lock:
+                if self._camera is None:
+                    self._state = "Stopped"
+                    self._last_error = None
 
     def apply_parameters(
         self, candidate: EditableCameraParameters
@@ -245,15 +263,25 @@ class CameraTuningService:
                     f"apply failed: {error}", apply_error=error
                 ) from error
 
-            close_completed, close_error = self._close_camera()
+            close_deadline = time.monotonic() + self._shutdown_timeout_s
+            close_completed, close_error = self._close_camera(
+                deadline=close_deadline,
+                pending_error="camera close cleanup is still in progress",
+            )
             if not close_completed:
-                error = RuntimeError("camera close is already in progress")
+                error = RuntimeError("camera close did not finish before apply timeout")
                 message = f"apply failed: {error}"
-                self._set_state("Disconnected", message)
+                with self._lock:
+                    self._running = False
+                    self._state = "Disconnected"
+                    self._last_error = message
                 raise ParameterApplyError(message, apply_error=error) from error
             if close_error is not None:
                 message = f"apply failed: camera close failed: {close_error}"
-                self._set_state("Disconnected", message)
+                with self._lock:
+                    self._running = False
+                    self._state = "Disconnected"
+                    self._last_error = message
                 raise ParameterApplyError(
                     message, apply_error=close_error
                 ) from close_error
@@ -271,7 +299,10 @@ class CameraTuningService:
                     retained_handle = self._camera is not None
                 if retained_handle:
                     message = f"apply failed: {apply_error}; camera cleanup failed"
-                    self._set_state("Disconnected", message)
+                    with self._lock:
+                        self._running = False
+                        self._state = "Disconnected"
+                        self._last_error = message
                     raise ParameterApplyError(
                         message, apply_error=apply_error
                     ) from apply_error
@@ -405,7 +436,7 @@ class CameraTuningService:
         detection.start()
         diagnostics.start()
 
-    def _stop_analysis_workers(self) -> bool:
+    def _stop_analysis_workers(self, *, timeout_s: float | None = None) -> bool:
         with self._lock:
             stop_event = self._analysis_stop
             threads = (self._diagnostics_thread, self._detection_thread)
@@ -413,9 +444,12 @@ class CameraTuningService:
         self._notify_analysis_worker(self._diagnostics_wakeup)
         self._notify_analysis_worker(self._detection_wakeup)
         current = threading.current_thread()
+        deadline = time.monotonic() + (
+            self._shutdown_timeout_s if timeout_s is None else max(0.0, timeout_s)
+        )
         for thread in threads:
             if thread is not None and thread is not current:
-                thread.join(timeout=self._shutdown_timeout_s)
+                thread.join(timeout=self._remaining(deadline))
         with self._lock:
             alive = any(thread is not None and thread.is_alive() for thread in threads)
             if not alive:
@@ -444,16 +478,25 @@ class CameraTuningService:
                             "timed out waiting for a confirming camera frame"
                         )
         except BaseException as primary_error:
-            try:
-                camera.close()
-            except BaseException as close_error:
-                with self._lock:
-                    self._camera = camera
-                    self._state = "Disconnected"
-                    self._last_error = (
-                        f"{primary_error}; camera close failed: {close_error}"
-                    )
-                raise RuntimeError(self._last_error) from primary_error
+            with self._lock:
+                if self._camera is not None:
+                    raise RuntimeError(
+                        f"{primary_error}; another camera handle is pending cleanup"
+                    ) from primary_error
+                self._camera = camera
+            deadline = time.monotonic() + self._shutdown_timeout_s
+            close_completed, close_error = self._close_camera(
+                deadline=deadline,
+                pending_error=f"{primary_error}; camera close cleanup is still in progress",
+            )
+            if not close_completed:
+                raise RuntimeError(
+                    f"{primary_error}; camera close did not finish before shutdown timeout"
+                ) from primary_error
+            if close_error is not None:
+                raise RuntimeError(
+                    f"{primary_error}; camera close failed: {close_error}"
+                ) from primary_error
             raise
 
     def _install_session(
@@ -494,7 +537,9 @@ class CameraTuningService:
         acquisition.start()
         self._wake_analysis_workers()
 
-    def _stop_acquisition(self, timeout_error: str) -> bool:
+    def _stop_acquisition(
+        self, timeout_error: str, *, timeout_s: float | None = None
+    ) -> bool:
         with self._lock:
             stop_event = self._camera_stop
             acquisition = self._acquisition_thread
@@ -506,7 +551,11 @@ class CameraTuningService:
             stop_event.set()
         current = threading.current_thread()
         if acquisition is not None and acquisition is not current:
-            acquisition.join(timeout=self._shutdown_timeout_s)
+            acquisition.join(
+                timeout=self._shutdown_timeout_s
+                if timeout_s is None
+                else max(0.0, timeout_s)
+            )
 
         start_cleanup_waiter = False
         timed_out = acquisition is not None and acquisition.is_alive()
@@ -537,27 +586,81 @@ class CameraTuningService:
             return False
         return True
 
-    def _close_camera(self) -> tuple[bool, BaseException | None]:
+    def _close_camera(
+        self, *, deadline: float, pending_error: str
+    ) -> tuple[bool, BaseException | None]:
+        done = self._claim_camera_close(pending_error)
+        if done is None:
+            return True, None
+        done.wait(timeout=self._remaining(deadline))
+        with self._lock:
+            if not done.is_set():
+                return False, None
+            return True, self._camera_close_error
+
+    def _claim_camera_close(self, pending_error: str) -> threading.Event | None:
+        start_thread: threading.Thread | None = None
         with self._lock:
             camera = self._camera
             if camera is None:
-                return True, None
-            if self._camera_close_owner is not None:
-                return False, None
-            self._camera_close_owner = camera
+                return None
+            if self._camera_close_owner is None:
+                done = threading.Event()
+                start_thread = threading.Thread(
+                    target=self._camera_close_worker,
+                    args=(camera, done),
+                    name="camera-tuning-close",
+                    daemon=True,
+                )
+                self._camera_close_owner = camera
+                self._camera_close_done = done
+                self._camera_close_thread = start_thread
+                self._camera_close_error = None
+                self._state = "Disconnected"
+                self._last_error = pending_error
+            elif self._camera_close_owner is camera:
+                done = self._camera_close_done
+                if done is None:
+                    raise RuntimeError("camera close ownership is incomplete")
+            else:
+                raise RuntimeError("another camera handle owns close cleanup")
+        if start_thread is not None:
+            start_thread.start()
+        return done
+
+    def _camera_close_worker(
+        self, camera: CameraPort, done: threading.Event
+    ) -> None:
+        close_error: BaseException | None = None
         try:
             camera.close()
         except BaseException as exc:
-            with self._lock:
-                if self._camera_close_owner is camera:
-                    self._camera_close_owner = None
-            return True, exc
+            close_error = exc
+
         with self._lock:
-            if self._camera is camera:
-                self._camera = None
-            if self._camera_close_owner is camera:
-                self._camera_close_owner = None
-        return True, None
+            if (
+                self._camera_close_owner is camera
+                and self._camera_close_done is done
+            ):
+                self._camera_close_error = close_error
+                self._camera_close_thread = None
+                self._deferred_cleanup = False
+                self._cleanup_claimed = False
+                if close_error is None:
+                    if self._camera is camera:
+                        self._camera = None
+                    self._camera_close_owner = None
+                    self._camera_close_done = None
+                    self._camera_close_error = None
+                    if not self._running:
+                        self._state = "Stopped"
+                        self._last_error = None
+                else:
+                    # Retain both the native handle and terminal owner forever:
+                    # retrying an uncertain close would violate exactly-once.
+                    self._state = "Disconnected"
+                    self._last_error = f"camera close failed: {close_error}"
+        done.set()
 
     def _start_deferred_cleanup_waiter(
         self, acquisition: threading.Thread | None
@@ -580,9 +683,6 @@ class CameraTuningService:
         self._close_deferred_camera(thread=acquisition)
 
     def _close_deferred_camera(self, *, thread: threading.Thread | None) -> None:
-        close_completed, close_error = self._close_camera()
-        if not close_completed:
-            return
         with self._lock:
             if self._acquisition_thread is thread:
                 self._acquisition_thread = None
@@ -590,14 +690,7 @@ class CameraTuningService:
                 self._acquisition_target_done = None
             if self._cleanup_thread is threading.current_thread():
                 self._cleanup_thread = None
-            self._deferred_cleanup = False
-            self._cleanup_claimed = False
-            if close_error is not None:
-                self._state = "Disconnected"
-                self._last_error = f"camera close failed: {close_error}"
-            elif not self._running:
-                self._state = "Stopped"
-                self._last_error = None
+        self._claim_camera_close("camera close cleanup is still in progress")
 
     def _acquisition_loop(
         self,
@@ -644,7 +737,7 @@ class CameraTuningService:
                     pass
                 target_done.set()
             if claim_close:
-                self._close_deferred_camera(thread=current)
+                self._start_deferred_cleanup_waiter(current)
 
     def _diagnostics_loop(self, stop_event: threading.Event) -> None:
         last_key: tuple[int, int] | None = None
@@ -904,6 +997,10 @@ class CameraTuningService:
                 0.0, (now_ns - self._detection_computed_ns) / 1_000_000.0
             )
         return replace(result, result_age_ms=age_ms)
+
+    @staticmethod
+    def _remaining(deadline: float) -> float:
+        return max(0.0, deadline - time.monotonic())
 
     def _set_state(self, state: str, error: str | None) -> None:
         with self._lock:
