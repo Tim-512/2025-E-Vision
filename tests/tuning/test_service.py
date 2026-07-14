@@ -881,6 +881,86 @@ def test_deferred_cleanup_closes_after_real_thread_target_return_race(
         service.stop()
 
 
+class BlockingCloseCamera(BlockingReadCamera):
+    def __init__(self, confirming_frame: Frame) -> None:
+        super().__init__(confirming_frame)
+        self.close_entered = threading.Event()
+        self.release_close = threading.Event()
+        self.active_close = 0
+        self.max_active_close = 0
+
+    def close(self) -> None:
+        with self._calls_lock:
+            self.close_count += 1
+            self.active_calls += 1
+            self.active_close += 1
+            self.max_active_calls = max(self.max_active_calls, self.active_calls)
+            self.max_active_close = max(self.max_active_close, self.active_close)
+        self.close_entered.set()
+        try:
+            assert self.release_close.wait(2.0)
+            self.opened = False
+        finally:
+            with self._calls_lock:
+                self.active_calls -= 1
+                self.active_close -= 1
+
+
+def test_second_stop_does_not_duplicate_deferred_close_in_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    TargetReturnPauseThread.pause_next_acquisition = True
+    TargetReturnPauseThread.target_returned = threading.Event()
+    TargetReturnPauseThread.allow_thread_exit = threading.Event()
+    monkeypatch.setattr(threading, "Thread", TargetReturnPauseThread)
+    blocked = BlockingCloseCamera(frame(1))
+    replacement = FakeCamera([frame(2)])
+    service = CameraTuningService(
+        camera_factory=FakeFactory([blocked, replacement]),
+        base_config=config(),
+        read_timeout_ms=2,
+        confirm_timeout_s=0.05,
+        diagnostics_fps=100.0,
+        detection_fps=100.0,
+        shutdown_timeout_s=0.01,
+    )
+    service.start()
+    assert blocked.read_started.wait(0.5)
+    assert service._camera_stop is not None
+    service._camera_stop.set()
+    blocked.release_read.set()
+    assert TargetReturnPauseThread.target_returned.wait(0.5)
+
+    service.stop()
+    TargetReturnPauseThread.allow_thread_exit.set()
+    assert blocked.close_entered.wait(0.5)
+    assert blocked.close_count == 1
+
+    started = time.monotonic()
+    service.stop()
+    assert time.monotonic() - started < 0.2
+    assert blocked.close_count == 1
+    assert blocked.max_active_close == 1
+
+    blocked.release_close.set()
+    try:
+        wait_until(
+            lambda: service._camera is None
+            and service._camera_close_owner is None
+            and service._acquisition_thread is None
+            and service._camera_stop is None
+        )
+        assert blocked.close_count == 1
+        assert blocked.max_active_close == 1
+        service.start()
+        service.stop()
+        wait_until(lambda: replacement.close_count == 1)
+    finally:
+        TargetReturnPauseThread.allow_thread_exit.set()
+        blocked.release_close.set()
+        service.stop()
+
+
 def analysis_thread_count() -> int:
     return sum(
         thread.name in {"camera-tuning-diagnostics", "camera-tuning-detection"}

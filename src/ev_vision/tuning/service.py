@@ -123,6 +123,7 @@ class CameraTuningService:
         self._lock = threading.RLock()
         self._operation_lock = threading.Lock()
         self._camera: CameraPort | None = None
+        self._camera_close_owner: CameraPort | None = None
         self._camera_stop: threading.Event | None = None
         self._acquisition_thread: threading.Thread | None = None
         self._deferred_cleanup = False
@@ -209,7 +210,9 @@ class CameraTuningService:
             if not acquisition_stopped:
                 return
 
-            close_error = self._close_camera()
+            close_completed, close_error = self._close_camera()
+            if not close_completed:
+                return
             if close_error is not None:
                 self._set_state("Disconnected", f"camera close failed: {close_error}")
                 return
@@ -236,7 +239,12 @@ class CameraTuningService:
                     f"apply failed: {error}", apply_error=error
                 ) from error
 
-            close_error = self._close_camera()
+            close_completed, close_error = self._close_camera()
+            if not close_completed:
+                error = RuntimeError("camera close is already in progress")
+                message = f"apply failed: {error}"
+                self._set_state("Disconnected", message)
+                raise ParameterApplyError(message, apply_error=error) from error
             if close_error is not None:
                 message = f"apply failed: camera close failed: {close_error}"
                 self._set_state("Disconnected", message)
@@ -523,19 +531,27 @@ class CameraTuningService:
             return False
         return True
 
-    def _close_camera(self) -> BaseException | None:
+    def _close_camera(self) -> tuple[bool, BaseException | None]:
         with self._lock:
             camera = self._camera
-        if camera is None:
-            return None
+            if camera is None:
+                return True, None
+            if self._camera_close_owner is not None:
+                return False, None
+            self._camera_close_owner = camera
         try:
             camera.close()
         except BaseException as exc:
-            return exc
+            with self._lock:
+                if self._camera_close_owner is camera:
+                    self._camera_close_owner = None
+            return True, exc
         with self._lock:
             if self._camera is camera:
                 self._camera = None
-        return None
+            if self._camera_close_owner is camera:
+                self._camera_close_owner = None
+        return True, None
 
     def _start_deferred_cleanup_waiter(
         self, acquisition: threading.Thread | None
@@ -558,7 +574,9 @@ class CameraTuningService:
         self._close_deferred_camera(thread=acquisition)
 
     def _close_deferred_camera(self, *, thread: threading.Thread | None) -> None:
-        close_error = self._close_camera()
+        close_completed, close_error = self._close_camera()
+        if not close_completed:
+            return
         with self._lock:
             if self._acquisition_thread is thread:
                 self._acquisition_thread = None
