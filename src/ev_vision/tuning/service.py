@@ -77,6 +77,12 @@ class _RateWindow:
             self._events.popleft()
 
 
+class _AnalysisWakeup:
+    def __init__(self) -> None:
+        self.condition = threading.Condition()
+        self.generation = 0
+
+
 class CameraTuningService:
     """Own a latest-only camera session with transactional parameter changes."""
 
@@ -136,8 +142,8 @@ class CameraTuningService:
 
         # Analysis workers are one bounded pair per running lifecycle. A blocked
         # worker prevents replacement, so detector calls cannot overlap on restart.
-        self._diagnostics_wakeup = threading.Condition()
-        self._detection_wakeup = threading.Condition()
+        self._diagnostics_wakeup = _AnalysisWakeup()
+        self._detection_wakeup = _AnalysisWakeup()
         self._analysis_stop = threading.Event()
         self._diagnostics_thread: threading.Thread | None = None
         self._detection_thread: threading.Thread | None = None
@@ -644,6 +650,9 @@ class CameraTuningService:
         last_key: tuple[int, int] | None = None
         while not stop_event.is_set():
             started_ns = self._clock_ns()
+            wake_generation = self._analysis_wake_generation(
+                self._diagnostics_wakeup
+            )
             with self._lock:
                 if not self._session_active or self._latest_frame is None:
                     item = None
@@ -677,13 +686,18 @@ class CameraTuningService:
             self._wait_for_analysis(
                 stop_event,
                 self._diagnostics_wakeup,
+                wake_generation,
                 max(0.0, self._diagnostics_period_s - elapsed_s),
+                wake_on_change=item is None,
             )
 
     def _detection_loop(self, stop_event: threading.Event) -> None:
         last_key: tuple[int, int, int] | None = None
         while not stop_event.is_set():
             started_ns = self._clock_ns()
+            wake_generation = self._analysis_wake_generation(
+                self._detection_wakeup
+            )
             # Check disabled/no-detector/session state before copying the image.
             with self._lock:
                 detector = self._detector
@@ -748,7 +762,9 @@ class CameraTuningService:
             self._wait_for_analysis(
                 stop_event,
                 self._detection_wakeup,
+                wake_generation,
                 max(0.0, self._detection_period_s - elapsed_s),
+                wake_on_change=item is None,
             )
 
     def _wake_analysis_workers(self) -> None:
@@ -756,19 +772,34 @@ class CameraTuningService:
         self._notify_analysis_worker(self._detection_wakeup)
 
     @staticmethod
-    def _notify_analysis_worker(wakeup: threading.Condition) -> None:
-        with wakeup:
-            wakeup.notify()
+    def _analysis_wake_generation(wakeup: _AnalysisWakeup) -> int:
+        with wakeup.condition:
+            return wakeup.generation
+
+    @staticmethod
+    def _notify_analysis_worker(wakeup: _AnalysisWakeup) -> None:
+        with wakeup.condition:
+            wakeup.generation += 1
+            wakeup.condition.notify_all()
 
     @staticmethod
     def _wait_for_analysis(
         stop_event: threading.Event,
-        wakeup: threading.Condition,
+        wakeup: _AnalysisWakeup,
+        observed_generation: int,
         timeout_s: float,
+        *,
+        wake_on_change: bool,
     ) -> None:
-        with wakeup:
-            if not stop_event.is_set():
-                wakeup.wait(timeout_s)
+        with wakeup.condition:
+            if wake_on_change:
+                wakeup.condition.wait_for(
+                    lambda: stop_event.is_set()
+                    or wakeup.generation != observed_generation,
+                    timeout_s,
+                )
+            else:
+                wakeup.condition.wait_for(stop_event.is_set, timeout_s)
 
     def _detection_key_is_current_locked(self, key: tuple[int, int, int]) -> bool:
         return (

@@ -1030,6 +1030,121 @@ def test_blocked_detector_worker_is_not_replaced_or_run_concurrently_on_restart(
         service.stop()
 
 
+def test_diagnostics_wakeup_is_not_lost_between_empty_check_and_wait() -> None:
+    camera = BlockingOpenCamera([frame(1)])
+    service = CameraTuningService(
+        camera_factory=FakeFactory([camera]),
+        base_config=config(),
+        read_timeout_ms=2,
+        confirm_timeout_s=0.05,
+        diagnostics_fps=0.01,
+        detection_fps=0.01,
+        shutdown_timeout_s=0.05,
+    )
+    window_reached = threading.Event()
+    allow_wait = threading.Event()
+    original_wait = service._wait_for_analysis
+
+    def pause_before_wait(
+        stop_event: threading.Event,
+        wakeup: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        if (
+            threading.current_thread().name == "camera-tuning-diagnostics"
+            and not window_reached.is_set()
+        ):
+            window_reached.set()
+            assert allow_wait.wait(2.0)
+        original_wait(stop_event, wakeup, *args, **kwargs)
+
+    service._wait_for_analysis = pause_before_wait  # type: ignore[method-assign]
+    start_errors: list[BaseException] = []
+
+    def start_service() -> None:
+        try:
+            service.start()
+        except BaseException as exc:
+            start_errors.append(exc)
+
+    starter = threading.Thread(target=start_service)
+    starter.start()
+    try:
+        assert window_reached.wait(0.5)
+        camera.allow_open.set()
+        starter.join(0.5)
+        assert not starter.is_alive()
+        assert start_errors == []
+        allow_wait.set()
+        wait_until(lambda: service.latest_diagnostics() is not None, timeout_s=0.2)
+    finally:
+        camera.allow_open.set()
+        allow_wait.set()
+        starter.join(0.5)
+        service.stop()
+
+
+def test_detection_wakeup_is_not_lost_between_empty_check_and_wait() -> None:
+    camera = BlockingOpenCamera([frame(1)])
+    detector = FakeDetector([observation(time.monotonic_ns())])
+    service = CameraTuningService(
+        camera_factory=FakeFactory([camera]),
+        base_config=config(),
+        detector=detector,
+        read_timeout_ms=2,
+        confirm_timeout_s=0.05,
+        diagnostics_fps=0.01,
+        detection_fps=0.01,
+        shutdown_timeout_s=0.05,
+    )
+    window_reached = threading.Event()
+    allow_wait = threading.Event()
+    original_wait = service._wait_for_analysis
+
+    def pause_before_wait(
+        stop_event: threading.Event,
+        wakeup: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        if (
+            threading.current_thread().name == "camera-tuning-detection"
+            and not window_reached.is_set()
+        ):
+            window_reached.set()
+            assert allow_wait.wait(2.0)
+        original_wait(stop_event, wakeup, *args, **kwargs)
+
+    service._wait_for_analysis = pause_before_wait  # type: ignore[method-assign]
+    start_errors: list[BaseException] = []
+
+    def start_service() -> None:
+        try:
+            service.start()
+        except BaseException as exc:
+            start_errors.append(exc)
+
+    starter = threading.Thread(target=start_service)
+    starter.start()
+    try:
+        assert window_reached.wait(0.5)
+        camera.allow_open.set()
+        starter.join(0.5)
+        assert not starter.is_alive()
+        assert start_errors == []
+        allow_wait.set()
+        wait_until(
+            lambda: service.latest_detection().source_sequence == 1,
+            timeout_s=0.2,
+        )
+    finally:
+        camera.allow_open.set()
+        allow_wait.set()
+        starter.join(0.5)
+        service.stop()
+
+
 def test_low_fps_analysis_workers_exit_immediately_after_blocked_detector_returns() -> None:
     started = threading.Event()
     release = threading.Event()
