@@ -35,7 +35,10 @@ def test_tuning_dependencies_and_static_package_data_are_declared() -> None:
     assert project["tool"]["setuptools"]["package-data"]["ev_vision.web"] == [
         "static/*"
     ]
-    assert project["project"]["scripts"]["ev-vision"] == "ev_vision.cli:main"
+    assert project["project"]['scripts']["ev-vision"] == "ev_vision.cli:main"
+    assert project["project"]['scripts']["ev-camera-tuning"] == (
+        "ev_vision.web.camera_tuning_server:main"
+    )
 
 
 def test_editable_parameters_preserve_fixed_camera_format() -> None:
