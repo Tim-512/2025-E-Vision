@@ -365,6 +365,17 @@ def test_apply_value_error_is_422(app, service: FakeService) -> None:
     assert service.apply_calls == [parameters()]
 
 
+def test_apply_runtime_conflict_is_409_with_actionable_detail(app, service: FakeService) -> None:
+    service.apply_error = RuntimeError("camera tuning service is not running")
+    with TestClient(app) as client:
+        response = client.put("/api/parameters", json=PARAMETERS)
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "message": "camera tuning service is not running",
+        "apply_error": "camera tuning service is not running",
+        "rollback_error": None,
+    }
+
 def test_apply_failure_with_successful_rollback_reports_null_rollback_detail(app, service: FakeService) -> None:
     service.apply_error = ParameterApplyError(
         "apply failed; previous parameters restored",

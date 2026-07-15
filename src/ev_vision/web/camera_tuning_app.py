@@ -254,6 +254,15 @@ def create_camera_tuning_app(
             ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": str(exc),
+                    "apply_error": str(exc),
+                    "rollback_error": None,
+                },
+            ) from exc
         return {"applied": _parameters_response(applied)}
 
     @app.get("/api/diagnostics")

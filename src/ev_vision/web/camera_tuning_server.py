@@ -70,6 +70,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--diagnostic-fps", type=_positive_float, default=10.0)
     parser.add_argument("--timeout-ms", type=_positive_int, default=100)
     parser.add_argument(
+        "--shutdown-timeout",
+        type=_positive_float,
+        default=2.0,
+        help="seconds allowed for acquisition stop and camera close during parameter apply",
+    )
+    parser.add_argument(
         "--log-level",
         choices=("critical", "error", "warning", "info", "debug", "trace"),
         default="info",
@@ -108,6 +114,7 @@ def build_application(args: argparse.Namespace):
         read_timeout_ms=args.timeout_ms,
         diagnostics_fps=args.diagnostic_fps,
         detection_fps=args.detection_fps,
+        shutdown_timeout_s=args.shutdown_timeout,
     )
     storage = TuningStorage(args.output, bounds=bounds)
     return create_camera_tuning_app(

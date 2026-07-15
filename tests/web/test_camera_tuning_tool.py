@@ -22,6 +22,7 @@ def test_parser_defaults_and_safety_help() -> None:
     assert args.detection_fps == 15.0
     assert args.diagnostic_fps == 10.0
     assert args.timeout_ms == 100
+    assert args.shutdown_timeout == 2.0
     assert args.log_level == "info"
 
     help_text = parser.format_help().lower()
@@ -42,6 +43,7 @@ def test_parser_rejects_non_positive_rates_ports_and_timeout() -> None:
         ["--detection-fps", "-1"],
         ["--diagnostic-fps", "nan"],
         ["--timeout-ms", "0"],
+        ["--shutdown-timeout", "0"],
     ):
         with pytest.raises(SystemExit):
             parser.parse_args(argv)
@@ -90,6 +92,7 @@ def test_build_application_enforces_format_and_wires_one_native_api(monkeypatch,
     assert service_kwargs["read_timeout_ms"] == 100
     assert service_kwargs["diagnostics_fps"] == 10.0
     assert service_kwargs["detection_fps"] == 15.0
+    assert service_kwargs["shutdown_timeout_s"] == 2.0
     assert service_kwargs["camera_identity"].model == "MV-CA013-21UC"
     assert service_kwargs["camera_identity"].serial == "SERIAL-X"
 
