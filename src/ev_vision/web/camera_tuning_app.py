@@ -1,0 +1,375 @@
+from __future__ import annotations
+
+import asyncio
+from contextlib import asynccontextmanager
+from dataclasses import fields, is_dataclass
+from pathlib import Path
+from typing import Any, AsyncIterator
+
+import cv2
+import numpy as np
+from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, ConfigDict, StrictBool, StrictFloat, StrictInt, field_validator
+
+from ev_vision.tuning.diagnostics import render_overlay
+from ev_vision.tuning.models import (
+    CameraIdentity,
+    EditableCameraParameters,
+    OverlayOptions,
+    ParameterBounds,
+)
+from ev_vision.tuning.service import ParameterApplyError
+
+
+_NUMERIC = StrictFloat | StrictInt
+_DEFAULT_OVERLAY = OverlayOptions()
+_FIXED_FORMAT = {
+    "width": 1280,
+    "height": 1024,
+    "pixel_format": "BayerRG8",
+    "buffer_size": 2,
+}
+_PLACEHOLDER_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Camera Tuning</title>
+<link rel="stylesheet" href="/static/camera-tuning.css"></head>
+<body><main><h1>Camera Tuning</h1><p>Dashboard assets will be installed by Task 6.</p></main>
+<script src="/static/camera-tuning.js"></script></body></html>"""
+
+
+class ParameterRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    exposure_us: _NUMERIC
+    gain_db: _NUMERIC
+    acquisition_fps: _NUMERIC
+    auto_exposure: StrictBool
+    auto_gain: StrictBool
+    auto_white_balance: StrictBool
+
+    @field_validator("exposure_us", "gain_db", "acquisition_fps")
+    @classmethod
+    def reject_non_finite(cls, value: int | float) -> float:
+        converted = float(value)
+        if not np.isfinite(converted):
+            raise ValueError("numeric camera parameters must be finite")
+        return converted
+
+    def domain(self) -> EditableCameraParameters:
+        return EditableCameraParameters(
+            exposure_us=float(self.exposure_us),
+            gain_db=float(self.gain_db),
+            acquisition_fps=float(self.acquisition_fps),
+            auto_exposure=self.auto_exposure,
+            auto_gain=self.auto_gain,
+            auto_white_balance=self.auto_white_balance,
+        )
+
+
+class ProfileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    display_name: str | None = None
+    parameters: ParameterRequest
+
+
+class OverlayRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    overlay: StrictBool = True
+    show_board_outline: StrictBool = True
+    show_corners: StrictBool = True
+    show_center: StrictBool = True
+    show_crosshair: StrictBool = True
+    show_detection_text: StrictBool = True
+    show_center_roi: StrictBool = True
+
+    def domain(self) -> OverlayOptions:
+        return OverlayOptions(
+            enabled=self.overlay,
+            show_board_outline=self.show_board_outline,
+            show_corners=self.show_corners,
+            show_center=self.show_center,
+            show_crosshair=self.show_crosshair,
+            show_detection_text=self.show_detection_text,
+            show_center_roi=self.show_center_roi,
+        )
+
+
+def _package_static_dir() -> Path:
+    return Path(__file__).with_name("static")
+
+
+def _json_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, np.generic):
+        return _json_value(value.item())
+    if isinstance(value, np.ndarray):
+        return [_json_value(item) for item in value.tolist()]
+    if is_dataclass(value) and not isinstance(value, type):
+        return {field.name: _json_value(getattr(value, field.name)) for field in fields(value)}
+    if isinstance(value, dict):
+        return {str(key): _json_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_json_value(item) for item in value]
+    if isinstance(value, Path):
+        return value.as_posix()
+    raise TypeError(f"cannot serialize {type(value).__name__}")
+
+
+def _parameters_response(value: EditableCameraParameters) -> dict[str, Any]:
+    return _json_value(value)
+
+
+def _profile_response(profile: Any) -> dict[str, Any]:
+    return {
+        "name": profile.name,
+        "display_name": profile.display_name,
+        "draft": _parameters_response(profile.parameters),
+    }
+
+
+def _storage_error(exc: BaseException) -> HTTPException:
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=422, detail=str(exc))
+    if isinstance(exc, FileNotFoundError):
+        return HTTPException(status_code=404, detail="profile not found")
+    return HTTPException(status_code=500, detail="storage operation failed")
+
+
+def _camera_identity(service: Any) -> CameraIdentity:
+    identity = getattr(service, "camera_identity", None)
+    if callable(identity):
+        identity = identity()
+    if identity is None:
+        identity = getattr(service, "identity", None)
+    if identity is None:
+        identity = getattr(service, "_camera_identity", None)
+    if not isinstance(identity, CameraIdentity):
+        return CameraIdentity(model="", serial="")
+    return identity
+
+
+def _resize_max_width(image: np.ndarray, max_width: int | None) -> np.ndarray:
+    if max_width is None or image.shape[1] <= max_width:
+        return image
+    height = max(1, round(image.shape[0] * max_width / image.shape[1]))
+    return cv2.resize(image, (max_width, height), interpolation=cv2.INTER_AREA)
+
+
+def _encode_jpeg(image: np.ndarray) -> bytes:
+    ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    if not ok:
+        raise RuntimeError("OpenCV failed to encode preview JPEG")
+    return encoded.tobytes()
+
+
+def _multipart_frame(jpeg: bytes) -> bytes:
+    return (
+        b"--frame\r\n"
+        b"Content-Type: image/jpeg\r\n"
+        + f"Content-Length: {len(jpeg)}\r\n\r\n".encode("ascii")
+        + jpeg
+        + b"\r\n"
+    )
+
+
+def _safe_capture_contract(storage: Any, capture_dir: Path) -> str:
+    try:
+        root = Path(storage.captures_dir).parent.resolve()
+        relative = capture_dir.resolve().relative_to(root)
+        return relative.as_posix()
+    except (AttributeError, OSError, ValueError):
+        parent = capture_dir.parent.name
+        return f"{parent}/{capture_dir.name}" if parent else capture_dir.name
+
+
+def create_camera_tuning_app(
+    service: Any,
+    storage: Any,
+    project_defaults: EditableCameraParameters,
+    preview_fps: float = 20.0,
+) -> FastAPI:
+    if isinstance(preview_fps, bool) or not isinstance(preview_fps, (int, float)):
+        raise ValueError("preview_fps must be numeric")
+    if not np.isfinite(preview_fps) or preview_fps <= 0:
+        raise ValueError("preview_fps must be positive and finite")
+    ParameterBounds().validate(project_defaults)
+    interval_s = 1.0 / float(preview_fps)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        try:
+            service.start()
+            yield
+        finally:
+            service.stop()
+
+    app = FastAPI(title="Camera Tuning", lifespan=lifespan)
+    static_dir = _package_static_dir()
+    app.mount("/static", StaticFiles(directory=static_dir, check_dir=False), name="static")
+
+    @app.get("/", response_class=HTMLResponse)
+    def dashboard() -> HTMLResponse:
+        html = static_dir / "camera-tuning.html"
+        if html.is_file():
+            return HTMLResponse(html.read_text(encoding="utf-8"))
+        return HTMLResponse(_PLACEHOLDER_PAGE)
+
+    @app.get("/api/status")
+    def status() -> dict[str, Any]:
+        return {
+            "camera": _json_value(_camera_identity(service)),
+            "fixed_format": dict(_FIXED_FORMAT),
+            "runtime": _json_value(service.runtime_snapshot()),
+            "applied": _parameters_response(service.applied_parameters()),
+            "overlay": _json_value(_DEFAULT_OVERLAY),
+            "detection": _json_value(service.latest_detection()),
+        }
+
+    @app.get("/api/parameters")
+    def get_parameters() -> dict[str, Any]:
+        return {
+            "applied": _parameters_response(service.applied_parameters()),
+            "project_defaults": _parameters_response(project_defaults),
+            "bounds": _json_value(ParameterBounds()),
+        }
+
+    @app.put("/api/parameters")
+    def put_parameters(request: ParameterRequest) -> dict[str, Any]:
+        candidate = request.domain()
+        try:
+            ParameterBounds().validate(candidate)
+            applied = service.apply_parameters(candidate)
+        except ParameterApplyError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": str(exc),
+                    "apply_error": str(exc.apply_error),
+                    "rollback_error": None if exc.rollback_error is None else str(exc.rollback_error),
+                },
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"applied": _parameters_response(applied)}
+
+    @app.get("/api/diagnostics")
+    def get_diagnostics() -> dict[str, Any]:
+        return {
+            "diagnostics": _json_value(service.latest_diagnostics()),
+            "detection": _json_value(service.latest_detection()),
+        }
+
+    @app.get("/api/profiles")
+    def list_profiles() -> dict[str, Any]:
+        try:
+            return {"profiles": storage.list_profiles()}
+        except Exception as exc:
+            raise _storage_error(exc) from exc
+
+    @app.get("/api/profiles/{name}")
+    def load_profile(name: str) -> dict[str, Any]:
+        try:
+            return _profile_response(storage.load_profile(name))
+        except Exception as exc:
+            raise _storage_error(exc) from exc
+
+    @app.put("/api/profiles/{name}")
+    def save_profile(name: str, request: ProfileRequest) -> dict[str, Any]:
+        candidate = request.parameters.domain()
+        try:
+            ParameterBounds().validate(candidate)
+            profile = storage.save_profile(name, candidate, display_name=request.display_name)
+        except Exception as exc:
+            raise _storage_error(exc) from exc
+        return _profile_response(profile)
+
+    @app.delete("/api/profiles/{name}")
+    def delete_profile(name: str) -> dict[str, str]:
+        try:
+            storage.delete_profile(name)
+        except Exception as exc:
+            raise _storage_error(exc) from exc
+        return {"deleted": name}
+
+    @app.post("/api/captures")
+    def create_capture(request: OverlayRequest = Body(default_factory=OverlayRequest)) -> dict[str, Any]:
+        options = request.domain()
+        try:
+            captured = service.capture_snapshot(options)
+            overlay_image = render_overlay(
+                captured.frame.image,
+                source_sequence=captured.frame.sequence,
+                detection=captured.detection,
+                options=options,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            capture_dir = Path(storage.save_capture(captured, overlay_image))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail="storage operation failed") from exc
+        return {
+            "capture": _safe_capture_contract(storage, capture_dir),
+            "files": ["original.png", "overlay.png", "metadata.yaml"],
+        }
+
+    @app.get("/api/preview.mjpg")
+    async def preview(
+        overlay: bool = Query(True),
+        detection: bool = Query(True),
+        show_board_outline: bool = Query(True),
+        show_corners: bool = Query(True),
+        show_center: bool = Query(True),
+        show_crosshair: bool = Query(True),
+        show_detection_text: bool = Query(True),
+        show_center_roi: bool = Query(True),
+        max_width: int | None = Query(None, ge=1, le=1280),
+    ) -> StreamingResponse:
+        options = OverlayOptions(
+            enabled=overlay,
+            show_board_outline=show_board_outline,
+            show_corners=show_corners,
+            show_center=show_center,
+            show_crosshair=show_crosshair,
+            show_detection_text=show_detection_text,
+            show_center_roi=show_center_roi,
+        )
+        try:
+            service.set_detection_enabled(detection)
+        except (AttributeError, RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        async def frames() -> AsyncIterator[bytes]:
+            while True:
+                frame = service.latest_frame()
+                if frame is None:
+                    await asyncio.sleep(interval_s)
+                    continue
+                image = frame.image
+                if options.enabled:
+                    image = render_overlay(
+                        image,
+                        source_sequence=frame.sequence,
+                        detection=service.latest_detection(),
+                        options=options,
+                    )
+                image = _resize_max_width(image, max_width)
+                jpeg = _encode_jpeg(image)
+                service.record_preview_frame()
+                yield _multipart_frame(jpeg)
+                await asyncio.sleep(interval_s)
+
+        return StreamingResponse(
+            frames(),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    return app
+
+
+__all__ = ["create_camera_tuning_app"]
