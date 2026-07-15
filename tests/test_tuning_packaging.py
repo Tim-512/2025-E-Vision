@@ -30,6 +30,7 @@ def test_tuning_dependencies_and_static_package_data_are_declared() -> None:
 
     optional = project["project"]["optional-dependencies"]
     assert "httpx>=0.27" in optional["dev"]
+    assert "httpx2>=2.0" in optional["dev"]
     assert "tomli>=2.0; python_version < '3.11'" in optional["dev"]
     assert optional["tuning"] == ["fastapi>=0.110", "uvicorn>=0.27"]
     assert project["tool"]["setuptools"]["package-data"]["ev_vision.web"] == [

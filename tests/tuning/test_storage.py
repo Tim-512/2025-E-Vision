@@ -235,7 +235,10 @@ def test_profile_save_is_atomic_and_preserves_previous_file_on_replace_failure(
     target = tmp_path / "profiles" / "stable.yaml"
     before = target.read_bytes()
 
-    def fail_replace(source: object, destination: object) -> None:
+    def fail_replace(
+        source: object, destination: object, **kwargs: object
+    ) -> None:
+        assert kwargs.keys() == {"src_dir_fd", "dst_dir_fd"}
         raise OSError("replace failed")
 
     monkeypatch.setattr(os, "replace", fail_replace)
@@ -378,9 +381,8 @@ def test_capture_cleanup_never_removes_public_directory_after_validation(
     snapshot = make_capture_snapshot()
     capture_name = "20260714_010203_456"
     original_write = storage._write_capture_png
-    original_lstat = Path.lstat
+    original_open = os.open
     cleanup_started = False
-    validations = 0
     swapped = False
 
     def fail_second_write(temporary: Path, target: Path, image: object) -> None:
@@ -390,21 +392,28 @@ def test_capture_cleanup_never_removes_public_directory_after_validation(
             raise OSError("simulated capture failure")
         original_write(temporary, target, image)
 
-    def swap_after_final_validation(path: Path):
-        nonlocal validations, swapped
-        result = original_lstat(path)
-        if cleanup_started and path.name == capture_name:
-            validations += 1
-            if validations == 2 and not swapped:
-                swapped = True
-                moved = path.with_name(f"{capture_name}-moved-final")
-                path.rename(moved)
-                path.mkdir()
-                (path / "sentinel.txt").write_text("do not delete", encoding="utf-8")
-        return result
+    def swap_before_verified_open(
+        path: object, flags: int, *args: object, **kwargs: object
+    ) -> int:
+        nonlocal swapped
+        candidate = Path(path) if isinstance(path, (str, os.PathLike)) else None
+        if (
+            cleanup_started
+            and not swapped
+            and candidate is not None
+            and candidate.name == capture_name
+        ):
+            swapped = True
+            moved = candidate.with_name(f"{capture_name}-moved-final")
+            candidate.rename(moved)
+            candidate.mkdir()
+            (candidate / "sentinel.txt").write_text(
+                "do not delete", encoding="utf-8"
+            )
+        return original_open(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(storage, "_write_capture_png", fail_second_write)
-    monkeypatch.setattr(Path, "lstat", swap_after_final_validation)
+    monkeypatch.setattr(os, "open", swap_before_verified_open)
 
     with pytest.raises(OSError, match="simulated capture failure"):
         storage.save_capture(snapshot, snapshot.frame.image)
