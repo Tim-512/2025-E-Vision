@@ -1589,7 +1589,12 @@ def test_low_fps_analysis_workers_exit_immediately_after_blocked_detector_return
     assert old_detection.is_alive()
     release.set()
     wait_until(
-        lambda: not old_diagnostics.is_alive() and not old_detection.is_alive(),
+        lambda: not old_diagnostics.is_alive()
+        and not old_detection.is_alive()
+        and service._camera is None
+        and service._camera_close_owner is None
+        and service._acquisition_thread is None
+        and service.runtime_snapshot().state == "Stopped",
         timeout_s=0.2,
     )
 
