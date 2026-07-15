@@ -199,6 +199,24 @@ def test_reconfigure_updates_editable_nodes_without_reopening_device() -> None:
     camera.close()
 
 
+def test_reconfigure_accepts_frame_sequence_restart_after_grabbing_restarts() -> None:
+    packets = [
+        FakePacket(np.zeros((4, 4), np.uint8), 100, 42),
+        FakePacket(np.zeros((4, 4), np.uint8), 200, 0),
+        FakePacket(np.zeros((4, 4), np.uint8), 300, 1),
+    ]
+    api = FakeMvsApi(packets=packets)
+    camera = HikrobotCamera(api, config(), serial_number="SERIAL-A")
+    camera.open()
+
+    assert camera.read(timeout_ms=10).sequence == 42
+    camera.reconfigure(config())
+    assert camera.read(timeout_ms=10).sequence == 0
+    assert camera.read(timeout_ms=10).sequence == 1
+
+    camera.close()
+
+
 def test_reconfigure_restarts_grabbing_and_preserves_config_after_node_failure() -> None:
     class FailingApi(FakeMvsApi):
         fail_exposure = False

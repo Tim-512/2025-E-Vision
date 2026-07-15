@@ -106,10 +106,17 @@ class HikrobotCamera:
                 float(config.acquisition_fps),
             )
         except BaseException:
-            self.api.start_grabbing(handle)
+            self._restart_grabbing(handle)
             raise
-        self.api.start_grabbing(handle)
+        self._restart_grabbing(handle)
         self.config = config
+
+    def _restart_grabbing(self, handle: Any) -> None:
+        self.api.start_grabbing(handle)
+        # Hikrobot nFrameNum restarts from zero after every StartGrabbing call.
+        # A fresh buffer starts a new sequence epoch while retaining strict
+        # monotonic checks within each uninterrupted acquisition session.
+        self._buffer = LatestFrameBuffer()
 
     def close(self) -> None:
         handle, self._handle = self._handle, None
