@@ -48,3 +48,61 @@ python tools/camera_smoke_test.py \
 短测正常后运行 10 分钟验收，并在另外两个终端观察 `tegrastats` 和
 `dmesg --follow`。重点检查输出中的 `disconnect`、`timeout_rate`、
 `sequence_gap_rate`、`non_monotonic_timestamps` 与 `rss_growth_bytes`。
+
+## 浏览器相机调参与视觉诊断
+
+云台尚未完成时，可以手持相机对已制作的靶板进行调参和传统视觉测试。该页面只访问相机、图像诊断、检测、截图和参数配置档，**不提供云台或激光控制**。开发与验收期间必须让 405 nm 激光保持物理断开并关闭。
+
+### Jetson 安装与本机启动
+
+先关闭 MVS Viewer，避免其独占相机，然后执行：
+
+```bash
+cd ~/2025-E-Vision/2025-E-Vision
+conda activate 2025-e-vision
+export PYTHONPATH="/opt/MVS/Samples/aarch64/Python/MvImport${PYTHONPATH:+:$PYTHONPATH}"
+export LD_LIBRARY_PATH="/opt/MVS/lib/aarch64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+python -m pip install -e '.[vision,tuning]'
+ev-camera-tuning --config config/default.yaml --serial 00G02809155
+```
+
+默认只监听 Jetson 本机的 `127.0.0.1:8000`。在 Jetson 浏览器中打开：
+
+```text
+http://127.0.0.1:8000
+```
+
+如命令入口暂时未刷新，也可使用：
+
+```bash
+python -m ev_vision.web.camera_tuning_server \
+  --config config/default.yaml \
+  --serial 00G02809155
+```
+
+### 从 Windows 通过可信局域网访问
+
+在 Jetson 查询 IP：
+
+```bash
+hostname -I
+```
+
+仅当 Jetson 和 Windows 位于可信、隔离的局域网时，显式监听所有网卡：
+
+```bash
+ev-camera-tuning \
+  --config config/default.yaml \
+  --serial 00G02809155 \
+  --host 0.0.0.0
+```
+
+假设 `hostname -I` 显示 Jetson 地址为 `192.168.1.20`，则在 Windows 浏览器打开：
+
+```text
+http://192.168.1.20:8000
+```
+
+此开发服务没有登录认证。不得暴露到公网，不得设置路由器端口转发，也不要在不可信 Wi-Fi 上使用 `--host 0.0.0.0`。
+
+完整逐项流程见 [相机调参页面实机验收清单](docs/camera-tuning-acceptance.md)。
