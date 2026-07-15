@@ -162,3 +162,69 @@ def test_open_failure_before_handle_assignment_is_translated_without_unbound_loc
         HikrobotCamera(api, config(), serial_number="SERIAL-A").open()
 
     assert isinstance(caught.value.__cause__, RuntimeError)
+
+
+def test_reconfigure_updates_editable_nodes_without_reopening_device() -> None:
+    api = FakeMvsApi(packets=[FakePacket(np.zeros((4, 4), np.uint8), 1, 1)])
+    camera = HikrobotCamera(api, config(), serial_number="SERIAL-A")
+    camera.open()
+    calls_before = len(api.calls)
+    updated = CameraConfig(
+        width=4,
+        height=4,
+        acquisition_fps=80,
+        exposure_us=1500,
+        gain_db=8.0,
+        auto_exposure=False,
+        auto_gain=False,
+        auto_white_balance=True,
+        buffer_size=1,
+    )
+
+    camera.reconfigure(updated)
+
+    calls = api.calls[calls_before:]
+    assert calls == [
+        ("stop_grabbing",),
+        ("set_enum", "ExposureAuto", "Off"),
+        ("set_float", "ExposureTime", 1500.0),
+        ("set_enum", "GainAuto", "Off"),
+        ("set_float", "Gain", 8.0),
+        ("set_enum", "BalanceWhiteAuto", "Continuous"),
+        ("set_float", "AcquisitionFrameRate", 80.0),
+        ("start_grabbing",),
+    ]
+    assert camera.config == updated
+    assert not any(call[0] in {"list_devices", "open_device", "close_device"} for call in calls)
+    camera.close()
+
+
+def test_reconfigure_restarts_grabbing_and_preserves_config_after_node_failure() -> None:
+    class FailingApi(FakeMvsApi):
+        fail_exposure = False
+
+        def set_float(self, handle, name, value):
+            super().set_float(handle, name, value)
+            if self.fail_exposure and name == "ExposureTime":
+                raise RuntimeError("node rejected")
+
+    original = config()
+    api = FailingApi()
+    camera = HikrobotCamera(api, original, serial_number="SERIAL-A")
+    camera.open()
+    api.fail_exposure = True
+    updated = CameraConfig(
+        width=4,
+        height=4,
+        acquisition_fps=80,
+        exposure_us=1500,
+        gain_db=8.0,
+        buffer_size=1,
+    )
+
+    with pytest.raises(RuntimeError, match="node rejected"):
+        camera.reconfigure(updated)
+
+    assert api.calls[-1] == ("start_grabbing",)
+    assert camera.config == original
+    camera.close()

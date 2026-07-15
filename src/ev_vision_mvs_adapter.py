@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import time
 import atexit
+import logging
+import threading
 from ctypes import POINTER, cast
 from dataclasses import dataclass
 from typing import Any, Callable
 
 import numpy as np
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class MvsSdkError(RuntimeError):
@@ -256,11 +261,47 @@ class NativeMvsApi:
         self._check("MV_CC_FreeImageBuffer", handle.camera.MV_CC_FreeImageBuffer(packet.sdk_frame))
         packet.released = True
 
+    def _run_shutdown_stage(
+        self,
+        handle: _Handle,
+        operation: str,
+        callback: Callable[[], int],
+    ) -> None:
+        started_ns = time.monotonic_ns()
+        _LOGGER.warning(
+            "%s begin serial=%s thread=%s",
+            operation,
+            handle.serial,
+            threading.current_thread().name,
+        )
+        try:
+            self._check(operation, callback())
+        except BaseException:
+            elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
+            _LOGGER.exception(
+                "%s end status=error elapsed_ms=%.3f serial=%s",
+                operation,
+                elapsed_ms,
+                handle.serial,
+            )
+            raise
+        elapsed_ms = (time.monotonic_ns() - started_ns) / 1_000_000.0
+        _LOGGER.warning(
+            "%s end status=ok elapsed_ms=%.3f serial=%s",
+            operation,
+            elapsed_ms,
+            handle.serial,
+        )
+
     def stop_grabbing(self, handle: _Handle) -> None:
         if handle.closed or not handle.grabbing:
             return
         try:
-            self._check("MV_CC_StopGrabbing", handle.camera.MV_CC_StopGrabbing())
+            self._run_shutdown_stage(
+                handle,
+                "MV_CC_StopGrabbing",
+                handle.camera.MV_CC_StopGrabbing,
+            )
         finally:
             handle.grabbing = False
 
@@ -273,11 +314,19 @@ class NativeMvsApi:
         except Exception as exc:
             first_error = exc
         try:
-            self._check("MV_CC_CloseDevice", handle.camera.MV_CC_CloseDevice())
+            self._run_shutdown_stage(
+                handle,
+                "MV_CC_CloseDevice",
+                handle.camera.MV_CC_CloseDevice,
+            )
         except Exception as exc:
             first_error = first_error or exc
         try:
-            self._check("MV_CC_DestroyHandle", handle.camera.MV_CC_DestroyHandle())
+            self._run_shutdown_stage(
+                handle,
+                "MV_CC_DestroyHandle",
+                handle.camera.MV_CC_DestroyHandle,
+            )
         except Exception as exc:
             first_error = first_error or exc
         handle.closed = True

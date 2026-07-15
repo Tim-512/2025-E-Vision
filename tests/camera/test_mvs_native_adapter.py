@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import gc
+import logging
 from dataclasses import dataclass
 
 import numpy as np
@@ -310,3 +311,17 @@ def test_release_failure_remains_retryable_instead_of_leaking_buffer_state():
     api.release_frame(handle, packet)
     assert packet.released is True
     assert len(bindings.freed) == 2
+
+
+def test_close_logs_each_native_shutdown_stage(caplog) -> None:
+    api, bindings = make_api()
+    handle = api.open_device("SERIAL-A")
+    api.start_grabbing(handle)
+
+    with caplog.at_level(logging.INFO, logger="ev_vision_mvs_adapter"):
+        api.close_device(handle)
+
+    messages = [record.getMessage() for record in caplog.records]
+    for operation in ("MV_CC_StopGrabbing", "MV_CC_CloseDevice", "MV_CC_DestroyHandle"):
+        assert any(f"{operation} begin" in message for message in messages)
+        assert any(f"{operation} end" in message and "elapsed_ms=" in message for message in messages)

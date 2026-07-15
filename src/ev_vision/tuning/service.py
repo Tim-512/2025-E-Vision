@@ -325,6 +325,21 @@ class CameraTuningService:
                         f"apply failed: {error}", apply_error=error
                     ) from error
 
+                with self._lock:
+                    active_camera = self._camera
+                reconfigure = (
+                    getattr(active_camera, "reconfigure", None)
+                    if active_camera is not None
+                    else None
+                )
+                if callable(reconfigure):
+                    return self._apply_parameters_in_place(
+                        active_camera,
+                        candidate,
+                        last_good=last_good,
+                        mutation_generation=mutation_generation,
+                    )
+
                 close_deadline = time.monotonic() + self._shutdown_timeout_s
                 close_completed, close_error = self._close_camera(
                     deadline=close_deadline,
@@ -572,6 +587,107 @@ class CameraTuningService:
                     self._detection_thread = None
             return not alive
 
+    def _apply_parameters_in_place(
+        self,
+        camera: CameraPort,
+        candidate: EditableCameraParameters,
+        *,
+        last_good: EditableCameraParameters,
+        mutation_generation: int,
+    ) -> EditableCameraParameters:
+        reconfigure = getattr(camera, "reconfigure")
+        apply_error: BaseException | None = None
+        try:
+            reconfigure(candidate.to_camera_config(self._base_config))
+            confirming_frame = self._confirm_camera_frame(
+                camera,
+                mutation_generation=mutation_generation,
+            )
+        except BaseException as exc:
+            apply_error = exc
+
+        if apply_error is None:
+            try:
+                self._install_session(
+                    camera,
+                    confirming_frame,
+                    parameters=candidate,
+                    error=None,
+                    mutation_generation=mutation_generation,
+                )
+            except _MutationCancelled as cancelled:
+                error = RuntimeError("camera apply was cancelled by shutdown")
+                raise ParameterApplyError(
+                    f"apply failed: {error}",
+                    apply_error=error,
+                ) from cancelled
+            return candidate
+
+        with self._lock:
+            cancelled = self._mutation_cancelled_locked(mutation_generation)
+        if cancelled:
+            error = RuntimeError("camera apply was cancelled by shutdown")
+            raise ParameterApplyError(
+                f"apply failed: {error}",
+                apply_error=error,
+            ) from apply_error
+
+        self._set_state("Recovering", str(apply_error))
+        try:
+            reconfigure(last_good.to_camera_config(self._base_config))
+            rollback_frame = self._confirm_camera_frame(
+                camera,
+                mutation_generation=mutation_generation,
+            )
+            self._install_session(
+                camera,
+                rollback_frame,
+                parameters=last_good,
+                error=f"apply failed and rolled back: {apply_error}",
+                mutation_generation=mutation_generation,
+            )
+        except BaseException as rollback_error:
+            with self._lock:
+                self._running = False
+                self._session_active = False
+                self._state = "Disconnected"
+                self._last_error = (
+                    f"apply failed: {apply_error}; rollback failed: {rollback_error}"
+                )
+            raise ParameterApplyError(
+                self._last_error,
+                apply_error=apply_error,
+                rollback_error=rollback_error,
+            ) from apply_error
+
+        raise ParameterApplyError(
+            f"apply failed and rolled back: {apply_error}",
+            apply_error=apply_error,
+        ) from apply_error
+
+    def _confirm_camera_frame(
+        self,
+        camera: CameraPort,
+        *,
+        mutation_generation: int,
+    ) -> Frame:
+        deadline_ns = self._clock_ns() + int(
+            self._confirm_timeout_s * 1_000_000_000
+        )
+        while True:
+            try:
+                candidate = camera.read(timeout_ms=self._read_timeout_ms)
+                self._raise_if_mutation_cancelled(mutation_generation)
+                return self._freeze_frame(candidate)
+            except TimeoutError:
+                with self._lock:
+                    self._timeout_count += 1
+                self._raise_if_mutation_cancelled(mutation_generation)
+                if self._clock_ns() >= deadline_ns:
+                    raise TimeoutError(
+                        "timed out waiting for a confirming camera frame"
+                    )
+
     def _open_and_confirm(
         self, config: CameraConfig, *, mutation_generation: int
     ) -> tuple[CameraPort, Frame]:
@@ -581,22 +697,11 @@ class CameraTuningService:
             self._raise_if_mutation_cancelled(mutation_generation)
             camera.open()
             self._raise_if_mutation_cancelled(mutation_generation)
-            deadline_ns = self._clock_ns() + int(
-                self._confirm_timeout_s * 1_000_000_000
+            confirming_frame = self._confirm_camera_frame(
+                camera,
+                mutation_generation=mutation_generation,
             )
-            while True:
-                try:
-                    candidate = camera.read(timeout_ms=self._read_timeout_ms)
-                    self._raise_if_mutation_cancelled(mutation_generation)
-                    return camera, self._freeze_frame(candidate)
-                except TimeoutError:
-                    with self._lock:
-                        self._timeout_count += 1
-                    self._raise_if_mutation_cancelled(mutation_generation)
-                    if self._clock_ns() >= deadline_ns:
-                        raise TimeoutError(
-                            "timed out waiting for a confirming camera frame"
-                        )
+            return camera, confirming_frame
         except BaseException as primary_error:
             if camera is not None:
                 self._close_uninstalled_camera(camera, primary_error)

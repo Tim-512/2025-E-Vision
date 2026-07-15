@@ -52,6 +52,26 @@ class FakeCamera:
         return item
 
 
+class ReconfigurableFakeCamera(FakeCamera):
+    def __init__(
+        self,
+        items: Iterable[Frame | BaseException] = (),
+        *,
+        reconfigure_results: Iterable[BaseException | None] = (),
+    ) -> None:
+        super().__init__(items)
+        self.reconfigure_results = deque(reconfigure_results)
+        self.reconfigure_calls: list[CameraConfig] = []
+
+    def reconfigure(self, camera_config: CameraConfig) -> None:
+        self.reconfigure_calls.append(camera_config)
+        result = self.reconfigure_results.popleft() if self.reconfigure_results else None
+        if result is not None:
+            raise result
+        self.config = camera_config
+        self.items.append(frame(100 + len(self.reconfigure_calls)))
+
+
 class FakeFactory:
     def __init__(self, cameras: Iterable[FakeCamera]) -> None:
         self.cameras = deque(cameras)
@@ -1727,5 +1747,55 @@ def test_apply_commits_candidate_parameters_and_frame_atomically() -> None:
         final = service.capture_snapshot()
         assert final.parameters == candidate
         assert final.frame.sequence == 20
+    finally:
+        service.stop()
+
+
+def test_reconfigurable_camera_applies_repeated_parameters_without_closing_handle() -> None:
+    camera = ReconfigurableFakeCamera([frame(1)])
+    factory = FakeFactory([camera])
+    service = make_service(factory)
+    service.start()
+    try:
+        for exposure_us in (800.0, 1000.0, 1200.0, 1500.0, 2000.0, 3000.0):
+            applied = service.apply_parameters(parameters(exposure_us=exposure_us))
+            assert applied.exposure_us == exposure_us
+
+        assert len(factory.created) == 1
+        assert camera.close_count == 0
+        assert [item.exposure_us for item in camera.reconfigure_calls] == [
+            800.0,
+            1000.0,
+            1200.0,
+            1500.0,
+            2000.0,
+            3000.0,
+        ]
+        assert service.runtime_snapshot().state == "Connected"
+    finally:
+        service.stop()
+    assert camera.close_count == 1
+
+
+def test_reconfigurable_camera_rolls_back_in_place_after_candidate_failure() -> None:
+    candidate_error = RuntimeError("candidate node rejected")
+    camera = ReconfigurableFakeCamera(
+        [frame(1)],
+        reconfigure_results=[candidate_error, None],
+    )
+    factory = FakeFactory([camera])
+    service = make_service(factory)
+    service.start()
+    try:
+        with pytest.raises(ParameterApplyError, match="rolled back") as captured:
+            service.apply_parameters(parameters(exposure_us=1600.0))
+
+        assert captured.value.apply_error is candidate_error
+        assert captured.value.rollback_error is None
+        assert len(factory.created) == 1
+        assert camera.close_count == 0
+        assert [item.exposure_us for item in camera.reconfigure_calls] == [1600.0, 800.0]
+        assert service.applied_parameters().exposure_us == 800.0
+        assert service.runtime_snapshot().state == "Connected"
     finally:
         service.stop()

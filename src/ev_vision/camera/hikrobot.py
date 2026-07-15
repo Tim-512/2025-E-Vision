@@ -66,6 +66,51 @@ class HikrobotCamera:
         self._handle = handle
         return self
 
+    def reconfigure(self, config: CameraConfig) -> None:
+        """Apply editable controls without closing or recreating the MVS handle."""
+        handle = self._handle
+        if handle is None:
+            raise CameraDisconnected("camera is not open")
+        fixed_fields = ("width", "height", "pixel_format", "buffer_size")
+        changed_fixed = [
+            name for name in fixed_fields if getattr(config, name) != getattr(self.config, name)
+        ]
+        if changed_fixed:
+            raise ValueError(
+                "cannot reconfigure fixed camera fields in place: "
+                + ", ".join(changed_fixed)
+            )
+
+        self.api.stop_grabbing(handle)
+        try:
+            self.api.set_enum(
+                handle,
+                "ExposureAuto",
+                "Continuous" if config.auto_exposure else "Off",
+            )
+            self.api.set_float(handle, "ExposureTime", float(config.exposure_us))
+            self.api.set_enum(
+                handle,
+                "GainAuto",
+                "Continuous" if config.auto_gain else "Off",
+            )
+            self.api.set_float(handle, "Gain", float(config.gain_db))
+            self.api.set_enum(
+                handle,
+                "BalanceWhiteAuto",
+                "Continuous" if config.auto_white_balance else "Off",
+            )
+            self.api.set_float(
+                handle,
+                "AcquisitionFrameRate",
+                float(config.acquisition_fps),
+            )
+        except BaseException:
+            self.api.start_grabbing(handle)
+            raise
+        self.api.start_grabbing(handle)
+        self.config = config
+
     def close(self) -> None:
         handle, self._handle = self._handle, None
         if handle is None:
