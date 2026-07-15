@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Camera Tuning · 相机调参与视觉诊断</title>
+  <link rel="stylesheet" href="/static/camera-tuning.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">EV VISION / CAMERA LAB</p>
+      <h1>相机调参与视觉诊断</h1>
+    </div>
+    <div class="connection-block">
+      <span id="connection-dot" class="state-dot state-starting" aria-hidden="true"></span>
+      <div>
+        <strong id="camera-state">正在连接</strong>
+        <span id="camera-identity">等待相机信息</span>
+      </div>
+    </div>
+  </header>
+
+  <section class="rate-strip" aria-label="运行状态">
+    <div><span>采集</span><strong id="acquisition-rate">--</strong><small>FPS</small></div>
+    <div><span>预览</span><strong id="preview-rate">--</strong><small>FPS</small></div>
+    <div><span>检测</span><strong id="detection-rate">--</strong><small>FPS</small></div>
+    <div><span>诊断</span><strong id="diagnostics-rate">--</strong><small>FPS</small></div>
+    <div><span>帧延迟</span><strong id="frame-age">--</strong><small>ms</small></div>
+    <div><span>超时 / 丢帧</span><strong id="fault-counters">--</strong></div>
+  </section>
+
+  <main class="dashboard-grid">
+    <section class="panel preview-panel" aria-labelledby="preview-title">
+      <div class="panel-heading">
+        <div>
+          <p class="section-kicker">LIVE VIEW</p>
+          <h2 id="preview-title">实时画面</h2>
+        </div>
+        <div class="preview-actions">
+          <label class="switch"><input id="detection-enabled" type="checkbox" checked><span>启用检测</span></label>
+          <button id="pause-preview" type="button" class="button secondary">暂停画面</button>
+        </div>
+      </div>
+
+      <div class="preview-stage">
+        <img id="preview" alt="相机实时预览">
+        <canvas id="frozen-preview" hidden aria-label="暂停的预览画面"></canvas>
+        <div id="preview-placeholder">等待首帧…</div>
+      </div>
+
+      <div class="overlay-controls" aria-label="叠加显示">
+        <label><input id="overlay-enabled" type="checkbox" checked> 总叠加</label>
+        <label><input id="show-board-outline" type="checkbox" checked> 靶框</label>
+        <label><input id="show-corners" type="checkbox" checked> 角点</label>
+        <label><input id="show-center" type="checkbox" checked> 中心</label>
+        <label><input id="show-crosshair" type="checkbox" checked> 十字线</label>
+        <label><input id="show-detection-text" type="checkbox" checked> 检测文字</label>
+        <label><input id="show-center-roi" type="checkbox" checked> 中心 ROI</label>
+      </div>
+
+      <div class="format-note">
+        <span>固定采集格式</span>
+        <strong id="fixed-format">1280 × 1024 · BayerRG8 · Buffer 2</strong>
+      </div>
+    </section>
+
+    <aside class="panel parameters-panel" aria-labelledby="parameters-title">
+      <div class="panel-heading compact">
+        <div>
+          <p class="section-kicker">CAMERA CONTROL</p>
+          <h2 id="parameters-title">相机参数</h2>
+        </div>
+        <span id="draft-state" class="draft-badge">同步</span>
+      </div>
+
+      <form id="parameter-form" autocomplete="off">
+        <div class="field-group">
+          <div class="field-heading"><label for="exposure-us">曝光时间</label><span id="applied-exposure">当前 -- μs</span></div>
+          <div class="number-field"><input id="exposure-us" name="exposure_us" type="number" inputmode="decimal" step="1"><span>μs</span></div>
+          <label class="switch inline"><input id="auto-exposure" type="checkbox"><span>自动曝光</span></label>
+        </div>
+
+        <div class="field-group">
+          <div class="field-heading"><label for="gain-db">增益</label><span id="applied-gain">当前 -- dB</span></div>
+          <div class="number-field"><input id="gain-db" name="gain_db" type="number" inputmode="decimal" step="0.1"><span>dB</span></div>
+          <label class="switch inline"><input id="auto-gain" type="checkbox"><span>自动增益</span></label>
+        </div>
+
+        <div class="field-group">
+          <div class="field-heading"><label for="acquisition-fps">采集帧率</label><span id="applied-fps">当前 -- FPS</span></div>
+          <div class="number-field"><input id="acquisition-fps" name="acquisition_fps" type="number" inputmode="decimal" step="1"><span>FPS</span></div>
+          <label class="switch inline"><input id="auto-white-balance" type="checkbox"><span>自动白平衡</span></label>
+        </div>
+
+        <div class="button-row primary-actions">
+          <button id="apply-parameters" type="button" class="button primary">应用参数</button>
+          <button id="revert-draft" type="button" class="button secondary">撤销草稿</button>
+          <button id="restore-defaults" type="button" class="button ghost">载入项目默认值</button>
+        </div>
+        <p class="form-hint">修改只进入草稿；点击“应用参数”并收到相机确认后才会生效。</p>
+      </form>
+    </aside>
+
+    <section class="panel diagnostics-panel" aria-labelledby="diagnostics-title">
+      <div class="panel-heading compact">
+        <div>
+          <p class="section-kicker">IMAGE HEALTH</p>
+          <h2 id="diagnostics-title">图像诊断</h2>
+        </div>
+        <span id="diagnostic-sequence" class="muted">序列 --</span>
+      </div>
+
+      <div class="metric-grid">
+        <article><span>暗部裁切</span><strong id="dark-percent">--%</strong></article>
+        <article><span>亮部裁切</span><strong id="bright-percent">--%</strong></article>
+        <article><span>清晰度分数</span><strong id="focus-score">--</strong></article>
+        <article><span>靶面检测</span><strong id="detection-state">--</strong></article>
+      </div>
+
+      <div class="chart-grid">
+        <figure><figcaption>灰度直方图</figcaption><canvas id="gray-histogram" width="560" height="160"></canvas></figure>
+        <figure><figcaption>RGB 直方图</figcaption><canvas id="rgb-histogram" width="560" height="160"></canvas></figure>
+      </div>
+
+      <div class="roi-block">
+        <div><h3>中心 ROI</h3><p id="roi-description">等待诊断数据</p></div>
+        <canvas id="center-roi" width="360" height="220" aria-label="中心区域预览"></canvas>
+      </div>
+    </section>
+
+    <section class="panel storage-panel" aria-labelledby="storage-title">
+      <div class="panel-heading compact">
+        <div>
+          <p class="section-kicker">CAPTURE &amp; PROFILES</p>
+          <h2 id="storage-title">采集与配置档</h2>
+        </div>
+      </div>
+
+      <div class="capture-box">
+        <button id="capture-button" type="button" class="button primary wide">保存当前完整快照</button>
+        <p id="capture-result" class="muted">将保存原图、叠加图和 YAML 元数据。</p>
+      </div>
+
+      <div class="profile-box">
+        <label for="profile-select">已有配置档</label>
+        <select id="profile-select"><option value="">请选择</option></select>
+        <div class="button-row">
+          <button id="load-profile" type="button" class="button secondary">载入到草稿</button>
+          <button id="delete-profile" type="button" class="button danger">删除</button>
+        </div>
+
+        <label for="profile-name">配置档名称</label>
+        <input id="profile-name" type="text" maxlength="64" placeholder="例如 indoor-normal">
+        <label for="profile-display-name">显示名称（可选）</label>
+        <input id="profile-display-name" type="text" maxlength="80" placeholder="例如 室内常规光照">
+        <button id="save-profile" type="button" class="button secondary wide">保存当前草稿</button>
+      </div>
+    </section>
+  </main>
+
+  <div id="status-message" class="status-message info" role="status" aria-live="polite">正在初始化页面…</div>
+  <script src="/static/camera-tuning.js"></script>
+</body>
+</html>

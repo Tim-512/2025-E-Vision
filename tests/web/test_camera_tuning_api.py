@@ -520,3 +520,43 @@ def test_preview_no_frame_retries_until_a_frame_arrives(app, service: FakeServic
     _, first = _first_preview_chunk(app)
     assert first.startswith(b"--frame")
     assert calls == 2
+
+
+def test_dashboard_contains_required_camera_tuning_controls_without_actuator_controls(app) -> None:
+    with TestClient(app) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    html = response.text
+    required_ids = {
+        "preview",
+        "exposure-us",
+        "gain-db",
+        "acquisition-fps",
+        "auto-exposure",
+        "auto-gain",
+        "auto-white-balance",
+        "apply-parameters",
+        "revert-draft",
+        "restore-defaults",
+        "detection-enabled",
+        "pause-preview",
+        "capture-button",
+        "profile-name",
+        "profile-select",
+        "load-profile",
+        "save-profile",
+        "delete-profile",
+        "gray-histogram",
+        "rgb-histogram",
+        "center-roi",
+        "status-message",
+    }
+    for element_id in required_ids:
+        assert f'id="{element_id}"' in html
+    assert 'role="status"' in html
+    assert "/static/camera-tuning.css" in html
+    assert "/static/camera-tuning.js" in html
+    lowered = html.lower()
+    assert "laser" not in lowered
+    assert "gimbal" not in lowered
