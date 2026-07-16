@@ -227,18 +227,43 @@ class RoiBoardGeometry:
             max(1, int(round(self.canny_low * 0.75))),
             max(1, int(round(self.canny_high * 0.75))),
         )
-        edges = cv2.bitwise_or(primary_edges, secondary_edges)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
-
+        combined_edges = cv2.bitwise_or(primary_edges, secondary_edges)
+        edges = cv2.morphologyEx(
+            combined_edges,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+        )
         contours, _ = cv2.findContours(
             edges,
             cv2.RETR_TREE,
             cv2.CHAIN_APPROX_SIMPLE,
         )
+        contours = list(contours)
         model_width = model_values[2] - model_values[0]
         model_height = model_values[3] - model_values[1]
         model_area = max(model_width * model_height, 1.0)
+
+        # Real captures can have short breaks where the dark frame meets a
+        # similarly dark background. Add a bridged contour pass, but only for
+        # contours already large enough to satisfy the area safety gate. This
+        # keeps morphology-created small loops out of candidate evaluation.
+        bridged_edges = cv2.morphologyEx(
+            combined_edges,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)),
+        )
+        bridged_contours, _ = cv2.findContours(
+            bridged_edges,
+            cv2.RETR_TREE,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        minimum_contour_area = self.minimum_area_fraction * model_area
+        contours.extend(
+            contour
+            for contour in bridged_contours
+            if abs(float(cv2.contourArea(contour))) >= minimum_contour_area
+        )
+        edges = cv2.bitwise_or(edges, bridged_edges)
 
         accepted: list[_Candidate] = []
         rejected: list[_RejectedCandidate] = []
@@ -490,7 +515,7 @@ class RoiBoardGeometry:
         )
         nearby_edges = cv2.dilate(
             edges,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+            cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)),
         )
         perimeter_pixels = int(np.count_nonzero(perimeter))
         if perimeter_pixels == 0:
@@ -523,7 +548,7 @@ class RoiBoardGeometry:
         normalized_x = xx / float(output_width - 1)
         normalized_y = yy / float(output_height - 1)
         outer_inset = 0.02
-        inner_inset = 0.18
+        inner_inset = 0.12
         inside_outer = (
             (normalized_x >= outer_inset)
             & (normalized_x <= 1.0 - outer_inset)
