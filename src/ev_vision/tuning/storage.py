@@ -31,6 +31,11 @@ _PARAMETER_KEYS = frozenset(
 )
 _PROFILE_REQUIRED_KEYS = frozenset({"schema_version", "parameters"})
 _PROFILE_ALLOWED_KEYS = frozenset({"schema_version", "display_name", "parameters"})
+_CAPTURE_DEBUG_FILES = {
+    "model-candidates": "model-candidates.png",
+    "geometry-accepted": "geometry-accepted.png",
+    "geometry-rejected": "geometry-rejected.png",
+}
 
 
 @dataclass(frozen=True)
@@ -192,6 +197,13 @@ class TuningStorage:
                 capture_dir / "overlay.png",
                 overlay_image,
             )
+            for debug_name, image in self._capture_debug_images(snapshot).items():
+                filename = _CAPTURE_DEBUG_FILES[debug_name]
+                self._write_capture_png(
+                    capture_dir / f"{filename.removesuffix('.png')}.tmp.png",
+                    capture_dir / filename,
+                    image,
+                )
             _atomic_write_yaml(
                 capture_dir / "metadata.yaml",
                 self._capture_metadata(snapshot, created),
@@ -335,9 +347,28 @@ class TuningStorage:
             raise
 
     @staticmethod
+    def _capture_debug_images(snapshot: CaptureSnapshot) -> dict[str, Any]:
+        debug = snapshot.detection_debug
+        if debug is None or debug.source_sequence != snapshot.frame.sequence:
+            return {}
+        return {
+            name: debug.images[name]
+            for name in _CAPTURE_DEBUG_FILES
+            if name in debug.images
+        }
+
+    @staticmethod
     def _capture_metadata(snapshot: CaptureSnapshot, created: datetime) -> dict[str, object]:
         config = snapshot.camera_config
         identity = snapshot.camera_identity
+        debug_images = TuningStorage._capture_debug_images(snapshot)
+        debug = snapshot.detection_debug
+        debug_metadata = None
+        if debug is not None and debug.source_sequence == snapshot.frame.sequence:
+            debug_metadata = {
+                "source_sequence": debug.source_sequence,
+                "images": sorted(debug_images),
+            }
         return {
             "schema_version": CAPTURE_SCHEMA_VERSION,
             "created_utc": created.isoformat(timespec="microseconds").replace("+00:00", "Z"),
@@ -357,6 +388,7 @@ class TuningStorage:
             "runtime": _yaml_value(snapshot.runtime),
             "diagnostics": _yaml_value(snapshot.diagnostics),
             "detection": _yaml_value(snapshot.detection),
+            "detection_debug": debug_metadata,
             "overlay_options": _yaml_value(snapshot.overlay_options),
         }
 
@@ -598,6 +630,12 @@ def _remove_directory_if_identity_matches(
         "original.png",
         "overlay.tmp.png",
         "overlay.png",
+        "model-candidates.tmp.png",
+        "model-candidates.png",
+        "geometry-accepted.tmp.png",
+        "geometry-accepted.png",
+        "geometry-rejected.tmp.png",
+        "geometry-rejected.png",
         "metadata.yaml",
     )
     try:

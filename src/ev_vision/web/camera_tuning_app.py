@@ -359,6 +359,26 @@ def _safe_capture_contract(storage: Any, capture_dir: Path) -> str:
         return f"{parent}/{capture_dir.name}" if parent else capture_dir.name
 
 
+_CAPTURE_RESPONSE_FILES = frozenset(
+    {
+        "original.png",
+        "overlay.png",
+        "metadata.yaml",
+        "model-candidates.png",
+        "geometry-accepted.png",
+        "geometry-rejected.png",
+    }
+)
+
+
+def _capture_response_files(capture_dir: Path) -> list[str]:
+    return sorted(
+        path.name
+        for path in capture_dir.iterdir()
+        if path.name in _CAPTURE_RESPONSE_FILES and path.is_file()
+    )
+
+
 def create_camera_tuning_app(
     service: Any,
     storage: Any,
@@ -558,7 +578,7 @@ def create_camera_tuning_app(
             raise HTTPException(status_code=500, detail="storage operation failed") from exc
         return {
             "capture": _safe_capture_contract(storage, capture_dir),
-            "files": ["original.png", "overlay.png", "metadata.yaml"],
+            "files": _capture_response_files(capture_dir),
         }
 
     @app.get("/api/preview.mjpg")

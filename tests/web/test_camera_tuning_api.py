@@ -228,6 +228,16 @@ class FakeStorage:
         self.saved_capture = (captured, overlay_image.copy())
         capture_dir = self.root / "captures" / "20260715_010203_456"
         capture_dir.mkdir(parents=True, exist_ok=True)
+        for name in (
+            "original.png",
+            "overlay.png",
+            "metadata.yaml",
+            "model-candidates.png",
+            "geometry-accepted.png",
+        ):
+            (capture_dir / name).write_bytes(b"capture")
+        (capture_dir / "subdirectory").mkdir(exist_ok=True)
+        (capture_dir / "unexpected.txt").write_text("ignore", encoding="utf-8")
         return capture_dir
 
 
@@ -456,7 +466,13 @@ def test_capture_renders_overlay_saves_snapshot_and_returns_safe_relative_contra
     assert response.status_code == 200
     assert response.json() == {
         "capture": "captures/20260715_010203_456",
-        "files": ["original.png", "overlay.png", "metadata.yaml"],
+        "files": [
+            "geometry-accepted.png",
+            "metadata.yaml",
+            "model-candidates.png",
+            "original.png",
+            "overlay.png",
+        ],
     }
     assert storage.saved_capture is not None
     saved_snapshot, overlay = storage.saved_capture

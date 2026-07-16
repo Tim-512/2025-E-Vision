@@ -584,6 +584,20 @@ class CameraTuningService:
             cached = self._latest_detection_debug
         if cached is not None and cached.source_sequence == frame.sequence:
             return cached
+        snapshot = self._inspect_detection_debug(frame)
+        if snapshot is None:
+            return None
+        with self._lock:
+            if (
+                self._latest_detection_frame is not None
+                and self._latest_detection_frame.sequence == frame.sequence
+            ):
+                self._latest_detection_debug = snapshot
+        return snapshot
+
+    def _inspect_detection_debug(
+        self, frame: Frame
+    ) -> DetectionDebugSnapshot | None:
         detector = self._detector
         if detector is None:
             return None
@@ -595,16 +609,11 @@ class CameraTuningService:
         )
         if not isinstance(result, HybridBoardResult):
             raise RuntimeError("configured detector does not support hybrid debug results")
-        snapshot = DetectionDebugSnapshot(
-            frame.sequence, copy_debug_images(result.debug_images)
+        if result.source_sequence != frame.sequence:
+            return None
+        return DetectionDebugSnapshot(
+            result.source_sequence, copy_debug_images(result.debug_images)
         )
-        with self._lock:
-            if (
-                self._latest_detection_frame is not None
-                and self._latest_detection_frame.sequence == frame.sequence
-            ):
-                self._latest_detection_debug = snapshot
-        return snapshot
 
     def reload_detection_model(self) -> None:
         detector = self._detector
@@ -647,17 +656,30 @@ class CameraTuningService:
             if self._latest_frame is None:
                 raise RuntimeError("no camera frame is available")
             parameters = self._applied
-            return CaptureSnapshot(
-                frame=self._copy_frame(self._latest_frame),
-                parameters=parameters,
-                runtime=self._runtime_snapshot_locked(now_ns),
-                diagnostics=self._latest_diagnostics,
-                detection=self._detection_snapshot_locked(now_ns),
-                overlay_options=overlay_options or OverlayOptions(),
-                camera_config=parameters.to_camera_config(self._base_config),
-                camera_identity=self._camera_identity,
-                detection_debug=self._latest_detection_debug,
-            )
+            frame = self._copy_frame(self._latest_frame)
+            runtime = self._runtime_snapshot_locked(now_ns)
+            diagnostics = self._latest_diagnostics
+            detection = self._detection_snapshot_locked(now_ns)
+            camera_config = parameters.to_camera_config(self._base_config)
+            camera_identity = self._camera_identity
+        detection_debug = None
+        try:
+            detection_debug = self._inspect_detection_debug(frame)
+        except RuntimeError:
+            detection_debug = None
+        if detection_debug is not None and detection_debug.source_sequence != frame.sequence:
+            detection_debug = None
+        return CaptureSnapshot(
+            frame=frame,
+            parameters=parameters,
+            runtime=runtime,
+            diagnostics=diagnostics,
+            detection=detection,
+            overlay_options=overlay_options or OverlayOptions(),
+            camera_config=camera_config,
+            camera_identity=camera_identity,
+            detection_debug=detection_debug,
+        )
 
     def record_preview_frame(self) -> None:
         now_ns = self._clock_ns()

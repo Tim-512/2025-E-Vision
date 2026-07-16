@@ -364,6 +364,60 @@ def test_detection_frame_and_debug_are_latest_only_cached_and_tracker_safe() -> 
         service.stop()
 
 
+def test_capture_snapshot_inspects_newer_captured_frame_not_stale_detection_frame() -> None:
+    detector = RepeatingHybridDetector(hybrid_result())
+    camera = FakeCamera([frame(9)])
+    service = make_service(
+        FakeFactory([camera]), detector=detector, detection_fps=1000.0
+    )
+    service.start()
+    try:
+        wait_until(lambda: service.latest_detection().source_sequence == 9)
+        assert service._stop_analysis_workers()
+        with camera._lock:
+            camera.items.append(frame(10))
+        wait_until(lambda: service.latest_frame().sequence == 10)
+        calls_before_capture = len(detector.calls)
+
+        snapshot = service.capture_snapshot()
+
+        assert snapshot.frame.sequence == 10
+        assert snapshot.detection.source_sequence == 9
+        assert snapshot.detection_debug is not None
+        assert snapshot.detection_debug.source_sequence == 10
+        assert len(detector.calls) == calls_before_capture + 1
+        assert detector.calls[-1]["source_sequence"] == 10
+        assert detector.calls[-1]["include_debug"] is True
+        assert detector.calls[-1]["update_tracker"] is False
+    finally:
+        service.stop()
+
+
+def test_capture_snapshot_inspects_its_copied_frame_for_tracker_safe_debug() -> None:
+    detector = RepeatingHybridDetector(hybrid_result())
+    service = make_service(
+        FakeFactory([FakeCamera([frame(9)])]), detector=detector, detection_fps=1000.0
+    )
+    service.start()
+    try:
+        wait_until(lambda: service.latest_detection().source_sequence == 9)
+        calls_before_capture = len(detector.calls)
+
+        snapshot = service.capture_snapshot()
+
+        assert snapshot.frame.sequence == 9
+        assert snapshot.detection_debug is not None
+        assert snapshot.detection_debug.source_sequence == snapshot.frame.sequence
+        assert np.all(snapshot.detection_debug.images["edges"] == 7)
+        assert len(detector.calls) == calls_before_capture + 1
+        assert detector.calls[-1]["source_sequence"] == snapshot.frame.sequence
+        assert detector.calls[-1]["include_debug"] is True
+        assert detector.calls[-1]["update_tracker"] is False
+        assert all(call["include_debug"] is False for call in detector.calls[:-1])
+    finally:
+        service.stop()
+
+
 def test_detector_exception_publishes_model_error_and_camera_keeps_streaming() -> None:
     detector = HybridDetectorFake([RuntimeError("detector boom")])
     service = make_service(FakeFactory([FakeCamera([frame(1), frame(2)])]), detector=detector, detection_fps=1000.0)

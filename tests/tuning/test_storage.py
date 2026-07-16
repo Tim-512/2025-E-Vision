@@ -17,6 +17,7 @@ from ev_vision.models import BoardObservation, Frame
 from ev_vision.tuning.models import (
     CameraIdentity,
     CaptureSnapshot,
+    DetectionDebugSnapshot,
     DetectionSnapshot,
     EditableCameraParameters,
     ImageDiagnostics,
@@ -42,7 +43,11 @@ def make_storage(tmp_path: Path, *, now: datetime | None = None) -> TuningStorag
     return TuningStorage(tmp_path, bounds=ParameterBounds(), now=lambda: fixed_now)
 
 
-def make_capture_snapshot(*, include_diagnostics: bool = False) -> CaptureSnapshot:
+def make_capture_snapshot(
+    *,
+    include_diagnostics: bool = False,
+    detection_debug: DetectionDebugSnapshot | None = None,
+) -> CaptureSnapshot:
     image = np.zeros((12, 16, 3), dtype=np.uint8)
     image[:, :8] = (10, 20, 30)
     observation = BoardObservation(
@@ -91,6 +96,7 @@ def make_capture_snapshot(*, include_diagnostics: bool = False) -> CaptureSnapsh
         overlay_options=OverlayOptions(),
         camera_config=CameraConfig(),
         camera_identity=CameraIdentity(model="MV-CA013-21UC", serial="00G02809155"),
+        detection_debug=detection_debug,
     )
 
 
@@ -456,6 +462,82 @@ def test_yaml_value_recursively_converts_ndarrays(tmp_path: Path) -> None:
     assert metadata["detection"]["error"] == [["left", "right"]]
 
 
+def test_capture_saves_only_available_current_hybrid_debug_images(tmp_path: Path) -> None:
+    storage = make_storage(tmp_path)
+    debug_images = {
+        "model-candidates": np.full((12, 16, 3), 10, dtype=np.uint8),
+        "geometry-accepted": np.full((12, 16, 3), 20, dtype=np.uint8),
+        "geometry-rejected": np.full((12, 16, 3), 30, dtype=np.uint8),
+        "roi": np.full((12, 16, 3), 40, dtype=np.uint8),
+    }
+    snapshot = make_capture_snapshot(
+        detection_debug=DetectionDebugSnapshot(source_sequence=42, images=debug_images)
+    )
+
+    capture_dir = storage.save_capture(snapshot, np.full_like(snapshot.frame.image, 200))
+
+    assert sorted(path.name for path in capture_dir.iterdir()) == [
+        "geometry-accepted.png",
+        "geometry-rejected.png",
+        "metadata.yaml",
+        "model-candidates.png",
+        "original.png",
+        "overlay.png",
+    ]
+    for debug_name in ("model-candidates", "geometry-accepted", "geometry-rejected"):
+        saved = cv2.imdecode(
+            np.fromfile(capture_dir / f"{debug_name}.png", dtype=np.uint8),
+            cv2.IMREAD_COLOR,
+        )
+        assert np.array_equal(saved, debug_images[debug_name])
+    metadata = yaml.safe_load((capture_dir / "metadata.yaml").read_text(encoding="utf-8"))
+    assert metadata["detection_debug"] == {
+        "source_sequence": 42,
+        "images": ["geometry-accepted", "geometry-rejected", "model-candidates"],
+    }
+
+
+def test_capture_omits_unavailable_hybrid_debug_images(tmp_path: Path) -> None:
+    storage = make_storage(tmp_path)
+    snapshot = make_capture_snapshot(
+        detection_debug=DetectionDebugSnapshot(
+            source_sequence=42,
+            images={"geometry-accepted": np.full((12, 16, 3), 20, dtype=np.uint8)},
+        )
+    )
+
+    capture_dir = storage.save_capture(snapshot, np.full_like(snapshot.frame.image, 200))
+
+    assert sorted(path.name for path in capture_dir.iterdir()) == [
+        "geometry-accepted.png",
+        "metadata.yaml",
+        "original.png",
+        "overlay.png",
+    ]
+
+
+def test_capture_without_current_hybrid_debug_preserves_original_contract(
+    tmp_path: Path,
+) -> None:
+    storage = make_storage(tmp_path)
+    snapshot = make_capture_snapshot(
+        detection_debug=DetectionDebugSnapshot(
+            source_sequence=41,
+            images={"model-candidates": np.full((12, 16, 3), 10, dtype=np.uint8)},
+        )
+    )
+
+    capture_dir = storage.save_capture(snapshot, np.full_like(snapshot.frame.image, 200))
+
+    assert sorted(path.name for path in capture_dir.iterdir()) == [
+        "metadata.yaml",
+        "original.png",
+        "overlay.png",
+    ]
+    metadata = yaml.safe_load((capture_dir / "metadata.yaml").read_text(encoding="utf-8"))
+    assert metadata["detection_debug"] is None
+
+
 def test_capture_creates_png_pair_and_complete_yaml_metadata(tmp_path: Path) -> None:
     storage = make_storage(tmp_path)
     snapshot = make_capture_snapshot()
@@ -483,6 +565,7 @@ def test_capture_creates_png_pair_and_complete_yaml_metadata(tmp_path: Path) -> 
         "runtime",
         "diagnostics",
         "detection",
+        "detection_debug",
         "overlay_options",
     }
     assert metadata["schema_version"] == 1
@@ -493,6 +576,7 @@ def test_capture_creates_png_pair_and_complete_yaml_metadata(tmp_path: Path) -> 
     assert metadata["runtime"]["last_error"] is None
     assert metadata["diagnostics"] is None
     assert metadata["detection"]["observation"]["center_px"] == [7.5, 5.5]
+    assert metadata["detection_debug"] is None
     assert metadata["fixed_format"]["camera_model"] == "MV-CA013-21UC"
     assert metadata["fixed_format"]["camera_serial"] == "00G02809155"
     assert not list(capture_dir.glob("*.tmp"))
