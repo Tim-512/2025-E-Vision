@@ -165,6 +165,23 @@ class RepeatingHybridDetector(HybridDetectorFake):
         )
 
 
+class FailingReloadHybridDetector(RepeatingHybridDetector):
+    def __init__(self, result: HybridBoardResult) -> None:
+        super().__init__(result)
+        self.model_state = "READY"
+        self.model_backend = "onnx"
+        self.model_path = "target.onnx"
+        self.model_errors: tuple[str, ...] = ()
+
+    def reload_model(self) -> None:
+        self.reload_calls += 1
+        self.model_state = "UNAVAILABLE"
+        self.model_backend = "classical-diagnostic"
+        self.model_path = None
+        self.model_errors = ("replacement.onnx: load failed",)
+        raise RuntimeError(self.model_errors[0])
+
+
 class BlockingOpenCamera(FakeCamera):
     def __init__(self, items: Iterable[Frame | BaseException]) -> None:
         super().__init__(items)
@@ -451,6 +468,43 @@ def test_detection_config_update_and_model_reload_do_not_reopen_camera() -> None
         service.reload_detection_model()
         assert camera.close_count == 0
         assert detector.config == updated and detector.reload_calls == 1
+    finally:
+        service.stop()
+
+
+def test_failed_model_reload_immediately_clears_published_target_and_retained_debug() -> None:
+    camera = FakeCamera([frame(1)])
+    detector = FailingReloadHybridDetector(hybrid_result(sequence=1))
+    service = make_service(FakeFactory([camera]), detector=detector, detection_fps=1000.0)
+    service.start()
+    try:
+        wait_until(lambda: service.latest_detection().target_valid)
+        assert service.detection_frame_for_latest() is not None
+        assert service.detection_debug_for_latest() is not None
+
+        with pytest.raises(RuntimeError, match="replacement.onnx"):
+            service.reload_detection_model()
+
+        snapshot = service.latest_detection()
+        assert snapshot.enabled is True
+        assert snapshot.detected is False
+        assert snapshot.target_valid is False
+        assert snapshot.source_sequence is None
+        assert snapshot.observation is None
+        assert snapshot.corners_px == ()
+        assert snapshot.center_px is None
+        assert snapshot.homography_valid is False
+        assert snapshot.target_x_mm is None
+        assert snapshot.target_y_mm is None
+        assert snapshot.model_state == "UNAVAILABLE"
+        assert snapshot.model_backend == "classical-diagnostic"
+        assert snapshot.model_path is None
+        assert snapshot.failure_reason == "MODEL_UNAVAILABLE"
+        assert service.detection_frame_for_latest() is None
+        assert service.detection_debug_for_latest() is None
+        assert detector.model_errors == ("replacement.onnx: load failed",)
+        assert camera.close_count == 0
+        assert service.runtime_snapshot().state == "Connected"
     finally:
         service.stop()
 

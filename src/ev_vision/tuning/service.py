@@ -622,13 +622,37 @@ class CameraTuningService:
         reload_model = getattr(detector, "reload_model", None)
         if not callable(reload_model):
             raise RuntimeError("configured detector does not support model reload")
-        reload_model()
-        self._reset_detector()
         with self._lock:
-            self._detection_generation += 1
-            self._latest_detection_frame = None
-            self._latest_detection_debug = None
+            self._invalidate_detection_for_reload_locked(detector)
         self._notify_analysis_worker(self._detection_wakeup)
+        try:
+            reload_model()
+        finally:
+            with self._lock:
+                self._invalidate_detection_for_reload_locked(detector)
+            self._notify_analysis_worker(self._detection_wakeup)
+
+    def _invalidate_detection_for_reload_locked(self, detector: DetectorPort) -> None:
+        model_state = str(getattr(detector, "model_state", "UNAVAILABLE"))
+        model_backend = str(getattr(detector, "model_backend", "none"))
+        model_path = getattr(detector, "model_path", None)
+        failure_reason = (
+            "MODEL_UNAVAILABLE" if model_state.upper() == "UNAVAILABLE" else None
+        )
+        self._detection_generation += 1
+        self._detection_computed_ns = None
+        self._latest_detection_frame = None
+        self._latest_detection_debug = None
+        self._latest_detection = DetectionSnapshot(
+            enabled=self._detection_enabled,
+            detected=False,
+            target_valid=False,
+            tracking_state="SEARCHING",
+            model_state=model_state,
+            model_backend=model_backend,
+            model_path=None if model_path is None else str(model_path),
+            failure_reason=failure_reason,
+        )
 
     def set_detection_enabled(self, enabled: bool) -> None:
         if not isinstance(enabled, bool):

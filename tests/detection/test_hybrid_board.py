@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import threading
 
 import numpy as np
 import pytest
@@ -826,6 +827,19 @@ class ReloadInferenceBackend:
         return ()
 
 
+class BlockingCandidateModel:
+    backend = object()
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def detect_candidates(self, image: np.ndarray) -> tuple[BoardSearchResult, ...]:
+        self.started.set()
+        assert self.release.wait(1.0)
+        return (candidate(0.95),)
+
+
 def test_reload_model_smoke_tests_then_atomically_swaps_backend() -> None:
     from pathlib import Path
 
@@ -917,3 +931,47 @@ def test_reload_smoke_failure_never_publishes_partially_loaded_backend() -> None
     assert detector.model_state == "UNAVAILABLE"
     assert detector.model_backend == "classical-diagnostic"
     assert "smoke inference failed" in detector.model_errors[0]
+
+
+def test_detection_started_before_failed_reload_cannot_update_tracker_or_return_valid() -> None:
+    model = BlockingCandidateModel()
+    tracker = FakeTracker(state=TrackingState.TRACKING, target_valid=True)
+    errors = ("replacement.onnx: load failed",)
+    detector = HybridBoardDetector(
+        model=model,
+        geometry=FakeGeometry({0: accepted_geometry(0.9, 0.8, 0.7)}),
+        tracker=tracker,
+        model_loader=lambda config: DetectionBackendSelection(
+            None, None, "classical-diagnostic", errors
+        ),
+        model_state="READY",
+        model_backend="engine",
+        model_path="old.engine",
+    )
+    results = []
+
+    worker = threading.Thread(
+        target=lambda: results.append(
+            detector.detect(frame_image(), captured_ns=3_000, source_sequence=27)
+        )
+    )
+    worker.start()
+    assert model.started.wait(0.5)
+
+    with pytest.raises(RuntimeError, match="replacement.onnx"):
+        detector.reload_model()
+
+    model.release.set()
+    worker.join(1.0)
+
+    assert not worker.is_alive()
+    assert tracker.reset_calls == 1
+    assert tracker.update_calls == []
+    assert len(results) == 1
+    result = results[0]
+    assert result.detected is False
+    assert result.target_valid is False
+    assert result.corners_px is None
+    assert result.center_px is None
+    assert result.model_state == "UNAVAILABLE"
+    assert result.failure_reason is DetectionFailure.MODEL_UNAVAILABLE

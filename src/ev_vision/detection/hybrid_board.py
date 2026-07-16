@@ -127,6 +127,9 @@ class HybridBoardDetector:
         self._model_errors = tuple(model_errors)
         self._model_loader = model_loader
         self._model_lock = threading.RLock()
+        self._reload_call_lock = threading.Lock()
+        self._reload_epoch = 0
+        self._reload_in_progress = False
 
     @property
     def model_state(self) -> str:
@@ -146,8 +149,8 @@ class HybridBoardDetector:
             return self._model_errors
 
     def reset(self) -> None:
-        if self.tracker is not None:
-            self.tracker.reset()
+        with self._model_lock:
+            self._reset_tracker_locked()
 
     def apply_config(self, config: DetectionConfig) -> None:
         geometry = self._geometry_from_config(config)
@@ -157,12 +160,30 @@ class HybridBoardDetector:
         self.reset()
 
     def reload_model(self) -> None:
+        with self._reload_call_lock:
+            self._reload_model_serialized()
+
+    def _reload_model_serialized(self) -> None:
+        with self._model_lock:
+            self._reload_epoch += 1
+            reload_epoch = self._reload_epoch
+            self._reload_in_progress = True
+            config = self.config
+            self._reset_tracker_locked()
+
         if self._model_loader is None:
-            raise RuntimeError("no model loader is configured")
-        selection = self._model_loader(self.config)
+            errors = ("no model loader is configured",)
+            self._publish_unavailable(errors, reload_epoch=reload_epoch)
+            raise RuntimeError(errors[0])
+        try:
+            selection = self._model_loader(config)
+        except Exception as exc:
+            errors = (str(exc),)
+            self._publish_unavailable(errors, reload_epoch=reload_epoch)
+            raise RuntimeError(errors[0]) from exc
         if selection.backend is None:
             errors = selection.errors or ("no portable model artifact could be loaded",)
-            self._publish_unavailable(errors)
+            self._publish_unavailable(errors, reload_epoch=reload_epoch)
             raise RuntimeError("; ".join(errors))
         try:
             self._smoke_test_backend(selection.backend)
@@ -170,24 +191,30 @@ class HybridBoardDetector:
         except Exception as exc:
             path = str(selection.path) if selection.path is not None else "model"
             errors = (f"{path}: {exc}",)
-            self._publish_unavailable(errors)
+            self._publish_unavailable(errors, reload_epoch=reload_epoch)
             raise RuntimeError(errors[0]) from exc
         with self._model_lock:
+            if reload_epoch != self._reload_epoch:
+                raise RuntimeError("model reload was superseded")
             self.model = model
             self._model_state = "READY"
             self._model_backend = selection.artifact_kind
             self._model_path = str(selection.path) if selection.path is not None else None
             self._model_errors = ()
-            self._reset_tracker_locked()
+            self._reload_in_progress = False
 
-    def _publish_unavailable(self, errors: Sequence[str]) -> None:
+    def _publish_unavailable(
+        self, errors: Sequence[str], *, reload_epoch: int
+    ) -> None:
         with self._model_lock:
+            if reload_epoch != self._reload_epoch:
+                return
             self.model = None
             self._model_state = "UNAVAILABLE"
             self._model_backend = "classical-diagnostic"
             self._model_path = None
             self._model_errors = tuple(errors)
-            self._reset_tracker_locked()
+            self._reload_in_progress = False
 
     def _reset_tracker_locked(self) -> None:
         if self.tracker is not None:
@@ -239,7 +266,11 @@ class HybridBoardDetector:
         with self._model_lock:
             model = self.model
             metadata = self._model_metadata_locked(model)
-        if self._model_unavailable(model):
+            reload_epoch = self._reload_epoch
+            model_unavailable = (
+                self._reload_in_progress or self._model_unavailable(model)
+            )
+        if model_unavailable:
             result = self._empty_result(
                 captured_ns=captured_ns,
                 source_sequence=source_sequence,
@@ -267,6 +298,7 @@ class HybridBoardDetector:
                 result,
                 started_ns=started_ns,
                 update_tracker=update_tracker,
+                reload_epoch=reload_epoch,
             )
         inference_ended_ns = self.clock_ns()
         inference_ms = _elapsed_ms(started_ns, inference_ended_ns)
@@ -285,6 +317,7 @@ class HybridBoardDetector:
                 result,
                 started_ns=started_ns,
                 update_tracker=update_tracker,
+                reload_epoch=reload_epoch,
             )
 
         evaluations: list[CandidateEvaluation] = []
@@ -315,6 +348,7 @@ class HybridBoardDetector:
                     result,
                     started_ns=started_ns,
                     update_tracker=update_tracker,
+                    reload_epoch=reload_epoch,
                 )
             refine_ended_ns = self.clock_ns()
             geometry_ms += _elapsed_ms(refine_started_ns, refine_ended_ns)
@@ -382,6 +416,7 @@ class HybridBoardDetector:
             result,
             started_ns=started_ns,
             update_tracker=update_tracker,
+            reload_epoch=reload_epoch,
         )
 
     def _finish(
@@ -390,10 +425,38 @@ class HybridBoardDetector:
         *,
         started_ns: int,
         update_tracker: bool,
+        reload_epoch: int,
     ) -> HybridBoardResult:
-        processed = self._apply_tracker(result, update_tracker=update_tracker)
+        with self._model_lock:
+            if reload_epoch != self._reload_epoch or self._reload_in_progress:
+                processed = self._stale_reload_result_locked(result)
+            else:
+                processed = self._apply_tracker(result, update_tracker=update_tracker)
         ended_ns = self.clock_ns()
         return replace(processed, total_ms=_elapsed_ms(started_ns, ended_ns))
+
+    def _stale_reload_result_locked(
+        self, result: HybridBoardResult
+    ) -> HybridBoardResult:
+        metadata = self._model_metadata_locked(self.model)
+        unavailable = self._reload_in_progress or self._model_unavailable(self.model)
+        return replace(
+            self._empty_result(
+                captured_ns=result.timestamp_ns,
+                source_sequence=result.source_sequence,
+                model_state="UNAVAILABLE" if self._reload_in_progress else metadata.state,
+                model_backend=metadata.backend,
+                model_path=metadata.path,
+                failure_reason=(
+                    DetectionFailure.MODEL_UNAVAILABLE
+                    if unavailable
+                    else DetectionFailure.STALE_FRAME
+                ),
+                inference_ms=result.inference_ms,
+                geometry_ms=result.geometry_ms,
+            ),
+            debug_images={},
+        )
 
     def _apply_tracker(
         self,
