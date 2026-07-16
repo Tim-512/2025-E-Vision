@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 import math
+from typing import Mapping
+
+import numpy as np
 
 from ev_vision.config import CameraConfig
 from ev_vision.models import BoardObservation, Frame
@@ -104,6 +107,19 @@ class ImageDiagnostics:
 
 
 @dataclass(frozen=True)
+class DetectionCandidateSnapshot:
+    xyxy_px: tuple[float, float, float, float]
+    accepted: bool
+    model_confidence: float
+    geometry_score: float
+    edge_support_score: float
+    structure_score: float
+    temporal_score: float
+    combined_score: float
+    failure_reason: str | None = None
+
+
+@dataclass(frozen=True)
 class DetectionSnapshot:
     enabled: bool
     detected: bool
@@ -111,6 +127,36 @@ class DetectionSnapshot:
     observation: BoardObservation | None = None
     result_age_ms: float | None = None
     error: str | None = None
+    target_valid: bool = False
+    tracking_state: str = "SEARCHING"
+    model_state: str = "UNAVAILABLE"
+    model_backend: str = "none"
+    model_path: str | None = None
+    model_confidence: float = 0.0
+    geometry_score: float = 0.0
+    edge_support_score: float = 0.0
+    structure_score: float = 0.0
+    combined_score: float = 0.0
+    candidate_count: int = 0
+    confirmation_count: int = 0
+    miss_count: int = 0
+    failure_reason: str | None = None
+    inference_ms: float = 0.0
+    geometry_ms: float = 0.0
+    total_ms: float = 0.0
+    temporal_score: float = 0.0
+    homography_valid: bool = False
+    target_x_mm: float | None = None
+    target_y_mm: float | None = None
+    corners_px: tuple[tuple[float, float], ...] = ()
+    center_px: tuple[float, float] | None = None
+    candidates: tuple[DetectionCandidateSnapshot, ...] = ()
+
+
+@dataclass(frozen=True)
+class DetectionDebugSnapshot:
+    source_sequence: int
+    images: Mapping[str, np.ndarray]
 
 
 @dataclass(frozen=True)
@@ -154,3 +200,4 @@ class CaptureSnapshot:
     overlay_options: OverlayOptions
     camera_config: CameraConfig
     camera_identity: CameraIdentity
+    detection_debug: DetectionDebugSnapshot | None = None

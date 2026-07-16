@@ -9,7 +9,14 @@ from typing import Iterable
 import numpy as np
 import pytest
 
-from ev_vision.config import CameraConfig
+from ev_vision.config import CameraConfig, DetectionConfig
+from ev_vision.detection.failures import (
+    CandidateEvaluation,
+    DetectionFailure,
+    HybridBoardResult,
+)
+from ev_vision.detection.roi_board_geometry import GeometryResult
+from ev_vision.detection.yolo_board import BoardSearchResult
 from ev_vision.models import BoardObservation, Frame
 from ev_vision.tuning.models import CameraIdentity, EditableCameraParameters, OverlayOptions
 from ev_vision.tuning.service import CameraTuningService, ParameterApplyError
@@ -102,6 +109,62 @@ class FakeDetector:
         return result
 
 
+class HybridDetectorFake:
+    def __init__(self, results: Iterable[HybridBoardResult | BaseException]) -> None:
+        self.results = deque(results)
+        self.calls: list[dict[str, object]] = []
+        self.reset_calls = 0
+        self.config: DetectionConfig | None = None
+        self.reload_calls = 0
+
+    def detect(
+        self,
+        image: np.ndarray,
+        *,
+        captured_ns: int,
+        source_sequence: int,
+        include_debug: bool = False,
+        update_tracker: bool = True,
+    ) -> HybridBoardResult:
+        self.calls.append({
+            "image": image.copy(),
+            "captured_ns": captured_ns,
+            "source_sequence": source_sequence,
+            "include_debug": include_debug,
+            "update_tracker": update_tracker,
+        })
+        result = self.results.popleft()
+        if isinstance(result, BaseException):
+            raise result
+        return replace(
+            result, timestamp_ns=captured_ns, source_sequence=source_sequence,
+            debug_images={"edges": np.full((3, 4), 7, dtype=np.uint8)} if include_debug else {},
+        )
+
+    def reset(self) -> None:
+        self.reset_calls += 1
+
+    def apply_config(self, config: DetectionConfig) -> None:
+        self.config = config
+
+    def reload_model(self) -> None:
+        self.reload_calls += 1
+
+
+class RepeatingHybridDetector(HybridDetectorFake):
+    def __init__(self, result: HybridBoardResult) -> None:
+        super().__init__([result])
+        self.result = result
+
+    def detect(self, image: np.ndarray, *, captured_ns: int, source_sequence: int, include_debug: bool = False, update_tracker: bool = True) -> HybridBoardResult:
+        if not self.results:
+            self.results.append(self.result)
+        return super().detect(
+            image, captured_ns=captured_ns, source_sequence=source_sequence,
+            include_debug=include_debug, update_tracker=update_tracker,
+        )
+
+
 class BlockingOpenCamera(FakeCamera):
     def __init__(self, items: Iterable[Frame | BaseException]) -> None:
         super().__init__(items)
@@ -156,6 +219,31 @@ def parameters(base: CameraConfig | None = None, **changes: object) -> EditableC
 
 def make_service(factory: FakeFactory, *, detector: FakeDetector | None = None, diagnostics_fps: float = 100.0, detection_fps: float = 100.0, confirm_timeout_s: float = 0.05) -> CameraTuningService:
     return CameraTuningService(camera_factory=factory, base_config=config(), detector=detector, camera_identity=CameraIdentity(model="fake", serial="serial-1"), read_timeout_ms=2, confirm_timeout_s=confirm_timeout_s, diagnostics_fps=diagnostics_fps, detection_fps=detection_fps, disconnect_timeout_threshold=1000)
+
+
+def hybrid_result(sequence: int = 9) -> HybridBoardResult:
+    model = BoardSearchResult(xyxy_px=(1.0, 2.0, 9.0, 7.0), confidence=0.91)
+    geometry = GeometryResult(
+        accepted=True, corners_px=((1.0, 1.0), (8.0, 1.0), (8.0, 6.0), (1.0, 6.0)),
+        center_px=(4.5, 3.5), geometry_score=0.82, edge_support_score=0.73,
+        structure_score=0.64, roi_xyxy_px=(0, 0, 10, 8), failure_reason=None,
+    )
+    candidate = CandidateEvaluation(model=model, geometry=geometry, temporal_score=0.72, combined_score=0.83)
+    return HybridBoardResult(
+        timestamp_ns=123, source_sequence=sequence, detected=True, target_valid=True,
+        tracking_state="TRACKING", model_state="READY", model_backend="onnx",
+        model_path="target.onnx", model_confidence=0.91, geometry_score=0.82,
+        edge_support_score=0.73, structure_score=0.64, temporal_score=0.72,
+        combined_score=0.83, candidate_count=1, corners_px=geometry.corners_px,
+        center_px=geometry.center_px, failure_reason=None, inference_ms=2.5,
+        geometry_ms=1.25, total_ms=4.0, homography_valid=True, target_x_mm=12.5,
+        target_y_mm=-7.0, candidates=(candidate,),
+    )
+
+
+def updated_detection_config() -> DetectionConfig:
+    current = DetectionConfig()
+    return replace(current, tracking=replace(current.tracking, confirm_frames=current.tracking.confirm_frames + 1))
 
 
 def wait_until(predicate, *, timeout_s: float = 0.5) -> None:
@@ -220,6 +308,127 @@ def test_detector_error_is_reported_without_stopping_acquisition() -> None:
         detector.results.append(observation(second.captured_ns))
         wait_until(lambda: service.latest_detection().detected)
         assert service.runtime_snapshot().state == "Connected"
+    finally:
+        service.stop()
+
+
+def test_service_publishes_hybrid_snapshot_and_candidate_geometry() -> None:
+    detector = RepeatingHybridDetector(hybrid_result())
+    service = make_service(FakeFactory([FakeCamera([frame(9)])]), detector=detector, detection_fps=1000.0)
+    service.start()
+    try:
+        wait_until(lambda: service.latest_detection().source_sequence == 9)
+        snapshot = service.latest_detection()
+        assert snapshot.target_valid is True
+        assert snapshot.tracking_state == "TRACKING"
+        assert snapshot.model_backend == "onnx"
+        assert snapshot.combined_score == pytest.approx(0.83)
+        assert snapshot.temporal_score == pytest.approx(0.72)
+        assert snapshot.homography_valid is True
+        assert snapshot.target_x_mm == pytest.approx(12.5)
+        assert snapshot.target_y_mm == pytest.approx(-7.0)
+        assert snapshot.corners_px == ((1.0, 1.0), (8.0, 1.0), (8.0, 6.0), (1.0, 6.0))
+        assert snapshot.center_px == (4.5, 3.5)
+        assert snapshot.observation is not None and snapshot.observation.confidence == pytest.approx(0.83)
+        assert snapshot.candidates[0].xyxy_px == (1.0, 2.0, 9.0, 7.0)
+        assert snapshot.candidates[0].accepted is True
+        assert snapshot.candidates[0].model_confidence == pytest.approx(0.91)
+        assert detector.calls[0]["include_debug"] is False
+        assert detector.calls[0]["update_tracker"] is True
+        assert service.runtime_snapshot().state == "Connected"
+    finally:
+        service.stop()
+
+
+def test_detection_frame_and_debug_are_latest_only_cached_and_tracker_safe() -> None:
+    detector = RepeatingHybridDetector(hybrid_result())
+    service = make_service(FakeFactory([FakeCamera([frame(9)])]), detector=detector, detection_fps=1000.0)
+    service.start()
+    try:
+        wait_until(lambda: service.latest_detection().source_sequence == 9)
+        pair = service.detection_frame_for_latest(expected_sequence=9)
+        assert pair is not None and pair[0].sequence == pair[1].source_sequence == 9
+        pair[0].image[:] = 0
+        assert np.all(service.detection_frame_for_latest(expected_sequence=9)[0].image == 9)
+        debug = service.detection_debug_for_latest(expected_sequence=9)
+        assert debug is not None and np.all(debug.images["edges"] == 7)
+        assert detector.calls[-1]["include_debug"] is True
+        assert detector.calls[-1]["update_tracker"] is False
+        calls_after_debug = len(detector.calls)
+        assert service.detection_debug_for_latest(expected_sequence=9) is debug
+        assert len(detector.calls) == calls_after_debug
+        with pytest.raises(RuntimeError) as caught:
+            service.detection_frame_for_latest(expected_sequence=8)
+        assert caught.value.expected == 8 and caught.value.actual == 9
+    finally:
+        service.stop()
+
+
+def test_detector_exception_publishes_model_error_and_camera_keeps_streaming() -> None:
+    detector = HybridDetectorFake([RuntimeError("detector boom")])
+    service = make_service(FakeFactory([FakeCamera([frame(1), frame(2)])]), detector=detector, detection_fps=1000.0)
+    service.start()
+    try:
+        wait_until(lambda: service.latest_detection().failure_reason == "MODEL_ERROR")
+        snapshot = service.latest_detection()
+        assert snapshot.target_valid is False and snapshot.detected is False
+        assert snapshot.model_state == "ERROR" and snapshot.error == "detector boom"
+        assert service.runtime_snapshot().frame_count > 0
+        assert service.runtime_snapshot().state == "Connected"
+        assert service.detection_frame_for_latest() is not None
+    finally:
+        service.stop()
+
+
+def test_detection_config_update_and_model_reload_do_not_reopen_camera() -> None:
+    camera = FakeCamera([frame(1)])
+    detector = RepeatingHybridDetector(hybrid_result(sequence=1))
+    initial = DetectionConfig()
+    service = CameraTuningService(
+        camera_factory=FakeFactory([camera]), base_config=config(), detector=detector,
+        detection_config=initial, read_timeout_ms=2, confirm_timeout_s=0.05,
+        diagnostics_fps=100.0, detection_fps=100.0, disconnect_timeout_threshold=1000,
+    )
+    service.start()
+    try:
+        updated = updated_detection_config()
+        assert service.detection_config() == initial
+        assert service.apply_detection_config(updated) == updated
+        service.reload_detection_model()
+        assert camera.close_count == 0
+        assert detector.config == updated and detector.reload_calls == 1
+    finally:
+        service.stop()
+
+
+def test_disabling_detection_camera_replacement_disconnect_and_shutdown_reset_tracker() -> None:
+    detector = RepeatingHybridDetector(hybrid_result())
+    service = make_service(FakeFactory([FakeCamera([frame(1)]), FakeCamera([frame(2)])]), detector=detector)
+    service.start()
+    try:
+        before_disable = detector.reset_calls
+        service.set_detection_enabled(False)
+        assert detector.reset_calls == before_disable + 1
+        before_replace = detector.reset_calls
+        service.apply_parameters(parameters(exposure_us=1200.0))
+        assert detector.reset_calls >= before_replace + 1
+    finally:
+        before_shutdown = detector.reset_calls
+        service.stop()
+        assert detector.reset_calls >= before_shutdown + 1
+
+
+def test_camera_disconnect_resets_tracker() -> None:
+    detector = RepeatingHybridDetector(hybrid_result(sequence=1))
+    service = CameraTuningService(
+        camera_factory=FakeFactory([FakeCamera([frame(1), TimeoutError("lost")])]),
+        base_config=config(), detector=detector, read_timeout_ms=2, confirm_timeout_s=0.05,
+        diagnostics_fps=100.0, detection_fps=100.0, disconnect_timeout_threshold=1,
+    )
+    service.start()
+    try:
+        wait_until(lambda: service.runtime_snapshot().state == "Disconnected")
+        assert detector.reset_calls >= 1
     finally:
         service.stop()
 

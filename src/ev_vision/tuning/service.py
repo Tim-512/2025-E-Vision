@@ -2,18 +2,22 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import replace
+import inspect
 import threading
 import time
-from typing import Callable, Protocol
+from typing import Callable, Mapping, Protocol
 
 import numpy as np
 
-from ev_vision.config import CameraConfig
+from ev_vision.config import CameraConfig, DetectionConfig
+from ev_vision.detection.failures import CandidateEvaluation, HybridBoardResult
 from ev_vision.models import BoardObservation, Frame
 from ev_vision.tuning.diagnostics import compute_diagnostics
 from ev_vision.tuning.models import (
     CameraIdentity,
     CaptureSnapshot,
+    DetectionCandidateSnapshot,
+    DetectionDebugSnapshot,
     DetectionSnapshot,
     EditableCameraParameters,
     ImageDiagnostics,
@@ -35,7 +39,42 @@ CameraFactory = Callable[[CameraConfig], CameraPort]
 
 
 class DetectorPort(Protocol):
-    def detect(self, image: np.ndarray, *, captured_ns: int) -> BoardObservation | None: ...
+    def detect(
+        self,
+        image: np.ndarray,
+        *,
+        captured_ns: int,
+        source_sequence: int,
+        include_debug: bool = False,
+        update_tracker: bool = True,
+    ) -> HybridBoardResult:
+        raise NotImplementedError
+
+    def reset(self) -> None:
+        raise NotImplementedError
+
+    def apply_config(self, config: DetectionConfig) -> None:
+        raise NotImplementedError
+
+    def reload_model(self) -> None:
+        raise NotImplementedError
+
+
+class StaleDetectionFrameError(RuntimeError):
+    def __init__(self, expected: int, actual: int) -> None:
+        super().__init__(f"requested detection sequence {expected}, latest is {actual}")
+        self.expected = expected
+        self.actual = actual
+
+
+def copy_frame(frame: Frame | None) -> Frame | None:
+    if frame is None:
+        return None
+    return Frame(frame.sequence, frame.captured_ns, frame.image.copy())
+
+
+def copy_debug_images(images: Mapping[str, np.ndarray]) -> Mapping[str, np.ndarray]:
+    return {name: image.copy() for name, image in images.items()}
 
 
 class ParameterApplyError(RuntimeError):
@@ -96,6 +135,7 @@ class CameraTuningService:
         camera_factory: CameraFactory,
         base_config: CameraConfig,
         detector: DetectorPort | None = None,
+        detection_config: DetectionConfig | None = None,
         bounds: ParameterBounds | None = None,
         camera_identity: CameraIdentity | None = None,
         read_timeout_ms: int = 100,
@@ -120,6 +160,7 @@ class CameraTuningService:
         self._camera_factory = camera_factory
         self._base_config = base_config
         self._detector = detector
+        self._detection_config = detection_config or DetectionConfig()
         self._bounds = bounds or ParameterBounds()
         self._camera_identity = camera_identity or CameraIdentity(model="", serial="")
         self._read_timeout_ms = int(read_timeout_ms)
@@ -173,6 +214,8 @@ class CameraTuningService:
             enabled=self._detection_enabled, detected=False
         )
         self._detection_computed_ns: int | None = None
+        self._latest_detection_frame: Frame | None = None
+        self._latest_detection_debug: DetectionDebugSnapshot | None = None
 
         self._frame_count = 0
         self._timeout_count = 0
@@ -493,6 +536,91 @@ class CameraTuningService:
         with self._lock:
             return self._detection_snapshot_locked(now_ns)
 
+    def detection_config(self) -> DetectionConfig:
+        with self._lock:
+            return self._detection_config
+
+    def apply_detection_config(self, config: DetectionConfig) -> DetectionConfig:
+        detector = self._detector
+        if detector is None:
+            raise RuntimeError("no detector is configured")
+        apply_config = getattr(detector, "apply_config", None)
+        if not callable(apply_config):
+            raise RuntimeError("configured detector does not support detection config updates")
+        apply_config(config)
+        with self._lock:
+            self._detection_config = config
+            self._detection_generation += 1
+            self._latest_detection_frame = None
+            self._latest_detection_debug = None
+        self._notify_analysis_worker(self._detection_wakeup)
+        return config
+
+    def detection_frame_for_latest(
+        self,
+        *,
+        expected_sequence: int | None = None,
+    ) -> tuple[Frame, DetectionSnapshot] | None:
+        with self._lock:
+            frame = copy_frame(self._latest_detection_frame)
+            snapshot = self._detection_snapshot_locked(self._clock_ns())
+        if frame is None or snapshot.source_sequence != frame.sequence:
+            return None
+        if expected_sequence is not None and frame.sequence != expected_sequence:
+            raise StaleDetectionFrameError(expected_sequence, frame.sequence)
+        return frame, snapshot
+
+    def detection_debug_for_latest(
+        self,
+        *,
+        expected_sequence: int | None = None,
+    ) -> DetectionDebugSnapshot | None:
+        """Inspect the retained detection input frame without advancing the tracker."""
+        pair = self.detection_frame_for_latest(expected_sequence=expected_sequence)
+        if pair is None:
+            return None
+        frame, _snapshot = pair
+        with self._lock:
+            cached = self._latest_detection_debug
+        if cached is not None and cached.source_sequence == frame.sequence:
+            return cached
+        detector = self._detector
+        if detector is None:
+            return None
+        result = self._detect_hybrid(
+            detector,
+            frame,
+            include_debug=True,
+            update_tracker=False,
+        )
+        if not isinstance(result, HybridBoardResult):
+            raise RuntimeError("configured detector does not support hybrid debug results")
+        snapshot = DetectionDebugSnapshot(
+            frame.sequence, copy_debug_images(result.debug_images)
+        )
+        with self._lock:
+            if (
+                self._latest_detection_frame is not None
+                and self._latest_detection_frame.sequence == frame.sequence
+            ):
+                self._latest_detection_debug = snapshot
+        return snapshot
+
+    def reload_detection_model(self) -> None:
+        detector = self._detector
+        if detector is None:
+            raise RuntimeError("no detector is configured")
+        reload_model = getattr(detector, "reload_model", None)
+        if not callable(reload_model):
+            raise RuntimeError("configured detector does not support model reload")
+        reload_model()
+        self._reset_detector()
+        with self._lock:
+            self._detection_generation += 1
+            self._latest_detection_frame = None
+            self._latest_detection_debug = None
+        self._notify_analysis_worker(self._detection_wakeup)
+
     def set_detection_enabled(self, enabled: bool) -> None:
         if not isinstance(enabled, bool):
             raise ValueError("enabled must be a bool")
@@ -504,7 +632,11 @@ class CameraTuningService:
             self._detection_enabled = enabled
             self._detection_generation += 1
             self._detection_computed_ns = None
+            self._latest_detection_frame = None
+            self._latest_detection_debug = None
             self._latest_detection = DetectionSnapshot(enabled=enabled, detected=False)
+        if not enabled:
+            self._reset_detector()
         self._notify_analysis_worker(self._detection_wakeup)
 
     def capture_snapshot(
@@ -524,6 +656,7 @@ class CameraTuningService:
                 overlay_options=overlay_options or OverlayOptions(),
                 camera_config=parameters.to_camera_config(self._base_config),
                 camera_identity=self._camera_identity,
+                detection_debug=self._latest_detection_debug,
             )
 
     def record_preview_frame(self) -> None:
@@ -737,6 +870,7 @@ class CameraTuningService:
         error: str | None,
         mutation_generation: int,
     ) -> None:
+        self._reset_detector()
         stop_event = threading.Event()
         target_done = threading.Event()
         with self._lock:
@@ -770,6 +904,7 @@ class CameraTuningService:
         self._wake_analysis_workers()
 
     def _publish_shutdown_intent(self) -> None:
+        self._reset_detector()
         with self._lock:
             self._shutdown_generation += 1
             self._shutdown_requested = True
@@ -1106,7 +1241,6 @@ class CameraTuningService:
             wake_generation = self._analysis_wake_generation(
                 self._detection_wakeup
             )
-            # Check disabled/no-detector/session state before copying the image.
             with self._lock:
                 detector = self._detector
                 if (
@@ -1130,8 +1264,11 @@ class CameraTuningService:
             if item is not None:
                 key, frame = item
                 try:
-                    result = detector.detect(
-                        frame.image, captured_ns=frame.captured_ns
+                    result = self._detect_hybrid(
+                        detector,
+                        frame,
+                        include_debug=False,
+                        update_tracker=True,
                     )
                 except BaseException as exc:
                     now_ns = self._clock_ns()
@@ -1142,27 +1279,26 @@ class CameraTuningService:
                                 detected=False,
                                 source_sequence=frame.sequence,
                                 error=str(exc),
+                                target_valid=False,
+                                model_state="ERROR",
+                                failure_reason="MODEL_ERROR",
                             )
+                            self._latest_detection_frame = copy_frame(frame)
+                            self._latest_detection_debug = None
                             self._detection_computed_ns = now_ns
-                            self._last_error = f"detection failed: {exc}"
+                            self._detection_rate.record(now_ns)
+                            last_key = key
                 else:
                     now_ns = self._clock_ns()
                     with self._lock:
                         if self._detection_key_is_current_locked(key):
-                            self._latest_detection = DetectionSnapshot(
-                                enabled=True,
-                                detected=result is not None,
-                                source_sequence=frame.sequence,
-                                observation=result,
+                            self._latest_detection = self._snapshot_for_result(
+                                result, frame
                             )
+                            self._latest_detection_frame = copy_frame(frame)
+                            self._latest_detection_debug = None
                             self._detection_computed_ns = now_ns
                             self._detection_rate.record(now_ns)
-                            if (
-                                self._state == "Connected"
-                                and self._last_error is not None
-                                and self._last_error.startswith("detection failed:")
-                            ):
-                                self._last_error = None
                             last_key = key
             elapsed_s = (self._clock_ns() - started_ns) / 1_000_000_000.0
             if stop_event.is_set():
@@ -1174,6 +1310,118 @@ class CameraTuningService:
                 max(0.0, self._detection_period_s - elapsed_s),
                 wake_on_change=item is None,
             )
+
+    @staticmethod
+    def _detect_hybrid(
+        detector: DetectorPort,
+        frame: Frame,
+        *,
+        include_debug: bool,
+        update_tracker: bool,
+    ) -> HybridBoardResult | BoardObservation | None:
+        parameters = inspect.signature(detector.detect).parameters
+        supports_hybrid = all(
+            name in parameters
+            for name in ("source_sequence", "include_debug", "update_tracker")
+        )
+        if supports_hybrid:
+            return detector.detect(
+                frame.image,
+                captured_ns=frame.captured_ns,
+                source_sequence=frame.sequence,
+                include_debug=include_debug,
+                update_tracker=update_tracker,
+            )
+        if include_debug or not update_tracker:
+            raise RuntimeError(
+                "configured detector does not support hybrid debug results"
+            )
+        return detector.detect(frame.image, captured_ns=frame.captured_ns)  # type: ignore[call-arg]
+
+    @staticmethod
+    def _snapshot_for_result(
+        result: HybridBoardResult | BoardObservation | None,
+        frame: Frame,
+    ) -> DetectionSnapshot:
+        if not isinstance(result, HybridBoardResult):
+            return DetectionSnapshot(
+                enabled=True,
+                detected=result is not None,
+                source_sequence=frame.sequence,
+                observation=result,
+            )
+        observation = None
+        corners = tuple(result.corners_px or ())
+        if result.detected and corners and result.center_px is not None:
+            observation = BoardObservation(
+                captured_ns=result.timestamp_ns,
+                corners_px=corners,
+                center_px=result.center_px,
+                confidence=result.combined_score,
+                homography_valid=result.homography_valid,
+            )
+        candidates = tuple(
+            CameraTuningService._candidate_snapshot(candidate)
+            for candidate in result.candidates
+        )
+        return DetectionSnapshot(
+            enabled=True,
+            detected=result.detected,
+            source_sequence=result.source_sequence,
+            observation=observation,
+            target_valid=result.target_valid,
+            tracking_state=result.tracking_state,
+            model_state=result.model_state,
+            model_backend=result.model_backend,
+            model_path=result.model_path,
+            model_confidence=result.model_confidence,
+            geometry_score=result.geometry_score,
+            edge_support_score=result.edge_support_score,
+            structure_score=result.structure_score,
+            combined_score=result.combined_score,
+            candidate_count=result.candidate_count,
+            confirmation_count=int(getattr(result, "confirmation_count", 0)),
+            miss_count=int(getattr(result, "miss_count", 0)),
+            failure_reason=CameraTuningService._enum_value(result.failure_reason),
+            inference_ms=result.inference_ms,
+            geometry_ms=result.geometry_ms,
+            total_ms=result.total_ms,
+            temporal_score=result.temporal_score,
+            homography_valid=result.homography_valid,
+            target_x_mm=result.target_x_mm,
+            target_y_mm=result.target_y_mm,
+            corners_px=corners,
+            center_px=result.center_px,
+            candidates=candidates,
+        )
+
+    @staticmethod
+    def _candidate_snapshot(candidate: CandidateEvaluation) -> DetectionCandidateSnapshot:
+        return DetectionCandidateSnapshot(
+            xyxy_px=tuple(float(value) for value in candidate.model.xyxy_px),
+            accepted=candidate.geometry.accepted,
+            model_confidence=float(candidate.model.confidence),
+            geometry_score=float(candidate.geometry.geometry_score),
+            edge_support_score=float(candidate.geometry.edge_support_score),
+            structure_score=float(candidate.geometry.structure_score),
+            temporal_score=float(candidate.temporal_score),
+            combined_score=float(candidate.combined_score),
+            failure_reason=CameraTuningService._enum_value(
+                candidate.geometry.failure_reason
+            ),
+        )
+
+    @staticmethod
+    def _enum_value(value: object | None) -> str | None:
+        if value is None:
+            return None
+        return str(getattr(value, "value", value))
+
+    def _reset_detector(self) -> None:
+        detector = self._detector
+        reset = getattr(detector, "reset", None) if detector is not None else None
+        if callable(reset):
+            reset()
 
     def _wake_analysis_workers(self) -> None:
         self._notify_analysis_worker(self._diagnostics_wakeup)
@@ -1221,14 +1469,18 @@ class CameraTuningService:
         return (
             self._session_active
             and self._detection_enabled
+            and self._latest_frame is not None
             and key[0] == self._session_generation
             and key[1] == self._detection_generation
+            and key[2] == self._latest_frame.sequence
         )
 
     def _reset_derived_locked(self) -> None:
         self._latest_diagnostics = None
         self._detection_generation += 1
         self._detection_computed_ns = None
+        self._latest_detection_frame = None
+        self._latest_detection_debug = None
         self._latest_detection = DetectionSnapshot(
             enabled=self._detection_enabled, detected=False
         )
@@ -1258,26 +1510,34 @@ class CameraTuningService:
         self._acquisition_rate.record(now_ns)
 
     def _record_timeout(self, generation: int) -> None:
+        reset_detector = False
         with self._lock:
             if generation != self._session_generation:
                 return
             self._timeout_count += 1
             self._consecutive_timeouts += 1
             if self._consecutive_timeouts >= self._disconnect_timeout_threshold:
+                reset_detector = not self._camera_fault_active
                 self._camera_fault_active = True
                 self._state = "Disconnected"
                 self._last_error = (
                     f"camera read reached {self._consecutive_timeouts} consecutive timeouts"
                 )
+        if reset_detector:
+            self._reset_detector()
 
     def _record_camera_error(self, error: BaseException, generation: int) -> None:
+        reset_detector = False
         with self._lock:
             if generation != self._session_generation:
                 return
             self._consecutive_timeouts = 0
+            reset_detector = not self._camera_fault_active
             self._camera_fault_active = True
             self._state = "Disconnected"
             self._last_error = f"camera read failed: {error}"
+        if reset_detector:
+            self._reset_detector()
 
     def _record_camera_success_locked(self) -> None:
         self._consecutive_timeouts = 0
