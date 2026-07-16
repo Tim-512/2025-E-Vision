@@ -32,3 +32,9 @@ Thumbs.db
 
 # Python package metadata
 *.egg-info/
+
+# Local target-board dataset contents
+datasets/target_board/images/
+datasets/target_board/labels/
+datasets/target_board/staging/
+datasets/target_board/*.cache
