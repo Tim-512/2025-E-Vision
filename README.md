@@ -14,6 +14,7 @@
 ## 文档
 
 - [视觉瞄准系统设计说明](docs/superpowers/specs/2026-07-12-vision-aiming-system-design.md)
+- [Jetson 混合靶面检测部署与实机验收手册](docs/hybrid-detector-acceptance.md)
 
 ## 范围
 

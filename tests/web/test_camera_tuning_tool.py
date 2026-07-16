@@ -147,3 +147,19 @@ def test_tool_wrapper_delegates_to_installed_module() -> None:
     text = Path("tools/camera_tuning_server.py").read_text(encoding="utf-8")
     assert "from ev_vision.web.camera_tuning_server import main" in text
     assert "SystemExit(main())" in text
+
+
+def test_hybrid_acceptance_runbook_contains_required_safety_and_commands() -> None:
+    text = Path("docs/hybrid-detector-acceptance.md").read_text(encoding="utf-8")
+    for marker in (
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1",
+        "models/target-board.onnx",
+        "models/target-board.engine",
+        "ev-camera-tuning",
+        "TRACKING",
+        "15-20 Hz",
+        "20 minutes",
+        "405 nm",
+        "physically disconnected",
+    ):
+        assert marker in text
