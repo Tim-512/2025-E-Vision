@@ -74,7 +74,12 @@ def _validate_label(path: Path, errors: list[str]) -> bool:
         errors.append(f"{path.name}: label is not readable: {exc}")
         return False
 
-    positive = any(line.strip() for line in lines)
+    nonempty_lines = [line for line in lines if line.strip()]
+    positive = bool(nonempty_lines)
+    if len(nonempty_lines) > 1:
+        errors.append(
+            f"{path.name}: label must contain at most one non-empty YOLO annotation"
+        )
     for line_number, raw_line in enumerate(lines, start=1):
         line = raw_line.strip()
         if not line:
@@ -99,9 +104,16 @@ def _validate_label(path: Path, errors: list[str]) -> bool:
             errors.append(
                 f"{path.name}: normalized coordinates must be within [0, 1]"
             )
-        width, height = coordinates[2], coordinates[3]
+        center_x, center_y, width, height = coordinates
         if width <= 0.0 or height <= 0.0:
             errors.append(f"{prefix}: width and height must be greater than zero")
+        elif not (
+            0.0 <= center_x - width / 2.0
+            and center_x + width / 2.0 <= 1.0
+            and 0.0 <= center_y - height / 2.0
+            and center_y + height / 2.0 <= 1.0
+        ):
+            errors.append(f"{prefix}: bounding box edges must be within [0, 1]")
     return positive
 
 
@@ -118,15 +130,22 @@ def _read_manifest(path: Path, errors: list[str]) -> tuple[_ManifestRow, ...]:
                     "image,scene,split,difficulty"
                 )
                 return ()
-            rows = tuple(
-                _ManifestRow(
-                    image=(row.get("image") or "").strip(),
-                    scene=(row.get("scene") or "").strip(),
-                    split=(row.get("split") or "").strip(),
-                    difficulty=(row.get("difficulty") or "").strip(),
+            rows_list: list[_ManifestRow] = []
+            for row_number, row in enumerate(reader, start=2):
+                if None in row:
+                    errors.append(
+                        f"split-manifest.csv:{row_number}: row has extra fields"
+                    )
+                    continue
+                rows_list.append(
+                    _ManifestRow(
+                        image=(row.get("image") or "").strip(),
+                        scene=(row.get("scene") or "").strip(),
+                        split=(row.get("split") or "").strip(),
+                        difficulty=(row.get("difficulty") or "").strip(),
+                    )
                 )
-                for row in reader
-            )
+            rows = tuple(rows_list)
     except (OSError, UnicodeError, csv.Error) as exc:
         errors.append(f"split-manifest.csv: cannot be read: {exc}")
         return ()
@@ -172,6 +191,8 @@ def validate_dataset(dataset: Path) -> DatasetReport:
     hashes: dict[str, list[tuple[str, str]]] = defaultdict(list)
     images = _find_images(dataset)
     labels = _find_labels(dataset)
+    if not images:
+        errors.append("dataset contains no images")
     images_by_stem: dict[tuple[str, str], list[Path]] = defaultdict(list)
     labels_by_stem: dict[tuple[str, str], list[Path]] = defaultdict(list)
 

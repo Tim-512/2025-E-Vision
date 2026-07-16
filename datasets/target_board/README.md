@@ -55,9 +55,12 @@ python tools/prepare_target_dataset.py CAPTURE_ROOT `
   --output datasets/target_board/staging `
   --scene desk-left `
   --split train `
-  --difficulty clear > staged-manifest.csv
+  --difficulty clear `
+  --manifest-output staged-manifest.csv
 
 python tools/validate_target_dataset.py datasets/target_board
 ```
 
-The prepare command writes only CSV rows to standard output, so they can be redirected safely; the prepared-image count is written to standard error. Copy the staged originals into the chosen `images/<split>` directory, create matching labels, append the emitted rows to `split-manifest.csv`, and validate before training. The validator rejects unreadable images, missing, orphaned, or malformed labels, duplicate image stems within a split, invalid normalized boxes, manifest/difficulty mismatches, scene leakage, and duplicate image content across splits.
+Use `--manifest-output` in PowerShell so the tool writes the CSV itself as UTF-8; PowerShell's `>` encoding varies by version and can produce a manifest the validator cannot read. When `--manifest-output` is omitted, the prepare command still writes only CSV rows to standard output for POSIX redirection or pipelines. The prepared-image count is always written to standard error. Repeating the same scene continues after the highest existing `scene-NNNNNN.*` number and never overwrites a staged image.
+
+Copy the staged originals into the chosen `images/<split>` directory, create matching labels, append the emitted rows to `split-manifest.csv`, and validate before training. The validator rejects empty datasets, unreadable images, missing, orphaned, or malformed labels, positive labels that do not contain exactly one annotation, non-empty negative labels, duplicate image stems within a split, boxes whose normalized edges leave the image, malformed manifest rows, manifest/difficulty mismatches, scene leakage, and duplicate image content across splits.

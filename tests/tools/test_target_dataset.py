@@ -91,6 +91,97 @@ def test_prepare_cli_writes_redirectable_csv_to_stdout_and_stats_to_stderr(
     assert captured.err == "prepared images: 1\n"
 
 
+def test_prepare_repeated_scene_continues_numbering_without_overwrite(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "captures" / "20260716T100000Z"
+    capture.mkdir(parents=True)
+    source = capture / "original.png"
+    source.write_bytes(b"first")
+    output = tmp_path / "staging"
+
+    first = prepare_dataset(
+        sources=[capture.parent],
+        output=output,
+        scene="desk-left",
+        split="train",
+        difficulty="clear",
+        copy_file=lambda source, target: target.write_bytes(source.read_bytes()),
+    )
+    source.write_bytes(b"second")
+    second = prepare_dataset(
+        sources=[capture.parent],
+        output=output,
+        scene="desk-left",
+        split="train",
+        difficulty="clear",
+        copy_file=lambda source, target: target.write_bytes(source.read_bytes()),
+    )
+
+    assert [item.destination.name for item in first] == ["desk-left-000001.png"]
+    assert [item.destination.name for item in second] == ["desk-left-000002.png"]
+    assert (output / "desk-left-000001.png").read_bytes() == b"first"
+    assert (output / "desk-left-000002.png").read_bytes() == b"second"
+
+
+def test_prepare_numbering_reserves_existing_scene_index_with_any_extension(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "captures" / "20260716T100000Z"
+    capture.mkdir(parents=True)
+    (capture / "original.png").write_bytes(b"new")
+    output = tmp_path / "staging"
+    output.mkdir()
+    (output / "desk-left-000007.tar.gz").write_bytes(b"existing")
+
+    prepared = prepare_dataset(
+        sources=[capture.parent],
+        output=output,
+        scene="desk-left",
+        split="train",
+        difficulty="clear",
+        copy_file=lambda source, target: target.write_bytes(source.read_bytes()),
+    )
+
+    assert [item.destination.name for item in prepared] == ["desk-left-000008.png"]
+    assert (output / "desk-left-000007.tar.gz").read_bytes() == b"existing"
+
+
+def test_prepare_cli_writes_manifest_output_as_utf8_without_using_stdout(
+    tmp_path: Path, capsys
+) -> None:
+    capture = tmp_path / "captures" / "20260716T100000Z"
+    capture.mkdir(parents=True)
+    (capture / "original.png").write_bytes(b"image")
+    manifest_output = tmp_path / "manifests" / "staged.csv"
+    scene = "\u684c\u9762"
+
+    exit_code = prepare_main(
+        [
+            str(capture.parent),
+            "--output",
+            str(tmp_path / "staging"),
+            "--scene",
+            scene,
+            "--split",
+            "train",
+            "--difficulty",
+            "clear",
+            "--manifest-output",
+            str(manifest_output),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert captured.out == ""
+    assert manifest_output.read_bytes().decode("utf-8").splitlines() == [
+        "image,scene,split,difficulty",
+        f"{scene}-000001.png,{scene},train,clear",
+    ]
+    assert captured.err == "prepared images: 1\n"
+
+
 def test_prepare_uses_only_original_png_and_deterministic_names(tmp_path: Path) -> None:
     capture_a = tmp_path / "captures" / "20260716T100000Z"
     capture_b = tmp_path / "captures" / "20260716T100100Z"
@@ -199,6 +290,71 @@ def test_validator_rejects_malformed_class_nonfinite_and_nonpositive_boxes(
     assert "a.txt:2: label line must contain five fields" in report.errors
     assert "a.txt:3: coordinates must be finite" in report.errors
     assert "a.txt:4: width and height must be greater than zero" in report.errors
+
+
+def test_validator_rejects_multiple_nonempty_annotations_for_one_image(
+    tmp_path: Path,
+) -> None:
+    dataset = build_minimal_dataset(tmp_path)
+    write_label(
+        dataset / "labels/train/a.txt",
+        "0 0.25 0.50 0.20 0.20\n0 0.75 0.50 0.20 0.20\n",
+    )
+
+    report = validate_dataset(dataset)
+
+    assert (
+        "a.txt: label must contain at most one non-empty YOLO annotation"
+        in report.errors
+    )
+
+
+def test_validator_rejects_boxes_whose_edges_leave_normalized_image(
+    tmp_path: Path,
+) -> None:
+    dataset = build_minimal_dataset(tmp_path)
+    write_label(dataset / "labels/train/a.txt", "0 0.05 0.50 0.20 0.20\n")
+
+    report = validate_dataset(dataset)
+
+    assert "a.txt:1: bounding box edges must be within [0, 1]" in report.errors
+
+
+def test_validator_rejects_manifest_rows_with_extra_fields(tmp_path: Path) -> None:
+    dataset = build_minimal_dataset(tmp_path)
+    append_manifest(dataset, "extra.png,scene-extra,train,clear,unexpected\n")
+
+    report = validate_dataset(dataset)
+
+    assert "split-manifest.csv:5: row has extra fields" in report.errors
+
+
+def test_validator_rejects_manifest_rows_with_empty_extra_field(
+    tmp_path: Path,
+) -> None:
+    dataset = build_minimal_dataset(tmp_path)
+    append_manifest(dataset, "extra.png,scene-extra,train,clear,\n")
+
+    report = validate_dataset(dataset)
+
+    assert "split-manifest.csv:5: row has extra fields" in report.errors
+
+
+def test_validator_rejects_empty_dataset_and_cli_returns_nonzero(
+    tmp_path: Path, capsys
+) -> None:
+    dataset = tmp_path / "empty-dataset"
+    dataset.mkdir()
+    write_manifest(dataset, [])
+
+    report = validate_dataset(dataset)
+    exit_code = validate_main([str(dataset)])
+    output = capsys.readouterr().out
+
+    assert not report.valid
+    assert "dataset contains no images" in report.errors
+    assert exit_code != 0
+    assert "dataset invalid" in output
 
 
 def test_validator_rejects_manifest_schema_and_difficulty_mismatch(tmp_path: Path) -> None:
