@@ -347,6 +347,8 @@ def detection_snapshot_payload(snapshot: DetectionSnapshot) -> dict[str, Any]:
         "enabled": snapshot.enabled,
         "detected": snapshot.detected,
         "source_sequence": snapshot.source_sequence,
+        "observation": None,
+        "error": snapshot.error,
         "target_valid": snapshot.target_valid,
         "tracking_state": snapshot.tracking_state,
         "model_state": snapshot.model_state,

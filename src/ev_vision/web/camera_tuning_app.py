@@ -252,6 +252,8 @@ _DETECTION_STATUS_FIELDS = (
     "enabled",
     "detected",
     "source_sequence",
+    "observation",
+    "error",
     "target_valid",
     "tracking_state",
     "model_state",
