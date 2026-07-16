@@ -50,3 +50,37 @@ laser:
   backend: mock
   active_high: true
   gpio_line: null
+
+detection:
+  backend: hybrid
+  model:
+    path: models/target-board.engine
+    fallback_path: models/target-board.onnx
+    input_width: 640
+    input_height: 640
+    confidence_threshold: 0.45
+    max_candidates: 3
+    device: 0
+  roi_geometry:
+    padding_fraction: 0.08
+    canny_low: 60
+    canny_high: 180
+    min_edge_support: 0.45
+    min_geometry_score: 0.55
+    expected_aspect_ratio: 0.707
+    aspect_ratio_tolerance: 0.35
+    minimum_side_px: 40.0
+    minimum_area_fraction: 0.25
+    maximum_area_fraction: 1.15
+  candidate_scoring:
+    model_weight: 0.45
+    geometry_weight: 0.30
+    structure_weight: 0.15
+    temporal_weight: 0.10
+    ambiguity_margin: 0.08
+  tracking:
+    confirm_frames: 3
+    predict_frames: 2
+    lost_frames: 3
+    max_center_jump_px: 160.0
+    max_result_age_ms: 100.0
