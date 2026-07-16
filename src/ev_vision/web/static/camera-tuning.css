@@ -146,6 +146,7 @@ figure canvas { display: block; width: 100%; height: 120px; }
 .detection-status-grid article,.candidate-list li { padding:10px; border:1px solid var(--line); border-radius:9px; background:var(--panel-2); }
 .detection-status-grid strong,.detection-status-grid small { display:block; margin-top:4px; overflow:hidden; text-overflow:ellipsis; }
 .detection-status-grid small { color:var(--muted); font-size:.7rem; }
+.detection-status-grid article.wide { grid-column:span 2; }
 .candidate-list { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; padding:0; list-style:none; }
 .candidate-list li.rejected { border-left:3px solid var(--red); }
 .detection-config-form { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; margin-top:10px; }

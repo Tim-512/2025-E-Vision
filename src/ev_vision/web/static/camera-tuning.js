@@ -1,4 +1,4 @@
-﻿"use strict";
+"use strict";
 
 const $ = (id) => document.getElementById(id);
 const parameterKeys = ["exposure_us", "gain_db", "acquisition_fps", "auto_exposure", "auto_gain", "auto_white_balance"];
@@ -165,6 +165,7 @@ function updateStatus(payload) {
   $("acquisition-rate").textContent = formatRate(runtime.acquisition_fps);
   $("preview-rate").textContent = formatRate(runtime.preview_fps);
   $("detection-rate").textContent = formatRate(runtime.detection_fps);
+  $("detection-processing-rate").textContent = formatRate(runtime.detection_fps);
   $("diagnostics-rate").textContent = formatRate(runtime.diagnostics_fps);
   $("frame-age").textContent = formatRate(runtime.frame_age_ms);
   $("fault-counters").textContent = `${runtime.timeout_count ?? 0} / ${runtime.sequence_gap_count ?? 0}`;
@@ -260,7 +261,16 @@ function renderDetectionConfig(config) {
   $("detection-canny-high").value = config.roi_geometry.canny_high;
   $("detection-min-edge-support").value = config.roi_geometry.min_edge_support;
   $("detection-min-geometry-score").value = config.roi_geometry.min_geometry_score;
+  $("detection-model-weight").value = config.candidate_scoring.model_weight;
+  $("detection-geometry-weight").value = config.candidate_scoring.geometry_weight;
+  $("detection-structure-weight").value = config.candidate_scoring.structure_weight;
+  $("detection-temporal-weight").value = config.candidate_scoring.temporal_weight;
   $("detection-ambiguity-margin").value = config.candidate_scoring.ambiguity_margin;
+  $("detection-confirm-frames").value = config.tracking.confirm_frames;
+  $("detection-predict-frames").value = config.tracking.predict_frames;
+  $("detection-lost-frames").value = config.tracking.lost_frames;
+  $("detection-max-center-jump-px").value = config.tracking.max_center_jump_px;
+  $("detection-max-result-age-ms").value = config.tracking.max_result_age_ms;
 }
 
 function readDetectionConfigForm() {
@@ -271,7 +281,16 @@ function readDetectionConfigForm() {
   value.roi_geometry.canny_high = Number($("detection-canny-high").value);
   value.roi_geometry.min_edge_support = Number($("detection-min-edge-support").value);
   value.roi_geometry.min_geometry_score = Number($("detection-min-geometry-score").value);
+  value.candidate_scoring.model_weight = Number($("detection-model-weight").value);
+  value.candidate_scoring.geometry_weight = Number($("detection-geometry-weight").value);
+  value.candidate_scoring.structure_weight = Number($("detection-structure-weight").value);
+  value.candidate_scoring.temporal_weight = Number($("detection-temporal-weight").value);
   value.candidate_scoring.ambiguity_margin = Number($("detection-ambiguity-margin").value);
+  value.tracking.confirm_frames = Number($("detection-confirm-frames").value);
+  value.tracking.predict_frames = Number($("detection-predict-frames").value);
+  value.tracking.lost_frames = Number($("detection-lost-frames").value);
+  value.tracking.max_center_jump_px = Number($("detection-max-center-jump-px").value);
+  value.tracking.max_result_age_ms = Number($("detection-max-result-age-ms").value);
   return value;
 }
 
@@ -280,10 +299,15 @@ function renderDetectionStatus(status) {
   $("detection-model-state").textContent = status.model_state || "--";
   $("detection-model-backend").textContent = status.model_backend || "--";
   $("detection-model-path").textContent = status.model_path || "--";
-  $("detection-tracking-state").textContent = `${status.tracking_state || "--"} · ${status.target_valid ? "目标有效" : "目标无效"}`;
+  $("detection-tracking-state").textContent = status.tracking_state || "--";
   $("detection-failure-reason").textContent = status.failure_reason || "NONE";
+  $("detection-target-valid").textContent = status.target_valid ? "目标有效" : "目标无效";
+  $("detection-confirmation-count").textContent = status.confirmation_count ?? 0;
+  $("detection-miss-count").textContent = status.miss_count ?? 0;
+  $("detection-result-age").textContent = `结果年龄 ${status.result_age_ms == null ? "--" : finiteNumber(status.result_age_ms).toFixed(1)} ms`;
   $("detection-candidate-count").textContent = status.candidate_count ?? 0;
   $("detection-latency").textContent = `推理 ${finiteNumber(status.inference_ms).toFixed(1)} / 几何 ${finiteNumber(status.geometry_ms).toFixed(1)} / 总计 ${finiteNumber(status.total_ms).toFixed(1)} ms`;
+  $("detection-score-components").textContent = `M ${finiteNumber(status.model_confidence).toFixed(3)} · G ${finiteNumber(status.geometry_score).toFixed(3)} · E ${finiteNumber(status.edge_support_score).toFixed(3)} · S ${finiteNumber(status.structure_score).toFixed(3)} · T ${finiteNumber(status.temporal_score).toFixed(3)} · C ${finiteNumber(status.combined_score).toFixed(3)}`;
   const list = $("detection-candidate-list"); list.replaceChildren();
   (status.candidates || []).forEach((candidate, index) => {
     const item = document.createElement("li");
@@ -307,7 +331,7 @@ async function applyDetectionConfig() {
 
 async function reloadDetectionModel() {
   const button = $("reload-detection-model"); button.disabled = true;
-  try { renderDetectionStatus(await api("/api/detection/reload", {method:"POST", body:"{}"})); setMessage("模型已重新加载。", "success"); }
+  try { renderDetectionStatus(await api("/api/detection/model/reload", {method:"POST", body:"{}"})); setMessage("模型已重新加载。", "success"); }
   catch (error) { reportError("重新加载模型失败", error); }
   finally { button.disabled = false; }
 }
@@ -315,7 +339,7 @@ async function reloadDetectionModel() {
 async function refreshDetectionDebug() {
   const view = $("detection-debug-view").value;
   if (!view || latestDetectionSequence == null) { $("detection-debug-image").hidden = true; return; }
-  $("detection-debug-image").src = `/api/detection/debug?image_name=${encodeURIComponent(view)}&sequence=${latestDetectionSequence}&t=${Date.now()}`;
+  $("detection-debug-image").src = `/api/detection/debug/${encodeURIComponent(view)}?sequence=${latestDetectionSequence}&t=${Date.now()}`;
   $("detection-debug-image").hidden = false;
 }
 

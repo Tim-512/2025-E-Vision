@@ -281,6 +281,26 @@ def test_debug_image_rejects_unknown_name_and_stale_sequence(client: TestClient)
     assert "latest" in response.json()["detail"]
 
 
+def test_canonical_debug_image_alias_returns_matching_view(client: TestClient) -> None:
+    response = client.get(
+        "/api/detection/debug/roi-geometry",
+        params={"sequence": 42},
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_canonical_model_reload_alias_preserves_legacy_route(
+    client: TestClient, service: FakeService
+) -> None:
+    canonical = client.post("/api/detection/model/reload")
+    legacy = client.post("/api/detection/reload")
+    assert canonical.status_code == 200
+    assert legacy.status_code == 200
+    assert service.reload_calls == 2
+
+
 def test_debug_request_returns_no_store_jpeg_without_advancing_tracker(
     client: TestClient, service: FakeService
 ) -> None:

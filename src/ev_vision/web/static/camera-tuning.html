@@ -134,7 +134,11 @@
       <div class="detection-status-grid">
         <article>模型 <strong id="detection-model-state">--</strong><small id="detection-model-backend">--</small><small id="detection-model-path">--</small></article>
         <article>跟踪 <strong id="detection-tracking-state">--</strong><small id="detection-failure-reason">--</small></article>
+        <article>目标有效性 <strong id="detection-target-valid">--</strong><small id="detection-result-age">结果年龄 -- ms</small></article>
+        <article>检测速率 <strong id="detection-processing-rate">--</strong><small>FPS</small></article>
+        <article>时序计数 <strong><span id="detection-confirmation-count">--</span> / <span id="detection-miss-count">--</span></strong><small>确认帧 / 丢失帧</small></article>
         <article>候选 <strong id="detection-candidate-count">--</strong><small id="detection-latency">--</small></article>
+        <article class="wide">评分分量 <strong id="detection-score-components">--</strong><small>M 模型 / G 几何 / E 边缘 / S 结构 / T 时序 / C 综合</small></article>
       </div>
       <ol id="detection-candidate-list" class="candidate-list"><li>等待候选</li></ol>
       <form id="detection-config-form" class="detection-config-form">
@@ -144,7 +148,16 @@
         <label>Canny 高阈值<input id="detection-canny-high" type="number" step="1"></label>
         <label>边缘支持<input id="detection-min-edge-support" type="number" step="0.01"></label>
         <label>几何阈值<input id="detection-min-geometry-score" type="number" step="0.01"></label>
+        <label>模型权重<input id="detection-model-weight" type="number" step="0.01"></label>
+        <label>几何权重<input id="detection-geometry-weight" type="number" step="0.01"></label>
+        <label>结构权重<input id="detection-structure-weight" type="number" step="0.01"></label>
+        <label>时序权重<input id="detection-temporal-weight" type="number" step="0.01"></label>
         <label>歧义间隔<input id="detection-ambiguity-margin" type="number" step="0.01"></label>
+        <label>确认帧数<input id="detection-confirm-frames" type="number" step="1"></label>
+        <label>预测帧数<input id="detection-predict-frames" type="number" step="1"></label>
+        <label>丢失帧数<input id="detection-lost-frames" type="number" step="1"></label>
+        <label>最大中心跳变（px）<input id="detection-max-center-jump-px" type="number" step="1"></label>
+        <label>最大结果年龄（ms）<input id="detection-max-result-age-ms" type="number" step="1"></label>
         <button id="apply-detection-config" type="button" class="button primary">应用检测参数</button>
         <button id="restore-detection-defaults" type="button" class="button secondary">恢复当前配置</button>
         <button id="reload-detection-model" type="button" class="button danger">重新加载模型</button>

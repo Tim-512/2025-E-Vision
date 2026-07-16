@@ -334,13 +334,28 @@ def test_dashboard_contains_hybrid_detection_controls_and_current_routes() -> No
         'id="detection-tracking-state"',
         'id="detection-failure-reason"',
         'id="detection-candidate-list"',
+        'id="detection-target-valid"',
+        'id="detection-processing-rate"',
+        'id="detection-confirmation-count"',
+        'id="detection-miss-count"',
+        'id="detection-result-age"',
+        'id="detection-score-components"',
         'id="detection-confidence-threshold"',
         'id="detection-max-candidates"',
         'id="detection-canny-low"',
         'id="detection-canny-high"',
         'id="detection-min-edge-support"',
         'id="detection-min-geometry-score"',
+        'id="detection-model-weight"',
+        'id="detection-geometry-weight"',
+        'id="detection-structure-weight"',
+        'id="detection-temporal-weight"',
         'id="detection-ambiguity-margin"',
+        'id="detection-confirm-frames"',
+        'id="detection-predict-frames"',
+        'id="detection-lost-frames"',
+        'id="detection-max-center-jump-px"',
+        'id="detection-max-result-age-ms"',
         'id="apply-detection-config"',
         'id="restore-detection-defaults"',
         'id="detection-debug-view"',
@@ -353,13 +368,65 @@ def test_dashboard_contains_hybrid_detection_controls_and_current_routes() -> No
     assert "/api/detection/status" in script
     assert "/api/detection/config" in script
     assert "/api/detection/debug" in script
-    assert "/api/detection/reload" in script
-    assert "/api/detection/model/reload" not in script
+    assert "/api/detection/model/reload" in script
+    assert "/api/detection/debug/" in script
     assert "payload.detail" in script
     assert "button.disabled = true" in script
+    assert '$("detection-processing-rate").textContent = formatRate(runtime.detection_fps);' in script
 
     status_function = _javascript_function(script, "refreshDetectionStatus")
     assert "refreshDetectionDebug" not in status_function
+
+
+def test_dashboard_hybrid_labels_are_utf8_and_not_question_mark_placeholders() -> None:
+    html = _static_text("camera-tuning.html")
+    script = _static_text("camera-tuning.js")
+
+    for label in (
+        "混合靶面检测",
+        "目标有效",
+        "目标无效",
+        "确认帧数",
+        "最大中心跳变",
+        "重新加载模型",
+    ):
+        assert label in html + script
+    assert "????" not in html
+    assert "????" not in script
+
+
+def test_invalid_hybrid_target_does_not_draw_green_confirmation_center() -> None:
+    import numpy as np
+
+    import ev_vision.web.camera_tuning_app as camera_tuning_app
+    from ev_vision.tuning.models import DetectionSnapshot, OverlayOptions
+
+    snapshot = DetectionSnapshot(
+        enabled=True,
+        detected=True,
+        source_sequence=9,
+        target_valid=False,
+        tracking_state="PREDICTING",
+        center_px=(57.0, 68.0),
+        corners_px=((15.0, 55.0), (100.0, 55.0), (98.0, 82.0), (17.0, 82.0)),
+        failure_reason="PREDICTING",
+    )
+    rendered = camera_tuning_app.render_overlay(
+        np.zeros((100, 120, 3), dtype=np.uint8),
+        source_sequence=9,
+        detection=snapshot,
+        options=OverlayOptions(
+            enabled=True,
+            show_board_outline=True,
+            show_corners=True,
+            show_center=True,
+            show_crosshair=False,
+            show_detection_text=False,
+            show_center_roi=False,
+        ),
+    )
+
+    assert not np.any(np.all(rendered == np.array([0, 255, 0], dtype=np.uint8), axis=2))
 
 
 def test_hybrid_overlay_draws_candidate_decisions_and_tracking_semantics(monkeypatch) -> None:

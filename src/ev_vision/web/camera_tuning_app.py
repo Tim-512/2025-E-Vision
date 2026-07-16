@@ -58,7 +58,7 @@ def _render_hybrid_overlay(image: np.ndarray, *, source_sequence: int, detection
         corners[:, 0] = np.clip(corners[:, 0], 0, width-1); corners[:, 1] = np.clip(corners[:, 1], 0, height-1)
         cv2.polylines(output, [np.rint(corners).astype(np.int32)], True, _CONFIRMED_COLOR, 2, cv2.LINE_8)
     center = np.asarray(getattr(detection, "center_px", ()) or (), dtype=float)
-    if center.shape == (2,) and np.isfinite(center).all():
+    if bool(getattr(detection, "target_valid", False)) and center.shape == (2,) and np.isfinite(center).all():
         point = (int(np.clip(round(center[0]), 0, width-1)), int(np.clip(round(center[1]), 0, height-1)))
         cv2.line(output, (width//2, height//2), point, _CONFIRMED_COLOR, 1, cv2.LINE_AA)
         cv2.drawMarker(output, point, _CONFIRMED_COLOR, cv2.MARKER_CROSS, 11, 2, cv2.LINE_8)
@@ -484,11 +484,7 @@ def create_camera_tuning_app(
     def get_detection_status() -> dict[str, Any]:
         return _detection_status_response(service.latest_detection())
 
-    @app.get("/api/detection/debug")
-    def get_detection_debug(
-        image_name: str = Query(...),
-        sequence: int | None = Query(None, ge=0),
-    ) -> Response:
+    def _detection_debug_response(image_name: str, sequence: int | None) -> Response:
         if image_name not in DEBUG_IMAGE_NAMES:
             raise HTTPException(status_code=404, detail="detection debug image not found")
         try:
@@ -519,7 +515,22 @@ def create_camera_tuning_app(
             headers={"Cache-Control": "no-store"},
         )
 
+    @app.get("/api/detection/debug")
+    def get_detection_debug(
+        image_name: str = Query(...),
+        sequence: int | None = Query(None, ge=0),
+    ) -> Response:
+        return _detection_debug_response(image_name, sequence)
+
+    @app.get("/api/detection/debug/{image_name}")
+    def get_detection_debug_by_name(
+        image_name: str,
+        sequence: int | None = Query(None, ge=0),
+    ) -> Response:
+        return _detection_debug_response(image_name, sequence)
+
     @app.post("/api/detection/reload")
+    @app.post("/api/detection/model/reload")
     def reload_detection_model() -> dict[str, Any]:
         try:
             service.reload_detection_model()
