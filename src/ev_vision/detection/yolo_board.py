@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Protocol
 
 import cv2
@@ -81,50 +83,71 @@ class YoloBoardDetector:
         *,
         confidence_threshold: float = 0.5,
         board_class_id: int = 0,
+        max_candidates: int = 3,
     ) -> None:
         self.backend = backend
         self.confidence_threshold = confidence_threshold
         self.board_class_id = board_class_id
+        self.max_candidates = max_candidates
 
     @staticmethod
     def _tensor(image: np.ndarray) -> np.ndarray:
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         return np.ascontiguousarray(rgb.transpose(2, 0, 1)[None], dtype=np.float32) / 255.0
 
-    def detect(self, image: np.ndarray) -> BoardSearchResult | None:
+    def detect_candidates(self, image: np.ndarray) -> tuple[BoardSearchResult, ...]:
         prepared, transform = letterbox(image, self.backend.input_size)
-        candidates = [
-            detection
-            for detection in self.backend.infer(self._tensor(prepared))
-            if detection.class_id == self.board_class_id and detection.confidence >= self.confidence_threshold
-        ]
-        candidates.sort(key=lambda item: item.confidence, reverse=True)
-        for detection in candidates:
-            box = transform.to_original_box(np.asarray(detection.xyxy, dtype=np.float64))
-            x0, y0, x1, y1 = (float(value) for value in box)
+        valid: list[BoardSearchResult] = []
+        for detection in self.backend.infer(self._tensor(prepared)):
+            if detection.class_id != self.board_class_id:
+                continue
+            if not math.isfinite(detection.confidence):
+                continue
+            if detection.confidence < self.confidence_threshold:
+                continue
+            model_box = np.asarray(detection.xyxy, dtype=np.float64)
+            if not np.isfinite(model_box).all():
+                continue
+            box = transform.to_original_box(model_box)
+            if not np.isfinite(box).all():
+                continue
+            x0, y0, x1, y1 = map(float, box)
             if x1 <= x0 or y1 <= y0:
                 continue
-            return BoardSearchResult((x0, y0, x1, y1), float(detection.confidence))
-        return None
+            valid.append(BoardSearchResult((x0, y0, x1, y1), float(detection.confidence)))
+        valid.sort(key=lambda item: item.confidence, reverse=True)
+        return tuple(valid[: self.max_candidates])
+
+    def detect(self, image: np.ndarray) -> BoardSearchResult | None:
+        candidates = self.detect_candidates(image)
+        return candidates[0] if candidates else None
 
 
-class TensorRTBackend:
-    """Ultralytics-backed TensorRT engine adapter, imported only when selected."""
+class UltralyticsBackend:
+    """Lazy Ultralytics adapter for portable YOLO model artifacts."""
+
+    _SUPPORTED_ARTIFACTS = frozenset({"pt", "onnx", "engine"})
 
     def __init__(
         self,
-        engine_path: str,
+        artifact_path: str,
         *,
         input_size: tuple[int, int] = (640, 640),
-        device: int = 0,
+        device: int | str = 0,
     ) -> None:
+        artifact_kind = Path(artifact_path).suffix.lower().lstrip(".")
+        if artifact_kind not in self._SUPPORTED_ARTIFACTS:
+            raise ValueError("YOLO artifact must use a .pt, .onnx, or .engine suffix")
+
         try:
             from ultralytics import YOLO
         except ImportError as exc:
-            raise RuntimeError("ultralytics is required to run the TensorRT engine on Jetson") from exc
+            raise RuntimeError("ultralytics is required to load YOLO model artifacts") from exc
+
         self.input_size = input_size
         self.device = device
-        self._model = YOLO(engine_path, task="detect")
+        self.artifact_kind = artifact_kind
+        self._model = YOLO(artifact_path, task="detect")
 
     def infer(self, tensor: np.ndarray) -> Iterable[RawDetection]:
         results = self._model.predict(tensor, verbose=False, device=self.device)
@@ -145,3 +168,6 @@ class TensorRTBackend:
                     )
                 )
         return detections
+
+
+TensorRTBackend = UltralyticsBackend
