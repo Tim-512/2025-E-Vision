@@ -1,4 +1,4 @@
-﻿from pathlib import Path
+from pathlib import Path
 
 import pytest
 import yaml
@@ -110,6 +110,56 @@ def test_invalid_detection_configuration_is_rejected(
     ],
 )
 def test_detection_configuration_rejects_additional_invalid_values(
+    tmp_path: Path, patch: dict[str, object], message: str
+) -> None:
+    path = write_detection_config(tmp_path, patch)
+    with pytest.raises(ConfigError, match=message):
+        load_config(path)
+
+@pytest.mark.parametrize(
+    ("patch", "message"),
+    [
+        ({"model": {"input_width": 640.5}}, "input_width"),
+        ({"model": {"input_width": True}}, "input_width"),
+        ({"model": {"input_height": 640.5}}, "input_height"),
+        ({"model": {"input_height": True}}, "input_height"),
+        ({"model": {"max_candidates": 3.5}}, "max_candidates"),
+        ({"model": {"max_candidates": True}}, "max_candidates"),
+        ({"model": {"device": 0.5}}, "device"),
+        ({"model": {"device": False}}, "device"),
+        ({"roi_geometry": {"canny_low": 60.5}}, "canny_low"),
+        ({"roi_geometry": {"canny_low": False}}, "canny_low"),
+        ({"roi_geometry": {"canny_high": 180.5}}, "canny_high"),
+        ({"roi_geometry": {"canny_high": True}}, "canny_high"),
+        ({"tracking": {"confirm_frames": 3.5}}, "confirm_frames"),
+        ({"tracking": {"confirm_frames": True}}, "confirm_frames"),
+        ({"tracking": {"predict_frames": 2.5}}, "predict_frames"),
+        ({"tracking": {"predict_frames": True}}, "predict_frames"),
+        ({"tracking": {"lost_frames": 3.5}}, "lost_frames"),
+        ({"tracking": {"lost_frames": True}}, "lost_frames"),
+    ],
+)
+def test_detection_integer_settings_reject_float_and_bool(
+    tmp_path: Path, patch: dict[str, object], message: str
+) -> None:
+    path = write_detection_config(tmp_path, patch)
+    with pytest.raises(ConfigError, match=rf"{message} must be .*integer"):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
+    ("patch", "message"),
+    [
+        ({"model": {"confidence_threshold": float("nan")}}, "confidence_threshold"),
+        ({"model": {"confidence_threshold": float("inf")}}, "confidence_threshold"),
+        ({"model": {"confidence_threshold": float("-inf")}}, "confidence_threshold"),
+        ({"candidate_scoring": {"ambiguity_margin": float("nan")}}, "ambiguity_margin"),
+        ({"candidate_scoring": {"ambiguity_margin": float("inf")}}, "ambiguity_margin"),
+        ({"tracking": {"max_result_age_ms": float("nan")}}, "max_result_age_ms"),
+        ({"tracking": {"max_result_age_ms": float("inf")}}, "max_result_age_ms"),
+    ],
+)
+def test_detection_ranges_reject_non_finite_values(
     tmp_path: Path, patch: dict[str, object], message: str
 ) -> None:
     path = write_detection_config(tmp_path, patch)

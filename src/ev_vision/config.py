@@ -197,6 +197,26 @@ def _finite(name: str, value: float) -> None:
         raise ConfigError(f"{name} must be a finite number")
 
 
+def _integer(name: str, value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"{name} must be an integer")
+    return value
+
+
+def _positive_integer(name: str, value: object) -> int:
+    integer = _integer(name, value)
+    if integer <= 0:
+        raise ConfigError(f"{name} must be a positive integer")
+    return integer
+
+
+def _non_negative_integer(name: str, value: object) -> int:
+    integer = _integer(name, value)
+    if integer < 0:
+        raise ConfigError(f"{name} must be a non-negative integer")
+    return integer
+
+
 def _positive(name: str, value: float) -> None:
     _finite(name, value)
     if value <= 0:
@@ -219,19 +239,23 @@ def _validate_detection(cfg: DetectionConfig) -> None:
     if cfg.backend not in {"hybrid", "classical"}:
         raise ConfigError("detection.backend must be 'hybrid' or 'classical'")
 
-    _positive("detection.model.input_width", cfg.model.input_width)
-    _positive("detection.model.input_height", cfg.model.input_height)
+    _positive_integer("detection.model.input_width", cfg.model.input_width)
+    _positive_integer("detection.model.input_height", cfg.model.input_height)
     _unit_interval(
         "detection.model.confidence_threshold", cfg.model.confidence_threshold
     )
-    _positive("detection.model.max_candidates", cfg.model.max_candidates)
-    _non_negative("detection.model.device", cfg.model.device)
+    _positive_integer("detection.model.max_candidates", cfg.model.max_candidates)
+    _non_negative_integer("detection.model.device", cfg.model.device)
 
     _non_negative(
         "detection.roi_geometry.padding_fraction", cfg.roi_geometry.padding_fraction
     )
-    _non_negative("detection.roi_geometry.canny_low", cfg.roi_geometry.canny_low)
-    _positive("detection.roi_geometry.canny_high", cfg.roi_geometry.canny_high)
+    _non_negative_integer(
+        "detection.roi_geometry.canny_low", cfg.roi_geometry.canny_low
+    )
+    _positive_integer(
+        "detection.roi_geometry.canny_high", cfg.roi_geometry.canny_high
+    )
     if cfg.roi_geometry.canny_low >= cfg.roi_geometry.canny_high:
         raise ConfigError(
             "detection.roi_geometry.canny_low must be less than canny_high"
@@ -288,9 +312,9 @@ def _validate_detection(cfg: DetectionConfig) -> None:
         cfg.candidate_scoring.ambiguity_margin,
     )
 
-    _positive("detection.tracking.confirm_frames", cfg.tracking.confirm_frames)
-    _positive("detection.tracking.predict_frames", cfg.tracking.predict_frames)
-    _positive("detection.tracking.lost_frames", cfg.tracking.lost_frames)
+    _positive_integer("detection.tracking.confirm_frames", cfg.tracking.confirm_frames)
+    _positive_integer("detection.tracking.predict_frames", cfg.tracking.predict_frames)
+    _positive_integer("detection.tracking.lost_frames", cfg.tracking.lost_frames)
     _positive(
         "detection.tracking.max_center_jump_px", cfg.tracking.max_center_jump_px
     )
