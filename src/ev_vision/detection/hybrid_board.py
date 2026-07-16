@@ -8,7 +8,8 @@ from typing import Protocol
 
 import numpy as np
 
-from ev_vision.config import CandidateScoringConfig, DetectionConfig
+from ev_vision.config import BoardConfig, CandidateScoringConfig, DetectionConfig
+from ev_vision.detection.board_solution import solve_board_plane
 from ev_vision.detection.failures import (
     CandidateEvaluation,
     DetectionFailure,
@@ -94,6 +95,7 @@ class HybridBoardDetector:
         *,
         config: DetectionConfig | None = None,
         tracker: TrackerPort | None = None,
+        board: BoardConfig | None = None,
         clock_ns: Callable[[], int] = time.perf_counter_ns,
         model_state: str | None = None,
         model_backend: str | None = None,
@@ -103,6 +105,7 @@ class HybridBoardDetector:
         self.config = config or DetectionConfig()
         self.geometry = geometry or self._geometry_from_config(self.config)
         self.tracker = tracker
+        self.board = board or BoardConfig()
         self.clock_ns = clock_ns
         self._model_state = model_state
         self._model_backend = model_backend
@@ -326,20 +329,42 @@ class HybridBoardDetector:
 
         failure_reason = tracked.failure_reason or result.failure_reason
         invalidated = tracked.failure_reason is not None
+        board_solution = None
+        if (
+            not invalidated
+            and result.detected
+            and result.failure_reason is None
+            and result.corners_px is not None
+        ):
+            board_solution = solve_board_plane(result.corners_px, board=self.board)
+        homography_valid = bool(
+            board_solution is not None and board_solution.homography_valid
+        )
         target_valid = (
             tracked.state is TrackingState.TRACKING
             and tracked.target_valid
             and result.detected
             and result.failure_reason is None
             and not invalidated
+            and homography_valid
+        )
+        target_center_mm = (
+            board_solution.target_center_mm if homography_valid else None
         )
         return replace(
             result,
             detected=False if invalidated else result.detected,
             target_valid=target_valid,
             tracking_state=tracked.state.value,
+            homography_valid=homography_valid,
+            target_x_mm=(target_center_mm[0] if target_center_mm is not None else None),
+            target_y_mm=(target_center_mm[1] if target_center_mm is not None else None),
             corners_px=None if invalidated else result.corners_px,
-            center_px=None if invalidated else result.center_px,
+            center_px=(
+                board_solution.center_px
+                if homography_valid and board_solution is not None
+                else (None if invalidated else result.center_px)
+            ),
             failure_reason=failure_reason,
         )
 
@@ -349,6 +374,9 @@ class HybridBoardDetector:
             detected=False,
             target_valid=False,
             tracking_state=self._current_tracking_state(),
+            homography_valid=False,
+            target_x_mm=None,
+            target_y_mm=None,
             corners_px=None,
             center_px=None,
             failure_reason=DetectionFailure.MODEL_ERROR,

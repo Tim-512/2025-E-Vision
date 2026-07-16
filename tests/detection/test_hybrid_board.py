@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from ev_vision.config import (
+    BoardConfig,
     BoardTrackingConfig,
     CandidateScoringConfig,
     DetectionConfig,
@@ -528,6 +529,49 @@ def test_three_unique_hybrid_hits_confirm_tracking_and_authorize_target() -> Non
     ]
     assert [result.target_valid for result in results] == [False, False, True]
 
+
+def test_tracking_result_publishes_valid_board_center_target_coordinates() -> None:
+    tracker = FakeTracker(state=TrackingState.TRACKING, target_valid=True)
+    detector = HybridBoardDetector(
+        model=FakeModel([candidate(0.9)]),
+        geometry=FakeGeometry({0: accepted_geometry(0.9, 0.8, 0.7)}),
+        tracker=tracker,
+        board=BoardConfig(width_cm=21.0, height_cm=29.7),
+    )
+
+    result = detector.detect(frame_image(), captured_ns=1_000, source_sequence=30)
+
+    assert result.target_valid is True
+    assert result.homography_valid is True
+    assert result.target_x_mm == pytest.approx(0.0)
+    assert result.target_y_mm == pytest.approx(0.0)
+
+
+def test_degenerate_selected_corners_force_tracking_target_invalid() -> None:
+    tracker = FakeTracker(state=TrackingState.TRACKING, target_valid=True)
+    degenerate = GeometryResult(
+        accepted=True,
+        corners_px=((1.0, 1.0), (2.0, 2.0), (3.0, 3.0), (4.0, 4.0)),
+        center_px=(2.5, 2.5),
+        geometry_score=0.9,
+        edge_support_score=0.8,
+        structure_score=0.7,
+        roi_xyxy_px=(0, 0, 5, 5),
+        failure_reason=None,
+    )
+    detector = HybridBoardDetector(
+        model=FakeModel([candidate(0.9)]),
+        geometry=FakeGeometry({0: degenerate}),
+        tracker=tracker,
+    )
+
+    result = detector.detect(frame_image(), captured_ns=1_000, source_sequence=31)
+
+    assert result.tracking_state == "TRACKING"
+    assert result.homography_valid is False
+    assert result.target_valid is False
+    assert result.target_x_mm is None
+    assert result.target_y_mm is None
 
 def test_hybrid_miss_enters_prediction_but_never_authorizes_target() -> None:
     tracker = BoardTracker(tracking_config().tracking)

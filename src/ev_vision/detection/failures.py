@@ -55,5 +55,8 @@ class HybridBoardResult:
     inference_ms: float
     geometry_ms: float
     total_ms: float
+    homography_valid: bool = False
+    target_x_mm: float | None = None
+    target_y_mm: float | None = None
     candidates: tuple[CandidateEvaluation, ...] = ()
     debug_images: Mapping[str, np.ndarray] = field(default_factory=dict, compare=False)

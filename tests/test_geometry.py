@@ -20,6 +20,23 @@ def test_target_image_round_trip() -> None:
         assert geom.image_to_target_cm(geom.target_cm_to_image(point)) == pytest.approx(point, abs=1e-5)
 
 
+def test_target_image_round_trip_preserves_custom_board_dimensions() -> None:
+    corners = ((10.0, 20.0), (410.0, 20.0), (410.0, 220.0), (10.0, 220.0))
+    geom = TargetGeometry.from_image_corners(
+        corners,
+        px_per_cm=25.0,
+        width_cm=40.0,
+        height_cm=20.0,
+    )
+
+    assert geom.width_cm == pytest.approx(40.0)
+    assert geom.height_cm == pytest.approx(20.0)
+    assert np.asarray(geom.target_corners_cm) == pytest.approx(
+        np.asarray(((-20.0, 10.0), (20.0, 10.0), (20.0, -10.0), (-20.0, -10.0)))
+    )
+    assert geom.image_to_target_cm(corners[0]) == pytest.approx((-20.0, 10.0))
+    assert geom.image_to_target_cm(corners[2]) == pytest.approx((20.0, -10.0))
+
 def test_degenerate_quadrilateral_is_rejected() -> None:
     with pytest.raises(HomographyError):
         TargetGeometry.from_image_corners(((0, 0), (1, 0), (2, 0), (3, 0)))

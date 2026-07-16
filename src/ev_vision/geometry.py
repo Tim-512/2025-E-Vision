@@ -69,11 +69,18 @@ class TargetGeometry:
         return ((-half_w, half_h), (half_w, half_h), (half_w, -half_h), (-half_w, -half_h))
 
     @classmethod
-    def from_image_corners(cls, corners: Iterable[tuple[float, float]], px_per_cm: float = 40.0) -> "TargetGeometry":
+    def from_image_corners(
+        cls,
+        corners: Iterable[tuple[float, float]],
+        px_per_cm: float = 40.0,
+        *,
+        width_cm: float = 21.0,
+        height_cm: float = 29.7,
+    ) -> "TargetGeometry":
         image = np.asarray(tuple(corners), dtype=np.float64)
         if image.shape != (4, 2) or _polygon_area(image) < 1.0:
             raise HomographyError("degenerate quadrilateral")
-        base = cls(px_per_cm=px_per_cm)
+        base = cls(px_per_cm=px_per_cm, width_cm=width_cm, height_cm=height_cm)
         target = np.asarray(base.target_corners_cm, dtype=np.float64)
         target_to_image = _solve_homography(target, image)
         try:
@@ -82,7 +89,13 @@ class TargetGeometry:
             raise HomographyError("singular homography") from exc
         if np.linalg.cond(target_to_image) > 1e12:
             raise HomographyError("ill-conditioned homography")
-        return cls(px_per_cm=px_per_cm, _target_to_image=target_to_image, _image_to_target=image_to_target)
+        return cls(
+            px_per_cm=px_per_cm,
+            width_cm=width_cm,
+            height_cm=height_cm,
+            _target_to_image=target_to_image,
+            _image_to_target=image_to_target,
+        )
 
     def cm_to_rectified_px(self, point_cm: tuple[float, float]) -> tuple[float, float]:
         cx, cy = self.center_px
