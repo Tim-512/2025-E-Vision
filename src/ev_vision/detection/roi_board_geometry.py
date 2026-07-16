@@ -145,9 +145,6 @@ def order_corners(
     center = array.mean(axis=0)
     angles = np.arctan2(array[:, 1] - center[1], array[:, 0] - center[0])
     ordered = array[np.argsort(angles)]
-    start = int(np.argmin(ordered[:, 0] + ordered[:, 1]))
-    ordered = np.roll(ordered, -start, axis=0)
-
     signed_area = 0.5 * float(
         np.sum(
             ordered[:, 0] * np.roll(ordered[:, 1], -1)
@@ -157,8 +154,19 @@ def order_corners(
     if abs(signed_area) <= 1e-6:
         raise ValueError("corner ordering has zero area")
     if signed_area < 0.0:
-        ordered = ordered[[0, 3, 2, 1]]
+        ordered = ordered[::-1]
 
+    # In image coordinates the TL->TR edge is the uppermost edge that travels
+    # to the right. Selecting an edge, rather than the minimum x+y vertex,
+    # remains stable when perspective or roll makes the bottom-left corner have
+    # the smallest coordinate sum.
+    next_points = np.roll(ordered, -1, axis=0)
+    edge_midpoint_y = 0.5 * (ordered[:, 1] + next_points[:, 1])
+    rightward_edges = np.flatnonzero(next_points[:, 0] > ordered[:, 0])
+    if rightward_edges.size == 0:
+        raise ValueError("corner ordering has no rightward top edge")
+    start = int(rightward_edges[np.argmin(edge_midpoint_y[rightward_edges])])
+    ordered = np.roll(ordered, -start, axis=0)
     contour = ordered.astype(np.float32).reshape(-1, 1, 2)
     if not cv2.isContourConvex(contour):
         raise ValueError("corner ordering is not convex")
@@ -181,6 +189,7 @@ class RoiBoardGeometry:
     border_margin_px: float = 2.0
     ambiguity_margin: float = 0.05
     refine_corners: bool = True
+    subpixel_window_radius_px: int = 5
 
     def refine(
         self,
@@ -211,13 +220,13 @@ class RoiBoardGeometry:
         roi_image = image[y0:y1, x0:x1]
         if roi_image.size == 0:
             return self._failure(GeometryFailure.INVALID_ROI)
-        model_touches_image_boundary = (
-            model_values[0] <= self.border_margin_px
-            or model_values[1] <= self.border_margin_px
-            or model_values[2] >= image_width - self.border_margin_px
-            or model_values[3] >= image_height - self.border_margin_px
+        roi_touches_image_boundary = (
+            x0 == 0,
+            y0 == 0,
+            x1 == image_width,
+            y1 == image_height,
         )
-        roi_bgr = self._as_bgr(roi_image)
+        roi_bgr = self._as_bgr(roi_image) if include_debug else None
         gray = self._as_gray(roi_image)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
@@ -265,6 +274,18 @@ class RoiBoardGeometry:
         )
         edges = cv2.bitwise_or(edges, bridged_edges)
 
+        boundary_hulls = [
+            cv2.convexHull(contour)
+            for contour in contours
+            if self._touches_boundary(
+                contour.reshape(-1, 2),
+                x1 - x0,
+                y1 - y0,
+                roi_touches_image_boundary=roi_touches_image_boundary,
+            )
+        ]
+        contours.extend(hull for hull in boundary_hulls if len(hull) >= 4)
+
         accepted: list[_Candidate] = []
         rejected: list[_RejectedCandidate] = []
         seen: list[np.ndarray] = []
@@ -310,7 +331,7 @@ class RoiBoardGeometry:
                     primary_edges=primary_edges,
                     model_area=model_area,
                     roi_size=(x1 - x0, y1 - y0),
-                    model_touches_image_boundary=model_touches_image_boundary,
+                    roi_touches_image_boundary=roi_touches_image_boundary,
                 )
                 if isinstance(evaluation, _Candidate):
                     accepted.append(evaluation)
@@ -319,23 +340,27 @@ class RoiBoardGeometry:
 
         debug = None
         if include_debug:
+            assert roi_bgr is not None
             debug = self._build_debug(roi_bgr, edges, accepted, rejected, None)
 
         if not accepted:
-            reason = self._best_failure_reason(
+            representative = self._representative_rejected(
                 rejected,
                 saw_contour=saw_contour,
                 saw_four_points=saw_four_points,
             )
-            best_rejected = self._best_rejected(rejected)
+            if representative is None:
+                return self._failure(
+                    GeometryFailure.NO_VALID_QUADRILATERAL,
+                    roi=roi,
+                    debug=debug,
+                )
             return self._failure(
-                reason,
+                representative.reason,
                 roi=roi,
-                geometry_score=(best_rejected.geometry_score if best_rejected else 0.0),
-                edge_support_score=(
-                    best_rejected.edge_support_score if best_rejected else 0.0
-                ),
-                structure_score=(best_rejected.structure_score if best_rejected else 0.0),
+                geometry_score=representative.geometry_score,
+                edge_support_score=representative.edge_support_score,
+                structure_score=representative.structure_score,
                 debug=debug,
             )
 
@@ -345,7 +370,10 @@ class RoiBoardGeometry:
             gap = winner.total_score - accepted[1].total_score
             if gap < self.ambiguity_margin:
                 if include_debug:
-                    debug = self._build_debug(roi_bgr, edges, accepted, rejected, None)
+                    assert roi_bgr is not None
+                    debug = self._build_debug(
+                        roi_bgr, edges, accepted, rejected, None
+                    )
                 return self._failure(
                     GeometryFailure.AMBIGUOUS_GEOMETRY,
                     roi=roi,
@@ -357,25 +385,64 @@ class RoiBoardGeometry:
 
         corners = winner.corners.copy()
         if self.refine_corners:
-            corners = self._subpixel_refine(blurred, corners)
+            refined = self._subpixel_refine(blurred, corners)
+            displacement = np.max(np.abs(refined - corners), axis=1)
+            if (
+                not np.isfinite(refined).all()
+                or float(np.max(displacement)) > self.subpixel_window_radius_px
+            ):
+                return self._failure(
+                    GeometryFailure.NO_VALID_QUADRILATERAL,
+                    roi=roi,
+                    debug=debug,
+                )
+            corners = refined
         try:
-            corners_tuple = order_corners(corners)
+            corners = np.asarray(order_corners(corners), dtype=np.float32)
         except ValueError:
             return self._failure(
                 GeometryFailure.CORNER_ORDER_FAILED,
                 roi=roi,
-                geometry_score=winner.geometry_score,
-                edge_support_score=winner.edge_support_score,
-                structure_score=winner.structure_score,
                 debug=debug,
             )
 
+        refined_evaluation = self._evaluate_candidate(
+            corners,
+            gray=gray,
+            primary_edges=primary_edges,
+            model_area=model_area,
+            roi_size=(x1 - x0, y1 - y0),
+            roi_touches_image_boundary=roi_touches_image_boundary,
+        )
+        if isinstance(refined_evaluation, _RejectedCandidate):
+            rejected.append(refined_evaluation)
+            if include_debug:
+                assert roi_bgr is not None
+                debug = self._build_debug(
+                    roi_bgr,
+                    edges,
+                    [candidate for candidate in accepted if candidate is not winner],
+                    rejected,
+                    None,
+                )
+            return self._failure(
+                refined_evaluation.reason,
+                roi=roi,
+                geometry_score=refined_evaluation.geometry_score,
+                edge_support_score=refined_evaluation.edge_support_score,
+                structure_score=refined_evaluation.structure_score,
+                debug=debug,
+            )
+        accepted[accepted.index(winner)] = refined_evaluation
+        winner = refined_evaluation
+        corners_tuple = tuple(tuple(float(value) for value in point) for point in corners)
         source_corners = roi.to_source(corners_tuple)
         center = tuple(
             float(value)
             for value in np.asarray(source_corners, dtype=np.float64).mean(axis=0)
         )
         if include_debug:
+            assert roi_bgr is not None
             debug = self._build_debug(roi_bgr, edges, accepted, rejected, winner)
         return GeometryResult(
             accepted=True,
@@ -397,11 +464,14 @@ class RoiBoardGeometry:
         primary_edges: np.ndarray,
         model_area: float,
         roi_size: tuple[int, int],
-        model_touches_image_boundary: bool,
+        roi_touches_image_boundary: tuple[bool, bool, bool, bool],
     ) -> _Candidate | _RejectedCandidate:
         roi_width, roi_height = roi_size
-        if model_touches_image_boundary or self._touches_boundary(
-            corners, roi_width, roi_height
+        if self._touches_boundary(
+            corners,
+            roi_width,
+            roi_height,
+            roi_touches_image_boundary=roi_touches_image_boundary,
         ):
             return _RejectedCandidate(corners, GeometryFailure.TRUNCATED_QUADRILATERAL)
 
@@ -493,13 +563,24 @@ class RoiBoardGeometry:
         corners: np.ndarray,
         roi_width: int,
         roi_height: int,
+        *,
+        roi_touches_image_boundary: tuple[bool, bool, bool, bool],
     ) -> bool:
         margin = self.border_margin_px
+        touches_left, touches_top, touches_right, touches_bottom = (
+            roi_touches_image_boundary
+        )
         return bool(
-            np.any(corners[:, 0] <= margin)
-            or np.any(corners[:, 1] <= margin)
-            or np.any(corners[:, 0] >= (roi_width - 1 - margin))
-            or np.any(corners[:, 1] >= (roi_height - 1 - margin))
+            (touches_left and np.any(corners[:, 0] <= margin))
+            or (touches_top and np.any(corners[:, 1] <= margin))
+            or (
+                touches_right
+                and np.any(corners[:, 0] >= (roi_width - 1 - margin))
+            )
+            or (
+                touches_bottom
+                and np.any(corners[:, 1] >= (roi_height - 1 - margin))
+            )
         )
 
     @staticmethod
@@ -580,19 +661,45 @@ class RoiBoardGeometry:
         dark_threshold = 0.5 * float(low + high)
         border_dark = float(np.mean(border_values <= dark_threshold))
         center_dark = float(np.mean(center_values <= dark_threshold))
-        return _clamp01((border_dark - center_dark) / 0.60)
+        border_contrast_score = _clamp01((border_dark - center_dark) / 0.60)
 
-    @staticmethod
-    def _subpixel_refine(gray: np.ndarray, corners: np.ndarray) -> np.ndarray:
+        # A thin hollow outline can satisfy border-vs-center contrast without
+        # containing a target. Require either a dark frame that persists into a
+        # deeper perimeter band (the synthetic board case), or measurable
+        # tonal structure in the central target region (the real board case).
+        frame_depth_band = (
+            (normalized_x >= 0.04)
+            & (normalized_x <= 0.96)
+            & (normalized_y >= 0.04)
+            & (normalized_y <= 0.96)
+            & ~(
+                (normalized_x >= 0.08)
+                & (normalized_x <= 0.92)
+                & (normalized_y >= 0.08)
+                & (normalized_y <= 0.92)
+            )
+        )
+        frame_depth_score = _clamp01(
+            float(np.mean(warped[frame_depth_band] <= dark_threshold)) / 0.50
+        )
+        center_low, center_high = np.percentile(center_values, (10.0, 90.0))
+        center_structure_score = _clamp01(
+            float(center_high - center_low) / 16.0
+        )
+        structural_evidence = max(frame_depth_score, center_structure_score)
+        return min(border_contrast_score, structural_evidence)
+
+    def _subpixel_refine(self, gray: np.ndarray, corners: np.ndarray) -> np.ndarray:
         height, width = gray.shape[:2]
         safe = corners.copy().astype(np.float32)
-        safe[:, 0] = np.clip(safe[:, 0], 5.0, max(5.0, width - 6.0))
-        safe[:, 1] = np.clip(safe[:, 1], 5.0, max(5.0, height - 6.0))
+        radius = float(self.subpixel_window_radius_px)
+        safe[:, 0] = np.clip(safe[:, 0], radius, max(radius, width - 1.0 - radius))
+        safe[:, 1] = np.clip(safe[:, 1], radius, max(radius, height - 1.0 - radius))
         try:
             refined = cv2.cornerSubPix(
                 gray,
                 safe.reshape(-1, 1, 2),
-                (5, 5),
+                (self.subpixel_window_radius_px,) * 2,
                 (-1, -1),
                 (
                     cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER,
@@ -638,47 +745,40 @@ class RoiBoardGeometry:
         raise ValueError("image must be grayscale, BGR, or BGRA")
 
     @staticmethod
-    def _best_rejected(
-        rejected: Sequence[_RejectedCandidate],
-    ) -> _RejectedCandidate | None:
-        if not rejected:
-            return None
-        return max(
-            rejected,
-            key=lambda item: (
-                item.geometry_score,
-                item.edge_support_score,
-                item.structure_score,
-            ),
-        )
-
-    @staticmethod
-    def _best_failure_reason(
+    def _representative_rejected(
         rejected: Sequence[_RejectedCandidate],
         *,
         saw_contour: bool,
         saw_four_points: bool,
-    ) -> GeometryFailure:
+    ) -> _RejectedCandidate | None:
         if not rejected:
-            return GeometryFailure.NO_VALID_QUADRILATERAL
-        # Report the most advanced hard gate reached.  This gives operators a
-        # useful cause instead of whichever contour happened to be visited last.
+            return None
+        # Choose one representative candidate so the failure reason and all
+        # reported scores describe the same rejected quadrilateral.
         priority = (
+            GeometryFailure.TRUNCATED_QUADRILATERAL,
             GeometryFailure.LOW_INTERNAL_STRUCTURE,
             GeometryFailure.LOW_EDGE_SUPPORT,
             GeometryFailure.INVALID_ASPECT_RATIO,
             GeometryFailure.UNDERSIZED_QUADRILATERAL,
-            GeometryFailure.TRUNCATED_QUADRILATERAL,
             GeometryFailure.CORNER_ORDER_FAILED,
             GeometryFailure.NO_VALID_QUADRILATERAL,
         )
         reasons = {item.reason for item in rejected}
         for reason in priority:
-            if reason in reasons:
-                return reason
+            if reason not in reasons:
+                continue
+            return max(
+                (item for item in rejected if item.reason is reason),
+                key=lambda item: (
+                    item.geometry_score,
+                    item.edge_support_score,
+                    item.structure_score,
+                ),
+            )
         if not saw_contour or not saw_four_points:
-            return GeometryFailure.NO_VALID_QUADRILATERAL
-        return GeometryFailure.NO_VALID_QUADRILATERAL
+            return None
+        return None
 
     @staticmethod
     def _build_debug(
