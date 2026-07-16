@@ -4,13 +4,15 @@ import argparse
 import math
 from pathlib import Path
 import sys
-from typing import Sequence
+from typing import Callable, Sequence
 
 import uvicorn
 
-from ev_vision.camera.hikrobot import HikrobotCamera, create_native_api
-from ev_vision.config import CameraConfig, load_config
-from ev_vision.detection.board_geometry import BoardGeometryDetector
+from ev_vision.camera.hikrobot import HikrobotCamera, MvsApi, create_native_api
+from ev_vision.config import BoardConfig, CameraConfig, DetectionConfig, load_config
+from ev_vision.detection.hybrid_board import DetectionBackendSelection, HybridBoardDetector
+from ev_vision.detection.yolo_board import InferencePort, UltralyticsBackend, YoloBoardDetector
+from ev_vision.tracking.board_tracker import BoardTracker
 from ev_vision.tuning.models import CameraIdentity, EditableCameraParameters, ParameterBounds
 from ev_vision.tuning.service import CameraTuningService
 from ev_vision.tuning.storage import TuningStorage
@@ -92,7 +94,67 @@ def _require_fixed_format(camera: CameraConfig) -> None:
         )
 
 
-def build_application(args: argparse.Namespace):
+def build_detection_backend(
+    config: DetectionConfig,
+    *,
+    backend_factory: Callable[..., InferencePort] = UltralyticsBackend,
+) -> DetectionBackendSelection:
+    errors: list[str] = []
+    for configured_path in (config.model.path, config.model.fallback_path):
+        path = Path(configured_path)
+        if not path.is_file():
+            errors.append(f"missing: {path}")
+            continue
+        try:
+            backend = backend_factory(
+                path,
+                input_size=(config.model.input_width, config.model.input_height),
+                device=config.model.device,
+            )
+        except Exception as exc:
+            errors.append(f"{path}: {exc}")
+            continue
+        artifact_kind = getattr(backend, "artifact_kind", path.suffix.lower().lstrip("."))
+        return DetectionBackendSelection(backend, path, str(artifact_kind), ())
+    return DetectionBackendSelection(None, None, "classical-diagnostic", tuple(errors))
+
+
+def build_detector(
+    config: DetectionConfig,
+    *,
+    board: BoardConfig | None = None,
+    backend_factory: Callable[..., InferencePort] = UltralyticsBackend,
+) -> HybridBoardDetector:
+    def model_loader(candidate: DetectionConfig) -> DetectionBackendSelection:
+        return build_detection_backend(candidate, backend_factory=backend_factory)
+
+    selection = model_loader(config)
+    model = None
+    if selection.backend is not None:
+        model = YoloBoardDetector(
+            selection.backend,
+            confidence_threshold=config.model.confidence_threshold,
+            max_candidates=config.model.max_candidates,
+        )
+    return HybridBoardDetector(
+        model=model,
+        config=config,
+        tracker=BoardTracker(config.tracking),
+        board=board,
+        model_state="READY" if model is not None else "UNAVAILABLE",
+        model_backend=selection.artifact_kind,
+        model_path=str(selection.path) if selection.path is not None else None,
+        model_errors=selection.errors,
+        model_loader=model_loader,
+    )
+
+
+def build_application(
+    args: argparse.Namespace,
+    *,
+    native_api_factory: Callable[[], MvsApi] = create_native_api,
+    backend_factory: Callable[..., InferencePort] = UltralyticsBackend,
+):
     config = load_config(args.config)
     _require_fixed_format(config.camera)
 
@@ -100,7 +162,12 @@ def build_application(args: argparse.Namespace):
     bounds = ParameterBounds()
     bounds.validate(defaults)
 
-    native_api = create_native_api()
+    native_api = native_api_factory()
+    detector = build_detector(
+        config.detection,
+        board=config.board,
+        backend_factory=backend_factory,
+    )
 
     def camera_factory(camera_config: CameraConfig) -> HikrobotCamera:
         return HikrobotCamera(native_api, camera_config, serial_number=args.serial)
@@ -108,7 +175,8 @@ def build_application(args: argparse.Namespace):
     service = CameraTuningService(
         camera_factory=camera_factory,
         base_config=config.camera,
-        detector=BoardGeometryDetector(),
+        detector=detector,
+        detection_config=config.detection,
         bounds=bounds,
         camera_identity=CameraIdentity(model=_CAMERA_MODEL, serial=args.serial),
         read_timeout_ms=args.timeout_ms,
@@ -117,12 +185,16 @@ def build_application(args: argparse.Namespace):
         shutdown_timeout_s=args.shutdown_timeout,
     )
     storage = TuningStorage(args.output, bounds=bounds)
-    return create_camera_tuning_app(
+    app = create_camera_tuning_app(
         service,
         storage,
         defaults,
         preview_fps=args.preview_fps,
     )
+    state = getattr(app, "state", None)
+    if state is not None:
+        state.service = service
+    return app
 
 
 def main(argv: Sequence[str] | None = None) -> int:

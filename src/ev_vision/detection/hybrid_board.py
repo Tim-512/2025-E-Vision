@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 import math
+from pathlib import Path
+import threading
 import time
 from typing import Protocol
 
@@ -20,7 +22,7 @@ from ev_vision.detection.roi_board_geometry import (
     GeometryResult,
     RoiBoardGeometry,
 )
-from ev_vision.detection.yolo_board import BoardSearchResult
+from ev_vision.detection.yolo_board import BoardSearchResult, InferencePort, YoloBoardDetector
 from ev_vision.tracking.board_tracker import (
     TrackObservation,
     TrackedBoardResult,
@@ -69,6 +71,14 @@ class TrackerPort(Protocol):
 
 
 @dataclass(frozen=True)
+class DetectionBackendSelection:
+    backend: InferencePort | None
+    path: Path | None
+    artifact_kind: str
+    errors: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class _ModelMetadata:
     state: str
     backend: str
@@ -102,6 +112,8 @@ class HybridBoardDetector:
         model_state: str | None = None,
         model_backend: str | None = None,
         model_path: str | None = None,
+        model_errors: Sequence[str] = (),
+        model_loader: Callable[[DetectionConfig], DetectionBackendSelection] | None = None,
     ) -> None:
         self.model = model
         self.config = config or DetectionConfig()
@@ -112,6 +124,91 @@ class HybridBoardDetector:
         self._model_state = model_state
         self._model_backend = model_backend
         self._model_path = model_path
+        self._model_errors = tuple(model_errors)
+        self._model_loader = model_loader
+        self._model_lock = threading.RLock()
+
+    @property
+    def model_state(self) -> str:
+        return self._model_metadata().state
+
+    @property
+    def model_backend(self) -> str:
+        return self._model_metadata().backend
+
+    @property
+    def model_path(self) -> str | None:
+        return self._model_metadata().path
+
+    @property
+    def model_errors(self) -> tuple[str, ...]:
+        with self._model_lock:
+            return self._model_errors
+
+    def reset(self) -> None:
+        if self.tracker is not None:
+            self.tracker.reset()
+
+    def apply_config(self, config: DetectionConfig) -> None:
+        geometry = self._geometry_from_config(config)
+        with self._model_lock:
+            self.config = config
+            self.geometry = geometry
+        self.reset()
+
+    def reload_model(self) -> None:
+        if self._model_loader is None:
+            raise RuntimeError("no model loader is configured")
+        selection = self._model_loader(self.config)
+        if selection.backend is None:
+            errors = selection.errors or ("no portable model artifact could be loaded",)
+            self._publish_unavailable(errors)
+            raise RuntimeError("; ".join(errors))
+        try:
+            self._smoke_test_backend(selection.backend)
+            model = self._model_from_backend(selection.backend)
+        except Exception as exc:
+            path = str(selection.path) if selection.path is not None else "model"
+            errors = (f"{path}: {exc}",)
+            self._publish_unavailable(errors)
+            raise RuntimeError(errors[0]) from exc
+        with self._model_lock:
+            self.model = model
+            self._model_state = "READY"
+            self._model_backend = selection.artifact_kind
+            self._model_path = str(selection.path) if selection.path is not None else None
+            self._model_errors = ()
+            self._reset_tracker_locked()
+
+    def _publish_unavailable(self, errors: Sequence[str]) -> None:
+        with self._model_lock:
+            self.model = None
+            self._model_state = "UNAVAILABLE"
+            self._model_backend = "classical-diagnostic"
+            self._model_path = None
+            self._model_errors = tuple(errors)
+            self._reset_tracker_locked()
+
+    def _reset_tracker_locked(self) -> None:
+        if self.tracker is not None:
+            try:
+                self.tracker.reset()
+            except Exception:
+                pass
+
+    def _model_from_backend(self, backend: InferencePort) -> YoloBoardDetector:
+        settings = self.config.model
+        return YoloBoardDetector(
+            backend,
+            confidence_threshold=settings.confidence_threshold,
+            max_candidates=settings.max_candidates,
+        )
+
+    @staticmethod
+    def _smoke_test_backend(backend: InferencePort) -> None:
+        width, height = backend.input_size
+        tensor = np.zeros((1, 3, height, width), dtype=np.float32)
+        tuple(backend.infer(tensor))
 
     @staticmethod
     def _geometry_from_config(config: DetectionConfig) -> RoiBoardGeometry:
@@ -139,8 +236,10 @@ class HybridBoardDetector:
         update_tracker: bool = True,
     ) -> HybridBoardResult:
         started_ns = self.clock_ns()
-        metadata = self._model_metadata()
-        if self._model_unavailable():
+        with self._model_lock:
+            model = self.model
+            metadata = self._model_metadata_locked(model)
+        if self._model_unavailable(model):
             result = self._empty_result(
                 captured_ns=captured_ns,
                 source_sequence=source_sequence,
@@ -149,14 +248,10 @@ class HybridBoardDetector:
                 model_path=metadata.path,
                 failure_reason=DetectionFailure.MODEL_UNAVAILABLE,
             )
-            return self._finish(
-                result,
-                started_ns=started_ns,
-                update_tracker=update_tracker,
-            )
+            return replace(result, total_ms=_elapsed_ms(started_ns, self.clock_ns()))
 
         try:
-            candidates = tuple(self.model.detect_candidates(image))  # type: ignore[union-attr]
+            candidates = tuple(model.detect_candidates(image))  # type: ignore[union-attr]
         except Exception:
             inference_ended_ns = self.clock_ns()
             result = self._empty_result(
@@ -413,23 +508,26 @@ class HybridBoardDetector:
         except Exception:
             return 0.0
 
-    def _model_unavailable(self) -> bool:
+    def _model_unavailable(self, model: ModelCandidatePort | None = None) -> bool:
+        candidate = self.model if model is None else model
         if self._model_state is not None and self._model_state.upper() == "UNAVAILABLE":
             return True
-        if self.model is None:
+        if candidate is None:
             return True
-        backend = getattr(self.model, "backend", _MISSING_BACKEND)
+        backend = getattr(candidate, "backend", _MISSING_BACKEND)
         return backend is None
 
     def _model_metadata(self) -> _ModelMetadata:
-        backend = (
-            getattr(self.model, "backend", None) if self.model is not None else None
-        )
+        with self._model_lock:
+            return self._model_metadata_locked(self.model)
+
+    def _model_metadata_locked(self, model: ModelCandidatePort | None) -> _ModelMetadata:
+        backend = getattr(model, "backend", None) if model is not None else None
         backend_name = self._model_backend or _backend_name(backend)
         path = self._model_path or _backend_path(backend)
         if self._model_state is not None:
             state = self._model_state
-        elif self._model_unavailable():
+        elif self._model_unavailable(model):
             state = "UNAVAILABLE"
         else:
             state = "READY"

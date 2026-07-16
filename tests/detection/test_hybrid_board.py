@@ -12,7 +12,10 @@ from ev_vision.config import (
     DetectionConfig,
 )
 from ev_vision.detection.failures import DetectionFailure
-from ev_vision.detection.hybrid_board import HybridBoardDetector
+from ev_vision.detection.hybrid_board import (
+    DetectionBackendSelection,
+    HybridBoardDetector,
+)
 from ev_vision.detection.roi_board_geometry import GeometryFailure, GeometryResult
 from ev_vision.detection.yolo_board import (
     BoardSearchResult,
@@ -806,3 +809,111 @@ def test_yolo_board_detector_backend_contract_remains_available() -> None:
     assert result.model_state == "READY"
     assert result.model_backend == "HybridInferenceBackend"
     assert result.detected is True
+
+class ReloadInferenceBackend:
+    input_size = (32, 32)
+
+    def __init__(self, path: str, artifact_kind: str, *, fail_smoke: bool = False) -> None:
+        self.artifact_path = path
+        self.artifact_kind = artifact_kind
+        self.fail_smoke = fail_smoke
+        self.infer_calls = 0
+
+    def infer(self, tensor: np.ndarray) -> tuple[RawDetection, ...]:
+        self.infer_calls += 1
+        if self.fail_smoke:
+            raise RuntimeError("smoke inference failed")
+        return ()
+
+
+def test_reload_model_smoke_tests_then_atomically_swaps_backend() -> None:
+    from pathlib import Path
+
+    old_backend = ReloadInferenceBackend("old.engine", "engine")
+    new_backend = ReloadInferenceBackend("new.onnx", "onnx")
+    tracker = FakeTracker(state=TrackingState.TRACKING, target_valid=True)
+    loader_calls: list[DetectionConfig] = []
+
+    def loader(config: DetectionConfig) -> DetectionBackendSelection:
+        loader_calls.append(config)
+        return DetectionBackendSelection(new_backend, Path("new.onnx"), "onnx", ())
+
+    detector = HybridBoardDetector(
+        model=YoloBoardDetector(old_backend),
+        geometry=FakeGeometry({}),
+        tracker=tracker,
+        model_loader=loader,
+        model_state="READY",
+        model_backend="engine",
+        model_path="old.engine",
+    )
+
+    detector.reload_model()
+
+    assert loader_calls == [detector.config]
+    assert new_backend.infer_calls == 1
+    assert detector.model.backend is new_backend
+    assert detector.model_state == "READY"
+    assert detector.model_backend == "onnx"
+    assert detector.model_path == "new.onnx"
+    assert detector.model_errors == ()
+    assert tracker.reset_calls == 1
+    assert tracker.latest.target_valid is False
+
+
+def test_reload_failure_invalidates_old_target_and_enters_diagnostic_mode() -> None:
+    old_backend = ReloadInferenceBackend("old.engine", "engine")
+    tracker = FakeTracker(state=TrackingState.TRACKING, target_valid=True)
+    errors = ("missing: replacement.engine", "replacement.onnx: load failed")
+    detector = HybridBoardDetector(
+        model=YoloBoardDetector(old_backend),
+        geometry=FakeGeometry({}),
+        tracker=tracker,
+        model_loader=lambda config: DetectionBackendSelection(
+            None, None, "classical-diagnostic", errors
+        ),
+        model_state="READY",
+        model_backend="engine",
+        model_path="old.engine",
+    )
+
+    with pytest.raises(RuntimeError, match="replacement.engine.*replacement.onnx"):
+        detector.reload_model()
+
+    result = detector.detect(frame_image(), captured_ns=2_000, source_sequence=26)
+
+    assert detector.model is None
+    assert detector.model_state == "UNAVAILABLE"
+    assert detector.model_backend == "classical-diagnostic"
+    assert detector.model_path is None
+    assert detector.model_errors == errors
+    assert tracker.reset_calls == 1
+    assert result.target_valid is False
+    assert result.failure_reason is DetectionFailure.MODEL_UNAVAILABLE
+
+
+def test_reload_smoke_failure_never_publishes_partially_loaded_backend() -> None:
+    from pathlib import Path
+
+    old_backend = ReloadInferenceBackend("old.engine", "engine")
+    bad_backend = ReloadInferenceBackend("bad.onnx", "onnx", fail_smoke=True)
+    detector = HybridBoardDetector(
+        model=YoloBoardDetector(old_backend),
+        geometry=FakeGeometry({}),
+        tracker=FakeTracker(state=TrackingState.TRACKING, target_valid=True),
+        model_loader=lambda config: DetectionBackendSelection(
+            bad_backend, Path("bad.onnx"), "onnx", ()
+        ),
+        model_state="READY",
+        model_backend="engine",
+        model_path="old.engine",
+    )
+
+    with pytest.raises(RuntimeError, match="smoke inference failed"):
+        detector.reload_model()
+
+    assert bad_backend.infer_calls == 1
+    assert detector.model is None
+    assert detector.model_state == "UNAVAILABLE"
+    assert detector.model_backend == "classical-diagnostic"
+    assert "smoke inference failed" in detector.model_errors[0]
