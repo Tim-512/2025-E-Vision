@@ -145,20 +145,20 @@ def _find_images(dataset: Path) -> tuple[tuple[str, Path], ...]:
     return tuple(sorted(found, key=lambda item: (item[0], item[1].as_posix())))
 
 
-def _matching_labels(dataset: Path, split: str, image: Path) -> tuple[Path, ...]:
-    image_root = dataset / "images" / split
-    label_root = dataset / "labels" / split
-    relative = image.relative_to(image_root)
-    expected_parent = label_root / relative.parent
-    if not expected_parent.is_dir():
-        return ()
-    return tuple(
-        path
-        for path in expected_parent.iterdir()
-        if path.is_file()
-        and path.suffix.lower() == ".txt"
-        and path.stem == image.stem
-    )
+def _find_labels(dataset: Path) -> tuple[tuple[str, Path], ...]:
+    found: list[tuple[str, Path]] = []
+    for split in _SPLITS:
+        directory = dataset / "labels" / split
+        if not directory.is_dir():
+            continue
+        for path in directory.rglob("*"):
+            if path.is_file() and path.suffix.lower() == ".txt":
+                found.append((split, path))
+    return tuple(sorted(found, key=lambda item: (item[0], item[1].as_posix())))
+
+
+def _relative_stem(path: Path, root: Path) -> str:
+    return path.relative_to(root).with_suffix("").as_posix()
 
 
 def validate_dataset(dataset: Path) -> DatasetReport:
@@ -170,21 +170,61 @@ def validate_dataset(dataset: Path) -> DatasetReport:
     negative_by_split = _empty_counts()
     records: dict[tuple[str, str], _ImageRecord] = {}
     hashes: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    images = _find_images(dataset)
+    labels = _find_labels(dataset)
+    images_by_stem: dict[tuple[str, str], list[Path]] = defaultdict(list)
+    labels_by_stem: dict[tuple[str, str], list[Path]] = defaultdict(list)
 
-    for split, image_path in _find_images(dataset):
-        image_relative = image_path.relative_to(dataset / "images" / split).as_posix()
+    for split, image_path in images:
+        image_root = dataset / "images" / split
+        images_by_stem[(split, _relative_stem(image_path, image_root))].append(
+            image_path
+        )
+    for split, label_path in labels:
+        label_root = dataset / "labels" / split
+        labels_by_stem[(split, _relative_stem(label_path, label_root))].append(
+            label_path
+        )
+
+    for (split, stem), paths in sorted(images_by_stem.items()):
+        if len(paths) > 1:
+            image_root = dataset / "images" / split
+            names = ", ".join(
+                sorted(path.relative_to(image_root).as_posix() for path in paths)
+            )
+            errors.append(
+                f"{split}: image stem {stem} is used by multiple files: {names}"
+            )
+    for (split, stem), paths in sorted(labels_by_stem.items()):
+        if len(paths) > 1:
+            label_root = dataset / "labels" / split
+            names = ", ".join(
+                sorted(path.relative_to(label_root).as_posix() for path in paths)
+            )
+            errors.append(
+                f"{split}: label stem {stem} is used by multiple files: {names}"
+            )
+        if (split, stem) not in images_by_stem:
+            for label_path in paths:
+                display_path = label_path.relative_to(dataset).as_posix()
+                errors.append(f"{display_path}: label has no matching image")
+
+    for split, image_path in images:
+        image_root = dataset / "images" / split
+        image_relative = image_path.relative_to(image_root).as_posix()
         display_path = image_path.relative_to(dataset).as_posix()
         images_by_split[split] += 1
         if not _readable_image(image_path):
             errors.append(f"{display_path}: image is not readable")
 
-        labels = _matching_labels(dataset, split, image_path)
-        if len(labels) != 1:
+        stem = _relative_stem(image_path, image_root)
+        matching_labels = labels_by_stem.get((split, stem), [])
+        if len(matching_labels) != 1:
             errors.append(f"{display_path}: expected exactly one label file")
             label_path = None
             positive = False
         else:
-            label_path = labels[0]
+            label_path = matching_labels[0]
             positive = _validate_label(label_path, errors)
 
         if positive:

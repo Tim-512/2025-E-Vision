@@ -42,7 +42,7 @@ datasets/target_board/
     └── test/
 ```
 
-Image and label relative paths must match within their split, for example `images/train/desk-left-000001.png` and `labels/train/desk-left-000001.txt`. Manifest `image` values use the image path relative to the split directory, normally just the deterministic filename.
+Image and label relative paths must match by stem within their split, for example `images/train/desk-left-000001.png` and `labels/train/desk-left-000001.txt`. Each image stem must be unique inside a split, so files such as `a.png` and `a.jpg` cannot share `a.txt`; every label must also have exactly one matching image. Manifest `image` values use the image path relative to the split directory, normally just the deterministic filename.
 
 ## Scene-based split
 
@@ -55,9 +55,9 @@ python tools/prepare_target_dataset.py CAPTURE_ROOT `
   --output datasets/target_board/staging `
   --scene desk-left `
   --split train `
-  --difficulty clear
+  --difficulty clear > staged-manifest.csv
 
 python tools/validate_target_dataset.py datasets/target_board
 ```
 
-Copy the staged originals into the chosen `images/<split>` directory, create matching labels, append the emitted rows to `split-manifest.csv`, and validate before training. The validator rejects unreadable images, missing or malformed labels, invalid normalized boxes, manifest/difficulty mismatches, scene leakage, and duplicate image content across splits.
+The prepare command writes only CSV rows to standard output, so they can be redirected safely; the prepared-image count is written to standard error. Copy the staged originals into the chosen `images/<split>` directory, create matching labels, append the emitted rows to `split-manifest.csv`, and validate before training. The validator rejects unreadable images, missing, orphaned, or malformed labels, duplicate image stems within a split, invalid normalized boxes, manifest/difficulty mismatches, scene leakage, and duplicate image content across splits.

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import csv
+import io
 from pathlib import Path
 
 import cv2
 import numpy as np
 
+from tools.prepare_target_dataset import main as prepare_main
 from tools.prepare_target_dataset import prepare_dataset
 from tools.validate_target_dataset import main as validate_main
 from tools.validate_target_dataset import validate_dataset
@@ -17,7 +19,9 @@ MANIFEST_HEADER = ("image", "scene", "split", "difficulty")
 def write_png(path: Path, value: int = 64) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     image = np.full((8, 10, 3), value, dtype=np.uint8)
-    assert cv2.imwrite(str(path), image)
+    encoded, data = cv2.imencode(path.suffix, image)
+    assert encoded
+    path.write_bytes(data.tobytes())
 
 
 def write_label(path: Path, contents: str) -> None:
@@ -55,6 +59,36 @@ def build_minimal_dataset(tmp_path: Path) -> Path:
         ],
     )
     return dataset
+
+
+def test_prepare_cli_writes_redirectable_csv_to_stdout_and_stats_to_stderr(
+    tmp_path: Path, capsys
+) -> None:
+    capture = tmp_path / "captures" / "20260716T100000Z"
+    capture.mkdir(parents=True)
+    (capture / "original.png").write_bytes(b"image")
+
+    exit_code = prepare_main(
+        [
+            str(capture.parent),
+            "--output",
+            str(tmp_path / "staging"),
+            "--scene",
+            "desk,left",
+            "--split",
+            "train",
+            "--difficulty",
+            "clear",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert list(csv.reader(io.StringIO(captured.out))) == [
+        ["image", "scene", "split", "difficulty"],
+        ["desk,left-000001.png", "desk,left", "train", "clear"],
+    ]
+    assert captured.err == "prepared images: 1\n"
 
 
 def test_prepare_uses_only_original_png_and_deterministic_names(tmp_path: Path) -> None:
@@ -123,6 +157,28 @@ def test_validator_rejects_bad_images_and_missing_labels(tmp_path: Path) -> None
 
     assert "images/train/a.png: image is not readable" in report.errors
     assert "images/val/b.png: expected exactly one label file" in report.errors
+
+
+def test_validator_rejects_orphan_label(tmp_path: Path) -> None:
+    dataset = build_minimal_dataset(tmp_path)
+    write_label(dataset / "labels/train/orphan.txt", "")
+
+    report = validate_dataset(dataset)
+
+    assert "labels/train/orphan.txt: label has no matching image" in report.errors
+
+
+def test_validator_rejects_duplicate_image_stem_within_split(tmp_path: Path) -> None:
+    dataset = build_minimal_dataset(tmp_path)
+    write_png(dataset / "images/train/a.jpg", 48)
+    append_manifest(dataset, "a.jpg,scene-train,train,clear\n")
+
+    report = validate_dataset(dataset)
+
+    assert (
+        "train: image stem a is used by multiple files: a.jpg, a.png"
+        in report.errors
+    )
 
 
 def test_validator_rejects_malformed_class_nonfinite_and_nonpositive_boxes(

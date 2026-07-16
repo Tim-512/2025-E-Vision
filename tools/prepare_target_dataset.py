@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import shutil
+import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -93,12 +95,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         split=args.split,
         difficulty=args.difficulty,
     )
-    print("image,scene,split,difficulty")
+    writer = csv.writer(sys.stdout, lineterminator="\n")
+    writer.writerow(("image", "scene", "split", "difficulty"))
     for item in prepared:
-        print(
-            f"{item.destination.name},{item.scene},{item.split},{item.difficulty}"
+        writer.writerow(
+            (item.destination.name, item.scene, item.split, item.difficulty)
         )
-    print(f"prepared images: {len(prepared)}")
+    print(f"prepared images: {len(prepared)}", file=sys.stderr)
     return 0
 
 
