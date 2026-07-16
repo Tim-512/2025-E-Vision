@@ -9,10 +9,19 @@ from typing import Any, AsyncIterator
 import cv2
 import numpy as np
 from fastapi import Body, FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, StrictBool, StrictFloat, StrictInt, field_validator
 
+from ev_vision.config import (
+    BoardTrackingConfig,
+    CandidateScoringConfig,
+    ConfigError,
+    DetectionConfig,
+    ModelDetectionConfig,
+    RoiGeometryConfig,
+    _validate_detection,
+)
 from ev_vision.tuning.diagnostics import render_overlay
 from ev_vision.tuning.models import (
     CameraIdentity,
@@ -20,7 +29,7 @@ from ev_vision.tuning.models import (
     OverlayOptions,
     ParameterBounds,
 )
-from ev_vision.tuning.service import ParameterApplyError
+from ev_vision.tuning.service import ParameterApplyError, StaleDetectionFrameError
 
 
 _NUMERIC = StrictFloat | StrictInt
@@ -30,6 +39,13 @@ _FIXED_FORMAT = {
     "height": 1024,
     "pixel_format": "BayerRG8",
     "buffer_size": 2,
+}
+DEBUG_IMAGE_NAMES = {
+    "model-candidates",
+    "roi",
+    "roi-edges",
+    "roi-geometry",
+    "final-overlay",
 }
 _PLACEHOLDER_PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Camera Tuning</title>
@@ -97,6 +113,115 @@ class OverlayRequest(BaseModel):
         )
 
 
+class _FiniteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("*", mode="after")
+    @classmethod
+    def reject_non_finite(cls, value: Any) -> Any:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if not np.isfinite(float(value)):
+                raise ValueError("numeric detection parameters must be finite")
+        return value
+
+
+class DetectionModelRequest(_FiniteRequest):
+    confidence_threshold: _NUMERIC
+    max_candidates: StrictInt
+
+    def domain(self, current: ModelDetectionConfig) -> ModelDetectionConfig:
+        return ModelDetectionConfig(
+            path=current.path,
+            fallback_path=current.fallback_path,
+            input_width=current.input_width,
+            input_height=current.input_height,
+            confidence_threshold=float(self.confidence_threshold),
+            max_candidates=self.max_candidates,
+            device=current.device,
+        )
+
+
+class DetectionRoiGeometryRequest(_FiniteRequest):
+    padding_fraction: _NUMERIC
+    canny_low: StrictInt
+    canny_high: StrictInt
+    min_edge_support: _NUMERIC
+    min_geometry_score: _NUMERIC
+    expected_aspect_ratio: _NUMERIC
+    aspect_ratio_tolerance: _NUMERIC
+    minimum_side_px: _NUMERIC
+    minimum_area_fraction: _NUMERIC
+    maximum_area_fraction: _NUMERIC
+
+    def domain(self) -> RoiGeometryConfig:
+        return RoiGeometryConfig(
+            padding_fraction=float(self.padding_fraction),
+            canny_low=self.canny_low,
+            canny_high=self.canny_high,
+            min_edge_support=float(self.min_edge_support),
+            min_geometry_score=float(self.min_geometry_score),
+            expected_aspect_ratio=float(self.expected_aspect_ratio),
+            aspect_ratio_tolerance=float(self.aspect_ratio_tolerance),
+            minimum_side_px=float(self.minimum_side_px),
+            minimum_area_fraction=float(self.minimum_area_fraction),
+            maximum_area_fraction=float(self.maximum_area_fraction),
+        )
+
+
+class DetectionCandidateScoringRequest(_FiniteRequest):
+    model_weight: _NUMERIC
+    geometry_weight: _NUMERIC
+    structure_weight: _NUMERIC
+    temporal_weight: _NUMERIC
+    ambiguity_margin: _NUMERIC
+
+    def domain(self) -> CandidateScoringConfig:
+        return CandidateScoringConfig(
+            model_weight=float(self.model_weight),
+            geometry_weight=float(self.geometry_weight),
+            structure_weight=float(self.structure_weight),
+            temporal_weight=float(self.temporal_weight),
+            ambiguity_margin=float(self.ambiguity_margin),
+        )
+
+
+class DetectionTrackingRequest(_FiniteRequest):
+    confirm_frames: StrictInt
+    predict_frames: StrictInt
+    lost_frames: StrictInt
+    max_center_jump_px: _NUMERIC
+    max_result_age_ms: _NUMERIC
+
+    def domain(self) -> BoardTrackingConfig:
+        return BoardTrackingConfig(
+            confirm_frames=self.confirm_frames,
+            predict_frames=self.predict_frames,
+            lost_frames=self.lost_frames,
+            max_center_jump_px=float(self.max_center_jump_px),
+            max_result_age_ms=float(self.max_result_age_ms),
+        )
+
+
+class DetectionConfigRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model: DetectionModelRequest
+    roi_geometry: DetectionRoiGeometryRequest
+    candidate_scoring: DetectionCandidateScoringRequest
+    tracking: DetectionTrackingRequest
+
+    def domain(self, current: DetectionConfig) -> DetectionConfig:
+        candidate = DetectionConfig(
+            backend=current.backend,
+            model=self.model.domain(current.model),
+            roi_geometry=self.roi_geometry.domain(),
+            candidate_scoring=self.candidate_scoring.domain(),
+            tracking=self.tracking.domain(),
+        )
+        _validate_detection(candidate)
+        return candidate
+
+
 def _package_static_dir() -> Path:
     return Path(__file__).with_name("static")
 
@@ -121,6 +246,54 @@ def _json_value(value: Any) -> Any:
 
 def _parameters_response(value: EditableCameraParameters) -> dict[str, Any]:
     return _json_value(value)
+
+
+_DETECTION_STATUS_FIELDS = (
+    "enabled",
+    "detected",
+    "source_sequence",
+    "target_valid",
+    "tracking_state",
+    "model_state",
+    "model_backend",
+    "model_path",
+    "candidate_count",
+    "model_confidence",
+    "geometry_score",
+    "edge_support_score",
+    "structure_score",
+    "temporal_score",
+    "combined_score",
+    "confirmation_count",
+    "miss_count",
+    "failure_reason",
+    "inference_ms",
+    "geometry_ms",
+    "total_ms",
+    "result_age_ms",
+    "homography_valid",
+    "target_x_mm",
+    "target_y_mm",
+    "corners_px",
+    "center_px",
+    "candidates",
+)
+
+
+def _detection_status_response(value: Any) -> dict[str, Any]:
+    return {name: _json_value(getattr(value, name)) for name in _DETECTION_STATUS_FIELDS}
+
+
+def _detection_config_response(value: DetectionConfig) -> dict[str, Any]:
+    return {
+        "model": {
+            "confidence_threshold": value.model.confidence_threshold,
+            "max_candidates": value.model.max_candidates,
+        },
+        "roi_geometry": _json_value(value.roi_geometry),
+        "candidate_scoring": _json_value(value.candidate_scoring),
+        "tracking": _json_value(value.tracking),
+    }
 
 
 def _profile_response(profile: Any) -> dict[str, Any]:
@@ -226,8 +399,70 @@ def create_camera_tuning_app(
             "runtime": _json_value(service.runtime_snapshot()),
             "applied": _parameters_response(service.applied_parameters()),
             "overlay": _json_value(_DEFAULT_OVERLAY),
-            "detection": _json_value(service.latest_detection()),
+            "detection": _detection_status_response(service.latest_detection()),
         }
+
+    @app.get("/api/detection/config")
+    def get_detection_config() -> dict[str, Any]:
+        return _detection_config_response(service.detection_config())
+
+    @app.put("/api/detection/config")
+    def put_detection_config(request: DetectionConfigRequest) -> dict[str, Any]:
+        try:
+            candidate = request.domain(service.detection_config())
+            applied = service.apply_detection_config(candidate)
+        except (ConfigError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=f"detection config apply failed: {exc}") from exc
+        return _detection_config_response(applied)
+
+    @app.get("/api/detection/status")
+    def get_detection_status() -> dict[str, Any]:
+        return _detection_status_response(service.latest_detection())
+
+    @app.get("/api/detection/debug")
+    def get_detection_debug(
+        image_name: str = Query(...),
+        sequence: int | None = Query(None, ge=0),
+    ) -> Response:
+        if image_name not in DEBUG_IMAGE_NAMES:
+            raise HTTPException(status_code=404, detail="detection debug image not found")
+        try:
+            if image_name == "final-overlay":
+                retained = service.detection_frame_for_latest(expected_sequence=sequence)
+                if retained is None:
+                    raise HTTPException(status_code=404, detail="detection frame unavailable")
+                frame, detection = retained
+                image = render_overlay(
+                    frame.image,
+                    source_sequence=frame.sequence,
+                    detection=detection,
+                    options=OverlayOptions(),
+                )
+            else:
+                debug = service.detection_debug_for_latest(expected_sequence=sequence)
+                if debug is None:
+                    raise HTTPException(status_code=404, detail="detection debug unavailable")
+                image = debug.images.get(image_name)
+                if image is None:
+                    raise HTTPException(status_code=404, detail="detection debug image unavailable")
+        except StaleDetectionFrameError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        jpeg = _encode_jpeg(image)
+        return Response(
+            content=jpeg,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/api/detection/reload")
+    def reload_detection_model() -> dict[str, Any]:
+        try:
+            service.reload_detection_model()
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail=f"model reload failed: {exc}") from exc
+        return _detection_status_response(service.latest_detection())
 
     @app.get("/api/parameters")
     def get_parameters() -> dict[str, Any]:
