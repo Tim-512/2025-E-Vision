@@ -509,6 +509,95 @@ def test_failed_model_reload_immediately_clears_published_target_and_retained_de
         service.stop()
 
 
+def test_model_reload_gate_blocks_old_model_worker_and_recovers_after_failure() -> None:
+    reload_entered = threading.Event()
+    release_reload = threading.Event()
+    stale_detect_started = threading.Event()
+    release_stale_detect = threading.Event()
+
+    class ReloadWindowDetector(RepeatingHybridDetector):
+        def detect(
+            self,
+            image: np.ndarray,
+            *,
+            captured_ns: int,
+            source_sequence: int,
+            include_debug: bool = False,
+            update_tracker: bool = True,
+        ) -> HybridBoardResult:
+            if reload_entered.is_set() and not release_reload.is_set() and update_tracker:
+                stale_detect_started.set()
+                assert release_stale_detect.wait(2.0)
+            return super().detect(
+                image,
+                captured_ns=captured_ns,
+                source_sequence=source_sequence,
+                include_debug=include_debug,
+                update_tracker=update_tracker,
+            )
+
+        def reload_model(self) -> None:
+            self.reload_calls += 1
+            reload_entered.set()
+            assert release_reload.wait(2.0)
+            raise RuntimeError("replacement model failed")
+
+    camera = FakeCamera([frame(1)])
+    detector = ReloadWindowDetector(hybrid_result(sequence=1))
+    service = make_service(
+        FakeFactory([camera]), detector=detector, detection_fps=1000.0
+    )
+    reload_errors: list[BaseException] = []
+    reload_thread: threading.Thread | None = None
+
+    def reload() -> None:
+        try:
+            service.reload_detection_model()
+        except BaseException as exc:
+            reload_errors.append(exc)
+
+    service.start()
+    try:
+        wait_until(lambda: service.latest_detection().target_valid)
+        reload_thread = threading.Thread(target=reload)
+        reload_thread.start()
+        assert reload_entered.wait(0.5)
+
+        # The old implementation schedules a new-generation worker task in the
+        # window before the detector begins its own reload/epoch transition.
+        if stale_detect_started.wait(0.5):
+            release_stale_detect.set()
+            wait_until(lambda: service.latest_detection().target_valid)
+
+        snapshot = service.latest_detection()
+        assert snapshot.detected is False
+        assert snapshot.target_valid is False
+        assert snapshot.source_sequence is None
+        assert snapshot.observation is None
+        assert service.detection_frame_for_latest() is None
+        assert service.detection_debug_for_latest() is None
+        assert camera.close_count == 0
+        assert service.runtime_snapshot().state == "Connected"
+
+        release_reload.set()
+        reload_thread.join(1.0)
+        assert not reload_thread.is_alive()
+        assert len(reload_errors) == 1
+        assert isinstance(reload_errors[0], RuntimeError)
+        assert str(reload_errors[0]) == "replacement model failed"
+        assert service._detection_reload_in_progress is False
+
+        wait_until(lambda: service.latest_detection().target_valid)
+        assert service.detection_frame_for_latest() is not None
+        assert camera.close_count == 0
+        assert service.runtime_snapshot().state == "Connected"
+    finally:
+        release_stale_detect.set()
+        release_reload.set()
+        if reload_thread is not None:
+            reload_thread.join(1.0)
+        service.stop()
+
 def test_disabling_detection_camera_replacement_disconnect_and_shutdown_reset_tracker() -> None:
     detector = RepeatingHybridDetector(hybrid_result())
     service = make_service(FakeFactory([FakeCamera([frame(1)]), FakeCamera([frame(2)])]), detector=detector)

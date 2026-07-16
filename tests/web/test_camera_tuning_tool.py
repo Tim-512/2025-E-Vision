@@ -395,20 +395,29 @@ def test_dashboard_hybrid_labels_are_utf8_and_not_question_mark_placeholders() -
     assert "????" not in script
 
 
-def test_invalid_hybrid_target_does_not_draw_green_confirmation_center() -> None:
+def test_invalid_hybrid_target_with_observation_does_not_draw_green_confirmation_geometry() -> None:
     import numpy as np
 
     import ev_vision.web.camera_tuning_app as camera_tuning_app
+    from ev_vision.models import BoardObservation
     from ev_vision.tuning.models import DetectionSnapshot, OverlayOptions
 
+    observation = BoardObservation(
+        captured_ns=123,
+        corners_px=((15.0, 55.0), (100.0, 55.0), (98.0, 82.0), (17.0, 82.0)),
+        center_px=(57.0, 68.0),
+        confidence=0.86,
+        homography_valid=True,
+    )
     snapshot = DetectionSnapshot(
         enabled=True,
         detected=True,
         source_sequence=9,
+        observation=observation,
         target_valid=False,
         tracking_state="PREDICTING",
-        center_px=(57.0, 68.0),
-        corners_px=((15.0, 55.0), (100.0, 55.0), (98.0, 82.0), (17.0, 82.0)),
+        center_px=observation.center_px,
+        corners_px=observation.corners_px,
         failure_reason="PREDICTING",
     )
     rendered = camera_tuning_app.render_overlay(
@@ -427,6 +436,7 @@ def test_invalid_hybrid_target_does_not_draw_green_confirmation_center() -> None
     )
 
     assert not np.any(np.all(rendered == np.array([0, 255, 0], dtype=np.uint8), axis=2))
+    assert not np.any(np.all(rendered == np.array([0, 200, 0], dtype=np.uint8), axis=2))
 
 
 def test_hybrid_overlay_draws_candidate_decisions_and_tracking_semantics(monkeypatch) -> None:

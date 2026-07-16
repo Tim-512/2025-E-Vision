@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from dataclasses import fields, is_dataclass
+from dataclasses import fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -38,7 +38,10 @@ _CONFIRMED_COLOR = (0, 255, 0)
 
 
 def _render_hybrid_overlay(image: np.ndarray, *, source_sequence: int, detection: Any, options: OverlayOptions) -> np.ndarray:
-    output = _render_base_overlay(image, source_sequence=source_sequence, detection=detection, options=options)
+    base_detection = detection
+    if hasattr(detection, "target_valid") and not bool(detection.target_valid) and is_dataclass(detection):
+        base_detection = replace(detection, observation=None)
+    output = _render_base_overlay(image, source_sequence=source_sequence, detection=base_detection, options=options)
     if not options.enabled or getattr(detection, "source_sequence", None) != source_sequence:
         return output
     height, width = output.shape[:2]

@@ -210,6 +210,7 @@ class CameraTuningService:
         self._latest_diagnostics: ImageDiagnostics | None = None
         self._detection_enabled = detector is not None
         self._detection_generation = 0
+        self._detection_reload_in_progress = False
         self._latest_detection = DetectionSnapshot(
             enabled=self._detection_enabled, detected=False
         )
@@ -623,6 +624,7 @@ class CameraTuningService:
         if not callable(reload_model):
             raise RuntimeError("configured detector does not support model reload")
         with self._lock:
+            self._detection_reload_in_progress = True
             self._invalidate_detection_for_reload_locked(detector)
         self._notify_analysis_worker(self._detection_wakeup)
         try:
@@ -630,6 +632,7 @@ class CameraTuningService:
         finally:
             with self._lock:
                 self._invalidate_detection_for_reload_locked(detector)
+                self._detection_reload_in_progress = False
             self._notify_analysis_worker(self._detection_wakeup)
 
     def _invalidate_detection_for_reload_locked(self, detector: DetectorPort) -> None:
@@ -1292,6 +1295,7 @@ class CameraTuningService:
                 if (
                     detector is None
                     or not self._detection_enabled
+                    or self._detection_reload_in_progress
                     or not self._session_active
                     or self._latest_frame is None
                 ):
@@ -1515,6 +1519,7 @@ class CameraTuningService:
         return (
             self._session_active
             and self._detection_enabled
+            and not self._detection_reload_in_progress
             and self._latest_frame is not None
             and key[0] == self._session_generation
             and key[1] == self._detection_generation
