@@ -43,6 +43,7 @@ class BoardTracker:
     def __init__(self, config: BoardTrackingConfig) -> None:
         self.config = config
         self._accepted: list[tuple[tuple[float, float], int]] = []
+        self._latest_corners: tuple[tuple[float, float], ...] | None = None
         self.latest = self._safe_result(TrackingState.SEARCHING)
 
     def update(
@@ -75,6 +76,11 @@ class BoardTracker:
                 return self._invalidate(
                     result, DetectionFailure.EXCESSIVE_POSITION_JUMP
                 )
+            assert result.corners_px is not None
+            if self._corners_jump_excessively(result.corners_px):
+                return self._invalidate(
+                    result, DetectionFailure.EXCESSIVE_POSITION_JUMP
+                )
 
         previous_state = self.latest.state
         if previous_state in {TrackingState.SEARCHING, TrackingState.LOST}:
@@ -85,7 +91,8 @@ class BoardTracker:
         else:
             confirmation_count = self.config.confirm_frames
 
-        self._remember(result.center_px, result.timestamp_ns)
+        assert result.corners_px is not None
+        self._remember(result.center_px, result.corners_px, result.timestamp_ns)
         state = (
             TrackingState.TRACKING
             if confirmation_count >= self.config.confirm_frames
@@ -104,7 +111,7 @@ class BoardTracker:
 
     def reset(self) -> None:
         """Return to SEARCHING and clear accepted history."""
-        self._accepted.clear()
+        self._clear_history()
         self.latest = self._safe_result(TrackingState.SEARCHING)
 
     def temporal_score(self, center_px: tuple[float, float]) -> float:
@@ -121,13 +128,13 @@ class BoardTracker:
         failure_reason = result.failure_reason
 
         if previous.state is TrackingState.CONFIRMING:
-            self._accepted.clear()
+            self._clear_history()
             state = TrackingState.SEARCHING
             confirmation_count = 0
             predicted_center = None
         elif previous.state in {TrackingState.TRACKING, TrackingState.PREDICTING}:
             if miss_count >= self.config.lost_frames:
-                self._accepted.clear()
+                self._clear_history()
                 state = TrackingState.LOST
                 confirmation_count = 0
                 predicted_center = None
@@ -164,7 +171,7 @@ class BoardTracker:
         result: TrackObservation,
         failure_reason: DetectionFailure,
     ) -> TrackedBoardResult:
-        self._accepted.clear()
+        self._clear_history()
         self.latest = TrackedBoardResult(
             state=TrackingState.SEARCHING,
             target_valid=False,
@@ -176,10 +183,30 @@ class BoardTracker:
         )
         return self.latest
 
-    def _remember(self, center_px: tuple[float, float], timestamp_ns: int) -> None:
+    def _remember(
+        self,
+        center_px: tuple[float, float],
+        corners_px: tuple[tuple[float, float], ...],
+        timestamp_ns: int,
+    ) -> None:
         self._accepted.append((center_px, timestamp_ns))
         if len(self._accepted) > 2:
             del self._accepted[:-2]
+        self._latest_corners = corners_px
+
+    def _corners_jump_excessively(
+        self, corners_px: tuple[tuple[float, float], ...]
+    ) -> bool:
+        if self._latest_corners is None:
+            return False
+        return any(
+            _distance(current, previous) > self.config.max_center_jump_px
+            for current, previous in zip(corners_px, self._latest_corners, strict=True)
+        )
+
+    def _clear_history(self) -> None:
+        self._accepted.clear()
+        self._latest_corners = None
 
     def _predict_center(self, target_ns: int) -> tuple[float, float] | None:
         if not self._accepted:

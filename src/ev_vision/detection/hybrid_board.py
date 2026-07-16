@@ -65,6 +65,8 @@ class TrackerPort(Protocol):
         now_ns: int | None = None,
     ) -> TrackedBoardResult: ...
 
+    def reset(self) -> None: ...
+
 
 @dataclass(frozen=True)
 class _ModelMetadata:
@@ -369,11 +371,16 @@ class HybridBoardDetector:
         )
 
     def _safe_tracker_failure(self, result: HybridBoardResult) -> HybridBoardResult:
+        if self.tracker is not None:
+            try:
+                self.tracker.reset()
+            except Exception:
+                pass
         return replace(
             result,
             detected=False,
             target_valid=False,
-            tracking_state=self._current_tracking_state(),
+            tracking_state=TrackingState.SEARCHING.value,
             homography_valid=False,
             target_x_mm=None,
             target_y_mm=None,

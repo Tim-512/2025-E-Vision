@@ -85,6 +85,7 @@ class FakeTracker:
         self.temporal_calls = []
         self.update_calls = []
         self.now_calls = []
+        self.reset_calls = 0
         self.latest = TrackedBoardResult(
             state=state,
             target_valid=target_valid,
@@ -108,6 +109,18 @@ class FakeTracker:
         self.update_calls.append(observation)
         self.now_calls.append(now_ns)
         return self.latest
+
+    def reset(self) -> None:
+        self.reset_calls += 1
+        self.latest = TrackedBoardResult(
+            state=TrackingState.SEARCHING,
+            target_valid=False,
+            observation=None,
+            predicted_center_px=None,
+            confirmation_count=0,
+            miss_count=0,
+            failure_reason=None,
+        )
 
 
 class IncrementingClock:
@@ -466,6 +479,12 @@ class RaisingTracker(FakeTracker):
         raise RuntimeError("tracker failed")
 
 
+class RaisingResetTracker(RaisingTracker):
+    def reset(self) -> None:
+        self.reset_calls += 1
+        raise RuntimeError("tracker reset failed")
+
+
 def tracking_config() -> DetectionConfig:
     return DetectionConfig(
         tracking=BoardTrackingConfig(
@@ -690,8 +709,11 @@ def test_geometry_exception_returns_stable_safe_invalid_result() -> None:
     assert result.total_ms == pytest.approx(0.008)
 
 
-def test_tracker_exception_cannot_authorize_or_publish_selected_coordinates() -> None:
-    tracker = RaisingTracker(state=TrackingState.TRACKING, target_valid=True)
+@pytest.mark.parametrize("tracker_type", [RaisingTracker, RaisingResetTracker])
+def test_tracker_exception_resets_state_and_reports_searching(
+    tracker_type: type[RaisingTracker],
+) -> None:
+    tracker = tracker_type(state=TrackingState.TRACKING, target_valid=True)
     detector = HybridBoardDetector(
         model=FakeModel([candidate(0.9)]),
         geometry=FakeGeometry({0: accepted_geometry(0.9, 0.8, 0.7)}),
@@ -703,10 +725,15 @@ def test_tracker_exception_cannot_authorize_or_publish_selected_coordinates() ->
 
     assert result.detected is False
     assert result.target_valid is False
+    assert result.tracking_state == TrackingState.SEARCHING.value
     assert result.failure_reason is DetectionFailure.MODEL_ERROR
     assert result.center_px is None
     assert result.corners_px is None
     assert len(tracker.update_calls) == 1
+    assert tracker.reset_calls == 1
+    if tracker_type is RaisingTracker:
+        assert tracker.latest.state is TrackingState.SEARCHING
+        assert tracker.latest.target_valid is False
 
 
 def test_model_without_backend_attribute_is_available_by_contract() -> None:

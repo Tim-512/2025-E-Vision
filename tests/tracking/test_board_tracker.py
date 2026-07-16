@@ -168,6 +168,37 @@ def test_jump_fails_safe_clears_history_and_next_hit_starts_confirming() -> None
     assert next_hit.target_valid is False
 
 
+def test_corner_jump_fails_safe_when_center_remains_nearby() -> None:
+    tracker = tracking_tracker(center=(100.0, 100.0))
+    corner_jump = TrackObservation(
+        timestamp_ns=60_000_000,
+        source_sequence=4,
+        detected=True,
+        center_px=(106.0, 100.0),
+        corners_px=(
+            (-200.0, -200.0),
+            (412.0, -200.0),
+            (412.0, 400.0),
+            (-200.0, 400.0),
+        ),
+        failure_reason=None,
+    )
+
+    jumped = tracker.update(corner_jump)
+
+    assert jumped.state is TrackingState.SEARCHING
+    assert jumped.failure_reason is DetectionFailure.EXCESSIVE_POSITION_JUMP
+    assert jumped.target_valid is False
+    assert jumped.confirmation_count == 0
+    assert tracker.temporal_score((108.0, 100.0)) == pytest.approx(0.0)
+
+    next_hit = tracker.update(hit(5, 80_000_000, center=(108.0, 100.0)))
+
+    assert next_hit.state is TrackingState.CONFIRMING
+    assert next_hit.confirmation_count == 1
+    assert next_hit.target_valid is False
+
+
 def test_stale_hit_fails_safe_and_requires_reconfirmation() -> None:
     tracker = tracking_tracker()
 
