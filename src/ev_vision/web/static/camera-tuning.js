@@ -3,6 +3,8 @@
 const $ = (id) => document.getElementById(id);
 const parameterKeys = ["exposure_us", "gain_db", "acquisition_fps", "auto_exposure", "auto_gain", "auto_white_balance"];
 const state = { applied: null, defaults: null, bounds: null, paused: false, previewUrl: "", initialized: false };
+let detectionConfig = null;
+let latestDetectionSequence = null;
 
 function setMessage(message, kind = "info") {
   const node = $("status-message");
@@ -15,7 +17,8 @@ async function api(path, options = {}) {
   let body = null;
   try { body = await response.json(); } catch (_) { body = null; }
   if (!response.ok) {
-    const detail = body && body.detail;
+    const payload = body;
+    const detail = payload && payload.detail;
     const message = typeof detail === "string" ? detail : detail && detail.message ? detail.message : `请求失败 (${response.status})`;
     throw new Error(message);
   }
@@ -249,9 +252,76 @@ function updateDiagnostics(payload) {
   drawRoi(data);
 }
 
+function renderDetectionConfig(config) {
+  detectionConfig = config;
+  $("detection-confidence-threshold").value = config.model.confidence_threshold;
+  $("detection-max-candidates").value = config.model.max_candidates;
+  $("detection-canny-low").value = config.roi_geometry.canny_low;
+  $("detection-canny-high").value = config.roi_geometry.canny_high;
+  $("detection-min-edge-support").value = config.roi_geometry.min_edge_support;
+  $("detection-min-geometry-score").value = config.roi_geometry.min_geometry_score;
+  $("detection-ambiguity-margin").value = config.candidate_scoring.ambiguity_margin;
+}
+
+function readDetectionConfigForm() {
+  const value = JSON.parse(JSON.stringify(detectionConfig));
+  value.model.confidence_threshold = Number($("detection-confidence-threshold").value);
+  value.model.max_candidates = Number($("detection-max-candidates").value);
+  value.roi_geometry.canny_low = Number($("detection-canny-low").value);
+  value.roi_geometry.canny_high = Number($("detection-canny-high").value);
+  value.roi_geometry.min_edge_support = Number($("detection-min-edge-support").value);
+  value.roi_geometry.min_geometry_score = Number($("detection-min-geometry-score").value);
+  value.candidate_scoring.ambiguity_margin = Number($("detection-ambiguity-margin").value);
+  return value;
+}
+
+function renderDetectionStatus(status) {
+  latestDetectionSequence = status.source_sequence;
+  $("detection-model-state").textContent = status.model_state || "--";
+  $("detection-model-backend").textContent = status.model_backend || "--";
+  $("detection-model-path").textContent = status.model_path || "--";
+  $("detection-tracking-state").textContent = `${status.tracking_state || "--"} · ${status.target_valid ? "目标有效" : "目标无效"}`;
+  $("detection-failure-reason").textContent = status.failure_reason || "NONE";
+  $("detection-candidate-count").textContent = status.candidate_count ?? 0;
+  $("detection-latency").textContent = `推理 ${finiteNumber(status.inference_ms).toFixed(1)} / 几何 ${finiteNumber(status.geometry_ms).toFixed(1)} / 总计 ${finiteNumber(status.total_ms).toFixed(1)} ms`;
+  const list = $("detection-candidate-list"); list.replaceChildren();
+  (status.candidates || []).forEach((candidate, index) => {
+    const item = document.createElement("li");
+    if (!candidate.accepted) item.className = "rejected";
+    item.textContent = `#${index + 1} M ${finiteNumber(candidate.model_confidence).toFixed(3)} G ${finiteNumber(candidate.geometry_score).toFixed(3)} E ${finiteNumber(candidate.edge_support_score).toFixed(3)} S ${finiteNumber(candidate.structure_score).toFixed(3)} T ${finiteNumber(candidate.temporal_score).toFixed(3)} C ${finiteNumber(candidate.combined_score).toFixed(3)} ${candidate.failure_reason || "ACCEPTED"}`;
+    list.append(item);
+  });
+}
+
+async function refreshDetectionStatus() {
+  const status = await api("/api/detection/status");
+  renderDetectionStatus(status);
+}
+
+async function applyDetectionConfig() {
+  const button = $("apply-detection-config"); button.disabled = true;
+  try { renderDetectionConfig(await api("/api/detection/config", {method:"PUT", body:JSON.stringify(readDetectionConfigForm())})); setMessage("检测参数已应用。", "success"); }
+  catch (error) { reportError("应用检测参数失败", error); }
+  finally { button.disabled = false; }
+}
+
+async function reloadDetectionModel() {
+  const button = $("reload-detection-model"); button.disabled = true;
+  try { renderDetectionStatus(await api("/api/detection/reload", {method:"POST", body:"{}"})); setMessage("模型已重新加载。", "success"); }
+  catch (error) { reportError("重新加载模型失败", error); }
+  finally { button.disabled = false; }
+}
+
+async function refreshDetectionDebug() {
+  const view = $("detection-debug-view").value;
+  if (!view || latestDetectionSequence == null) { $("detection-debug-image").hidden = true; return; }
+  $("detection-debug-image").src = `/api/detection/debug?image_name=${encodeURIComponent(view)}&sequence=${latestDetectionSequence}&t=${Date.now()}`;
+  $("detection-debug-image").hidden = false;
+}
+
 async function poll() {
   try {
-    const [status, diagnostics] = await Promise.all([api("/api/status"), api("/api/diagnostics")]);
+    const [status, diagnostics] = await Promise.all([api("/api/status"), api("/api/diagnostics"), refreshDetectionStatus()]);
     updateStatus(status);
     updateDiagnostics(diagnostics);
     state.initialized = true;
@@ -352,6 +422,11 @@ function bindEvents() {
   $("revert-draft").addEventListener("click", () => { setDraft(state.applied); setMessage("草稿已恢复为当前生效值。", "success"); });
   $("restore-defaults").addEventListener("click", () => { setDraft(state.defaults); setMessage("项目默认值已载入草稿，尚未应用。", "warning"); });
   $("capture-button").addEventListener("click", capture);
+  $("apply-detection-config").addEventListener("click", applyDetectionConfig);
+  $("restore-detection-defaults").addEventListener("click", () => renderDetectionConfig(detectionConfig));
+  $("reload-detection-model").addEventListener("click", reloadDetectionModel);
+  $("refresh-detection-debug").addEventListener("click", refreshDetectionDebug);
+  $("detection-debug-view").addEventListener("change", refreshDetectionDebug);
   $("load-profile").addEventListener("click", loadProfile);
   $("save-profile").addEventListener("click", saveProfile);
   $("delete-profile").addEventListener("click", deleteProfile);
@@ -363,6 +438,7 @@ async function initialize() {
   bindEvents();
   try {
     await loadParameters();
+    renderDetectionConfig(await api("/api/detection/config"));
     await refreshProfiles();
     refreshPreview();
     await poll();

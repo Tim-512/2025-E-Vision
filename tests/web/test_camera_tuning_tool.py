@@ -307,3 +307,137 @@ def test_missing_models_builds_invalid_diagnostic_detector_without_blocking_app(
     assert result.model_path is None
     assert result.failure_reason is DetectionFailure.MODEL_UNAVAILABLE
     assert len(detector.model_errors) == 2
+
+
+
+def _static_text(name: str) -> str:
+    return Path("src/ev_vision/web/static", name).read_text(encoding="utf-8")
+
+
+def _javascript_function(script: str, name: str) -> str:
+    marker = f"async function {name}"
+    start = script.index(marker)
+    next_function = script.find("\nasync function ", start + len(marker))
+    if next_function < 0:
+        next_function = len(script)
+    return script[start:next_function]
+
+
+def test_dashboard_contains_hybrid_detection_controls_and_current_routes() -> None:
+    html = _static_text("camera-tuning.html")
+    script = _static_text("camera-tuning.js")
+
+    for marker in (
+        'id="detection-model-state"',
+        'id="detection-model-backend"',
+        'id="detection-model-path"',
+        'id="detection-tracking-state"',
+        'id="detection-failure-reason"',
+        'id="detection-candidate-list"',
+        'id="detection-confidence-threshold"',
+        'id="detection-max-candidates"',
+        'id="detection-canny-low"',
+        'id="detection-canny-high"',
+        'id="detection-min-edge-support"',
+        'id="detection-min-geometry-score"',
+        'id="detection-ambiguity-margin"',
+        'id="apply-detection-config"',
+        'id="restore-detection-defaults"',
+        'id="detection-debug-view"',
+        'id="refresh-detection-debug"',
+        'id="detection-debug-image"',
+        'id="reload-detection-model"',
+    ):
+        assert marker in html
+
+    assert "/api/detection/status" in script
+    assert "/api/detection/config" in script
+    assert "/api/detection/debug" in script
+    assert "/api/detection/reload" in script
+    assert "/api/detection/model/reload" not in script
+    assert "payload.detail" in script
+    assert "button.disabled = true" in script
+
+    status_function = _javascript_function(script, "refreshDetectionStatus")
+    assert "refreshDetectionDebug" not in status_function
+
+
+def test_hybrid_overlay_draws_candidate_decisions_and_tracking_semantics(monkeypatch) -> None:
+    import cv2
+    import numpy as np
+
+    import ev_vision.web.camera_tuning_app as camera_tuning_app
+    from ev_vision.tuning.models import (
+        DetectionCandidateSnapshot,
+        DetectionSnapshot,
+        OverlayOptions,
+    )
+
+    accepted = DetectionCandidateSnapshot(
+        xyxy_px=(10.0, 10.0, 50.0, 45.0),
+        accepted=True,
+        model_confidence=0.91,
+        geometry_score=0.88,
+        edge_support_score=0.82,
+        structure_score=0.79,
+        temporal_score=0.76,
+        combined_score=0.86,
+    )
+    rejected = DetectionCandidateSnapshot(
+        xyxy_px=(65.0, 12.0, 105.0, 47.0),
+        accepted=False,
+        model_confidence=0.72,
+        geometry_score=0.21,
+        edge_support_score=0.18,
+        structure_score=0.35,
+        temporal_score=0.40,
+        combined_score=0.39,
+        failure_reason="GEOMETRY_REJECTED",
+    )
+    snapshot = DetectionSnapshot(
+        enabled=True,
+        detected=True,
+        source_sequence=7,
+        target_valid=True,
+        tracking_state="TRACKING",
+        model_state="READY",
+        model_backend="onnx",
+        model_path="models/target-board.onnx",
+        combined_score=0.86,
+        failure_reason=None,
+        corners_px=((15.0, 55.0), (100.0, 55.0), (98.0, 82.0), (17.0, 82.0)),
+        center_px=(57.0, 68.0),
+        candidates=(accepted, rejected),
+    )
+    recorded_text: list[str] = []
+    original_put_text = cv2.putText
+
+    def record_put_text(image, text, *args, **kwargs):
+        recorded_text.append(str(text))
+        return original_put_text(image, text, *args, **kwargs)
+
+    monkeypatch.setattr(camera_tuning_app.cv2, "putText", record_put_text)
+    rendered = camera_tuning_app.render_overlay(
+        np.zeros((100, 120, 3), dtype=np.uint8),
+        source_sequence=7,
+        detection=snapshot,
+        options=OverlayOptions(
+            enabled=True,
+            show_board_outline=True,
+            show_corners=True,
+            show_center=True,
+            show_crosshair=False,
+            show_detection_text=True,
+            show_center_roi=False,
+        ),
+    )
+
+    assert tuple(rendered[10, 25]) == (0, 255, 255)  # accepted/model candidate: yellow
+    assert tuple(rendered[12, 80]) == (0, 0, 255)  # geometry rejection: red
+    assert tuple(rendered[55, 40]) == (0, 255, 0)  # confirmed quadrilateral: green
+    assert rendered[68, 57, 1] > 0  # target center marker
+    overlay_text = " ".join(recorded_text)
+    assert "TRACKING" in overlay_text
+    assert "valid" in overlay_text.lower()
+    assert "score=0.860" in overlay_text
+    assert "GEOMETRY_REJECTED" in overlay_text

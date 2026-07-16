@@ -22,7 +22,7 @@ from ev_vision.config import (
     RoiGeometryConfig,
     _validate_detection,
 )
-from ev_vision.tuning.diagnostics import render_overlay
+from ev_vision.tuning.diagnostics import render_overlay as _render_base_overlay
 from ev_vision.tuning.models import (
     CameraIdentity,
     EditableCameraParameters,
@@ -30,6 +30,47 @@ from ev_vision.tuning.models import (
     ParameterBounds,
 )
 from ev_vision.tuning.service import ParameterApplyError, StaleDetectionFrameError
+
+
+_CANDIDATE_COLOR = (0, 255, 255)
+_REJECTED_COLOR = (0, 0, 255)
+_CONFIRMED_COLOR = (0, 255, 0)
+
+
+def _render_hybrid_overlay(image: np.ndarray, *, source_sequence: int, detection: Any, options: OverlayOptions) -> np.ndarray:
+    output = _render_base_overlay(image, source_sequence=source_sequence, detection=detection, options=options)
+    if not options.enabled or getattr(detection, "source_sequence", None) != source_sequence:
+        return output
+    height, width = output.shape[:2]
+    for index, candidate in enumerate(getattr(detection, "candidates", ()) or (), 1):
+        box = np.asarray(getattr(candidate, "xyxy_px", ()), dtype=float)
+        if box.shape != (4,) or not np.isfinite(box).all(): continue
+        x1, y1, x2, y2 = box
+        p1 = (int(np.clip(round(x1), 0, width-1)), int(np.clip(round(y1), 0, height-1)))
+        p2 = (int(np.clip(round(x2), 0, width-1)), int(np.clip(round(y2), 0, height-1)))
+        accepted = bool(getattr(candidate, "accepted", False))
+        color = _CANDIDATE_COLOR if accepted else _REJECTED_COLOR
+        cv2.rectangle(output, p1, p2, color, 2, cv2.LINE_8)
+        failure = getattr(candidate, "failure_reason", None) or ("ACCEPTED" if accepted else "REJECTED")
+        cv2.putText(output, f"C{index} score={float(getattr(candidate, 'combined_score', 0.0)):.3f} {failure}", (p1[0], max(10, p1[1]-3)), cv2.FONT_HERSHEY_SIMPLEX, .35, color, 1, cv2.LINE_AA)
+    corners = np.asarray(getattr(detection, "corners_px", ()) or (), dtype=float)
+    if bool(getattr(detection, "target_valid", False)) and corners.shape == (4, 2) and np.isfinite(corners).all():
+        corners[:, 0] = np.clip(corners[:, 0], 0, width-1); corners[:, 1] = np.clip(corners[:, 1], 0, height-1)
+        cv2.polylines(output, [np.rint(corners).astype(np.int32)], True, _CONFIRMED_COLOR, 2, cv2.LINE_8)
+    center = np.asarray(getattr(detection, "center_px", ()) or (), dtype=float)
+    if center.shape == (2,) and np.isfinite(center).all():
+        point = (int(np.clip(round(center[0]), 0, width-1)), int(np.clip(round(center[1]), 0, height-1)))
+        cv2.line(output, (width//2, height//2), point, _CONFIRMED_COLOR, 1, cv2.LINE_AA)
+        cv2.drawMarker(output, point, _CONFIRMED_COLOR, cv2.MARKER_CROSS, 11, 2, cv2.LINE_8)
+    if options.show_detection_text:
+        tracking = str(getattr(detection, "tracking_state", "SEARCHING")); valid = "valid" if getattr(detection, "target_valid", False) else "invalid"
+        failure = str(getattr(detection, "failure_reason", None) or "NONE")
+        cv2.putText(output, f"{tracking} {valid} score={float(getattr(detection, 'combined_score', 0.0)):.3f} failure={failure}", (12, 54), cv2.FONT_HERSHEY_SIMPLEX, .48, _CONFIRMED_COLOR if valid == "valid" else _REJECTED_COLOR, 1, cv2.LINE_AA)
+    return output
+
+
+def render_overlay(image: np.ndarray, *, source_sequence: int, detection: Any, options: OverlayOptions) -> np.ndarray:
+    return _render_hybrid_overlay(image, source_sequence=source_sequence, detection=detection, options=options)
 
 
 _NUMERIC = StrictFloat | StrictInt
