@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 import time
 from typing import Protocol
@@ -20,10 +20,26 @@ from ev_vision.detection.roi_board_geometry import (
     RoiBoardGeometry,
 )
 from ev_vision.detection.yolo_board import BoardSearchResult
+from ev_vision.tracking.board_tracker import (
+    TrackObservation,
+    TrackedBoardResult,
+    TrackingState,
+)
 
 
 class ModelCandidatePort(Protocol):
+    """Candidate source; models without backend metadata are considered available.
+
+    Availability is overridden by ``model_state="UNAVAILABLE"``. Backend-aware
+    adapters such as ``YoloBoardDetector`` may additionally expose ``backend``;
+    an explicitly present ``backend=None`` declares that adapter unavailable.
+    """
+
     def detect_candidates(self, image: np.ndarray) -> Sequence[BoardSearchResult]: ...
+
+
+class BackendAwareModelCandidatePort(ModelCandidatePort, Protocol):
+    backend: object | None
 
 
 class GeometryPort(Protocol):
@@ -37,19 +53,23 @@ class GeometryPort(Protocol):
 
 
 class TrackerPort(Protocol):
+    latest: TrackedBoardResult
+
     def temporal_score(self, center_px: tuple[float, float]) -> float: ...
 
-    def update(self, observation: object) -> object: ...
+    def update(
+        self,
+        observation: TrackObservation,
+        *,
+        now_ns: int | None = None,
+    ) -> TrackedBoardResult: ...
 
 
 @dataclass(frozen=True)
-class _TrackerObservation:
-    timestamp_ns: int
-    source_sequence: int
-    detected: bool
-    center_px: tuple[float, float] | None
-    corners_px: tuple[tuple[float, float], ...] | None
-    failure_reason: DetectionFailure | None
+class _ModelMetadata:
+    state: str
+    backend: str
+    path: str | None
 
 
 _GEOMETRY_FAILURE_MAP = {
@@ -63,6 +83,7 @@ _GEOMETRY_FAILURE_MAP = {
     GeometryFailure.AMBIGUOUS_GEOMETRY: DetectionFailure.AMBIGUOUS_CANDIDATES,
     GeometryFailure.CORNER_ORDER_FAILED: DetectionFailure.NO_VALID_QUADRILATERAL,
 }
+_MISSING_BACKEND = object()
 
 
 class HybridBoardDetector:
@@ -113,35 +134,39 @@ class HybridBoardDetector:
         update_tracker: bool = True,
     ) -> HybridBoardResult:
         started_ns = self.clock_ns()
-        model_state, model_backend, model_path = self._model_metadata()
+        metadata = self._model_metadata()
         if self._model_unavailable():
-            ended_ns = self.clock_ns()
-            return self._empty_result(
+            result = self._empty_result(
                 captured_ns=captured_ns,
                 source_sequence=source_sequence,
                 model_state="UNAVAILABLE",
-                model_backend=model_backend,
-                model_path=model_path,
+                model_backend=metadata.backend,
+                model_path=metadata.path,
                 failure_reason=DetectionFailure.MODEL_UNAVAILABLE,
-                inference_ms=0.0,
-                geometry_ms=0.0,
-                total_ms=_elapsed_ms(started_ns, ended_ns),
+            )
+            return self._finish(
+                result,
+                started_ns=started_ns,
+                update_tracker=update_tracker,
             )
 
         try:
             candidates = tuple(self.model.detect_candidates(image))  # type: ignore[union-attr]
         except Exception:
             inference_ended_ns = self.clock_ns()
-            return self._empty_result(
+            result = self._empty_result(
                 captured_ns=captured_ns,
                 source_sequence=source_sequence,
                 model_state="ERROR",
-                model_backend=model_backend,
-                model_path=model_path,
+                model_backend=metadata.backend,
+                model_path=metadata.path,
                 failure_reason=DetectionFailure.MODEL_ERROR,
                 inference_ms=_elapsed_ms(started_ns, inference_ended_ns),
-                geometry_ms=0.0,
-                total_ms=_elapsed_ms(started_ns, inference_ended_ns),
+            )
+            return self._finish(
+                result,
+                started_ns=started_ns,
+                update_tracker=update_tracker,
             )
         inference_ended_ns = self.clock_ns()
         inference_ms = _elapsed_ms(started_ns, inference_ended_ns)
@@ -150,26 +175,50 @@ class HybridBoardDetector:
             result = self._empty_result(
                 captured_ns=captured_ns,
                 source_sequence=source_sequence,
-                model_state=model_state,
-                model_backend=model_backend,
-                model_path=model_path,
+                model_state=metadata.state,
+                model_backend=metadata.backend,
+                model_path=metadata.path,
                 failure_reason=DetectionFailure.NO_MODEL_CANDIDATE,
                 inference_ms=inference_ms,
-                geometry_ms=0.0,
-                total_ms=_elapsed_ms(started_ns, inference_ended_ns),
             )
-            self._update_tracker(result, update_tracker=update_tracker)
-            return result
+            return self._finish(
+                result,
+                started_ns=started_ns,
+                update_tracker=update_tracker,
+            )
 
-        geometry_started_ns = self.clock_ns()
         evaluations: list[CandidateEvaluation] = []
         debug_images: dict[str, np.ndarray] = {}
+        geometry_ms = 0.0
         for index, model_candidate in enumerate(candidates):
-            geometry_result = self.geometry.refine(
-                image,
-                model_candidate.xyxy_px,
-                include_debug=include_debug,
-            )
+            refine_started_ns = self.clock_ns()
+            try:
+                geometry_result = self.geometry.refine(
+                    image,
+                    model_candidate.xyxy_px,
+                    include_debug=include_debug,
+                )
+            except Exception:
+                refine_ended_ns = self.clock_ns()
+                geometry_ms += _elapsed_ms(refine_started_ns, refine_ended_ns)
+                result = self._empty_result(
+                    captured_ns=captured_ns,
+                    source_sequence=source_sequence,
+                    model_state=metadata.state,
+                    model_backend=metadata.backend,
+                    model_path=metadata.path,
+                    failure_reason=DetectionFailure.MODEL_ERROR,
+                    inference_ms=inference_ms,
+                    geometry_ms=geometry_ms,
+                )
+                return self._finish(
+                    result,
+                    started_ns=started_ns,
+                    update_tracker=update_tracker,
+                )
+            refine_ended_ns = self.clock_ns()
+            geometry_ms += _elapsed_ms(refine_started_ns, refine_ended_ns)
+
             temporal_score = self._temporal_score(geometry_result)
             evaluations.append(
                 CandidateEvaluation(
@@ -185,10 +234,8 @@ class HybridBoardDetector:
             )
             if include_debug:
                 self._collect_debug(debug_images, index, geometry_result)
-        geometry_ended_ns = self.clock_ns()
-        geometry_ms = _elapsed_ms(geometry_started_ns, geometry_ended_ns)
-        evaluations.sort(key=lambda item: item.combined_score, reverse=True)
 
+        evaluations.sort(key=lambda item: item.combined_score, reverse=True)
         accepted = tuple(item for item in evaluations if item.geometry.accepted)
         best = accepted[0] if accepted else None
         failure_reason: DetectionFailure | None = None
@@ -209,13 +256,15 @@ class HybridBoardDetector:
             source_sequence=source_sequence,
             detected=detected,
             target_valid=False,
-            tracking_state="SEARCHING",
-            model_state=model_state,
-            model_backend=model_backend,
-            model_path=model_path,
+            tracking_state=self._current_tracking_state(),
+            model_state=metadata.state,
+            model_backend=metadata.backend,
+            model_path=metadata.path,
             model_confidence=best.model.confidence if best is not None else 0.0,
             geometry_score=best.geometry.geometry_score if best is not None else 0.0,
-            edge_support_score=best.geometry.edge_support_score if best is not None else 0.0,
+            edge_support_score=(
+                best.geometry.edge_support_score if best is not None else 0.0
+            ),
             structure_score=best.geometry.structure_score if best is not None else 0.0,
             temporal_score=best.temporal_score if best is not None else 0.0,
             combined_score=best.combined_score if best is not None else 0.0,
@@ -225,12 +274,85 @@ class HybridBoardDetector:
             failure_reason=failure_reason,
             inference_ms=inference_ms,
             geometry_ms=geometry_ms,
-            total_ms=_elapsed_ms(started_ns, geometry_ended_ns),
+            total_ms=0.0,
             candidates=tuple(evaluations),
             debug_images=debug_images,
         )
-        self._update_tracker(result, update_tracker=update_tracker)
-        return result
+        return self._finish(
+            result,
+            started_ns=started_ns,
+            update_tracker=update_tracker,
+        )
+
+    def _finish(
+        self,
+        result: HybridBoardResult,
+        *,
+        started_ns: int,
+        update_tracker: bool,
+    ) -> HybridBoardResult:
+        processed = self._apply_tracker(result, update_tracker=update_tracker)
+        ended_ns = self.clock_ns()
+        return replace(processed, total_ms=_elapsed_ms(started_ns, ended_ns))
+
+    def _apply_tracker(
+        self,
+        result: HybridBoardResult,
+        *,
+        update_tracker: bool,
+    ) -> HybridBoardResult:
+        if self.tracker is None:
+            return replace(result, target_valid=False, tracking_state="SEARCHING")
+        if not update_tracker:
+            return replace(
+                result,
+                target_valid=False,
+                tracking_state=self._current_tracking_state(),
+            )
+
+        observation = TrackObservation(
+            timestamp_ns=result.timestamp_ns,
+            source_sequence=result.source_sequence,
+            detected=result.detected,
+            center_px=result.center_px,
+            corners_px=result.corners_px,
+            failure_reason=result.failure_reason,
+        )
+        tracker_now_ns = self.clock_ns()
+        try:
+            tracked = self.tracker.update(observation, now_ns=tracker_now_ns)
+        except Exception:
+            return self._safe_tracker_failure(result)
+
+        failure_reason = tracked.failure_reason or result.failure_reason
+        invalidated = tracked.failure_reason is not None
+        target_valid = (
+            tracked.state is TrackingState.TRACKING
+            and tracked.target_valid
+            and result.detected
+            and result.failure_reason is None
+            and not invalidated
+        )
+        return replace(
+            result,
+            detected=False if invalidated else result.detected,
+            target_valid=target_valid,
+            tracking_state=tracked.state.value,
+            corners_px=None if invalidated else result.corners_px,
+            center_px=None if invalidated else result.center_px,
+            failure_reason=failure_reason,
+        )
+
+    def _safe_tracker_failure(self, result: HybridBoardResult) -> HybridBoardResult:
+        return replace(
+            result,
+            detected=False,
+            target_valid=False,
+            tracking_state=self._current_tracking_state(),
+            corners_px=None,
+            center_px=None,
+            failure_reason=DetectionFailure.MODEL_ERROR,
+        )
 
     def _combined_score(
         self,
@@ -257,12 +379,17 @@ class HybridBoardDetector:
             return 0.0
 
     def _model_unavailable(self) -> bool:
+        if self._model_state is not None and self._model_state.upper() == "UNAVAILABLE":
+            return True
         if self.model is None:
             return True
-        return hasattr(self.model, "backend") and getattr(self.model, "backend") is None
+        backend = getattr(self.model, "backend", _MISSING_BACKEND)
+        return backend is None
 
-    def _model_metadata(self) -> tuple[str, str, str | None]:
-        backend = getattr(self.model, "backend", None) if self.model is not None else None
+    def _model_metadata(self) -> _ModelMetadata:
+        backend = (
+            getattr(self.model, "backend", None) if self.model is not None else None
+        )
         backend_name = self._model_backend or _backend_name(backend)
         path = self._model_path or _backend_path(backend)
         if self._model_state is not None:
@@ -271,7 +398,15 @@ class HybridBoardDetector:
             state = "UNAVAILABLE"
         else:
             state = "READY"
-        return state, backend_name, path
+        return _ModelMetadata(state=state, backend=backend_name, path=path)
+
+    def _current_tracking_state(self) -> str:
+        if self.tracker is None:
+            return "SEARCHING"
+        try:
+            return self.tracker.latest.state.value
+        except Exception:
+            return "SEARCHING"
 
     @staticmethod
     def _collect_debug(
@@ -286,25 +421,6 @@ class HybridBoardDetector:
         debug_images[f"candidate_{index}_edges"] = debug.edges
         debug_images[f"candidate_{index}_geometry"] = debug.candidates_bgr
 
-    def _update_tracker(
-        self,
-        result: HybridBoardResult,
-        *,
-        update_tracker: bool,
-    ) -> None:
-        if not update_tracker or self.tracker is None:
-            return
-        self.tracker.update(
-            _TrackerObservation(
-                timestamp_ns=result.timestamp_ns,
-                source_sequence=result.source_sequence,
-                detected=result.detected,
-                center_px=result.center_px,
-                corners_px=result.corners_px,
-                failure_reason=result.failure_reason,
-            )
-        )
-
     @staticmethod
     def _empty_result(
         *,
@@ -314,9 +430,8 @@ class HybridBoardDetector:
         model_backend: str,
         model_path: str | None,
         failure_reason: DetectionFailure,
-        inference_ms: float,
-        geometry_ms: float,
-        total_ms: float,
+        inference_ms: float = 0.0,
+        geometry_ms: float = 0.0,
     ) -> HybridBoardResult:
         return HybridBoardResult(
             timestamp_ns=captured_ns,
@@ -339,7 +454,7 @@ class HybridBoardDetector:
             failure_reason=failure_reason,
             inference_ms=inference_ms,
             geometry_ms=geometry_ms,
-            total_ms=total_ms,
+            total_ms=0.0,
         )
 
 
