@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import shutil
 import tarfile
 import tempfile
 import time
@@ -44,20 +46,44 @@ def _iter_image_paths(root: Path) -> Iterator[Path]:
     )
 
 
+def _safe_member_parts(name: str) -> tuple[str, ...]:
+    normalized = name.replace("\\", "/")
+    path = PurePosixPath(normalized)
+    if (
+        not normalized
+        or normalized.startswith("/")
+        or normalized.startswith("//")
+        or re.match(r"^[A-Za-z]:", normalized) is not None
+        or path.is_absolute()
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise ValueError(f"unsafe archive member: {name}")
+    return path.parts
+
+
 def _safe_extract(archive_path: Path, destination: Path) -> None:
+    destination = destination.resolve()
     with tarfile.open(archive_path) as archive:
-        members = archive.getmembers()
-        for member in members:
-            member_path = PurePosixPath(member.name)
-            if (
-                member_path.is_absolute()
-                or ".." in member_path.parts
-                or member.issym()
-                or member.islnk()
-                or member.isdev()
-            ):
+        for member in archive:
+            parts = _safe_member_parts(member.name)
+            if member.issym() or member.islnk() or member.isdev():
                 raise ValueError(f"unsafe archive member: {member.name}")
-        archive.extractall(destination, members=members)
+            target = destination.joinpath(*parts)
+            try:
+                target.resolve().relative_to(destination)
+            except ValueError as exc:
+                raise ValueError(f"unsafe archive member: {member.name}") from exc
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            if not member.isfile():
+                raise ValueError(f"unsafe archive member: {member.name}")
+            source = archive.extractfile(member)
+            if source is None:
+                raise ValueError(f"unreadable archive member: {member.name}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with source, target.open("wb") as output:
+                shutil.copyfileobj(source, output)
 
 
 def _is_archive(path: Path) -> bool:

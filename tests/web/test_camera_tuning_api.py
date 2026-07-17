@@ -155,6 +155,11 @@ class FakeService:
     def latest_frame(self) -> Frame | None:
         return self.current_frame
 
+    def latest_frame_with_detection(self) -> tuple[Frame, DetectionSnapshot] | None:
+        if self.current_frame is None:
+            return None
+        return self.current_frame, self.detect
+
     def set_detection_enabled(self, enabled: bool) -> None:
         self.detection_enabled_calls.append(enabled)
         self.detect = DetectionSnapshot(enabled=enabled, detected=False)
@@ -542,18 +547,48 @@ def test_preview_first_chunk_is_latest_only_overlay_resized_jpeg_and_records_cou
     assert service.detection_enabled_calls == [False]
 
 
+def test_preview_uses_service_sequence_matched_frame_and_detection(
+    app, service: FakeService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    matched = DetectionSnapshot(
+        enabled=True,
+        detected=False,
+        source_sequence=service.current_frame.sequence,
+        error="matching detection unavailable",
+    )
+    calls = 0
+
+    def latest_frame_with_detection():
+        nonlocal calls
+        calls += 1
+        return service.current_frame, matched
+
+    monkeypatch.setattr(service, "latest_frame_with_detection", latest_frame_with_detection)
+    monkeypatch.setattr(
+        service,
+        "latest_frame",
+        lambda: (_ for _ in ()).throw(AssertionError("preview must use matched pair")),
+    )
+
+    _, first = _first_preview_chunk(app)
+
+    assert first.startswith(b"--frame")
+    assert calls == 1
+
+
 def test_preview_no_frame_retries_until_a_frame_arrives(app, service: FakeService, monkeypatch: pytest.MonkeyPatch) -> None:
     service.current_frame = None
     calls = 0
 
-    def latest_frame() -> Frame | None:
+    def latest_frame_with_detection():
         nonlocal calls
         calls += 1
         if calls < 2:
             return None
-        return snapshot().frame
+        ready = snapshot()
+        return ready.frame, ready.detection
 
-    monkeypatch.setattr(service, "latest_frame", latest_frame)
+    monkeypatch.setattr(service, "latest_frame_with_detection", latest_frame_with_detection)
     _, first = _first_preview_chunk(app)
     assert first.startswith(b"--frame")
     assert calls == 2

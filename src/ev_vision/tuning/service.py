@@ -174,6 +174,7 @@ class CameraTuningService:
 
         self._lock = threading.RLock()
         self._operation_lock = threading.Lock()
+        self._detector_lock = threading.RLock()
         self._camera: CameraPort | None = None
         # A claimed camera handle is closed exactly once by its dedicated worker.
         # A failed operation deliberately retains its owner/result as a terminal
@@ -534,6 +535,19 @@ class CameraTuningService:
         with self._lock:
             return None if self._latest_frame is None else self._copy_frame(self._latest_frame)
 
+    def latest_frame_with_detection(
+        self,
+    ) -> tuple[Frame, DetectionSnapshot] | None:
+        now_ns = self._clock_ns()
+        with self._lock:
+            frame = copy_frame(self._latest_frame)
+            if frame is None:
+                return None
+            detection = self._detection_snapshot_locked(now_ns)
+            if detection.source_sequence != frame.sequence:
+                detection = self._unavailable_detection_for_frame_locked(frame.sequence)
+            return frame, detection
+
     def latest_diagnostics(self) -> ImageDiagnostics | None:
         with self._lock:
             return self._latest_diagnostics
@@ -554,7 +568,8 @@ class CameraTuningService:
         apply_config = getattr(detector, "apply_config", None)
         if not callable(apply_config):
             raise RuntimeError("configured detector does not support detection config updates")
-        apply_config(config)
+        with self._detector_lock:
+            apply_config(config)
         with self._lock:
             self._detection_config = config
             self._detection_generation += 1
@@ -562,6 +577,24 @@ class CameraTuningService:
             self._latest_detection_debug = None
         self._notify_analysis_worker(self._detection_wakeup)
         return config
+
+    def _unavailable_detection_for_frame_locked(
+        self, source_sequence: int
+    ) -> DetectionSnapshot:
+        detector = self._detector
+        return DetectionSnapshot(
+            enabled=self._detection_enabled,
+            detected=False,
+            source_sequence=source_sequence,
+            error="matching detection unavailable",
+            target_valid=False,
+            tracking_state="SEARCHING",
+            observation_source="NONE",
+            model_state=str(getattr(detector, "model_state", "UNAVAILABLE")),
+            model_backend=str(getattr(detector, "model_backend", "none")),
+            model_path=getattr(detector, "model_path", None),
+            failure_reason="DETECTION_UNAVAILABLE",
+        )
 
     def detection_frame_for_latest(
         self,
@@ -633,7 +666,8 @@ class CameraTuningService:
             self._invalidate_detection_for_reload_locked(detector)
         self._notify_analysis_worker(self._detection_wakeup)
         try:
-            reload_model()
+            with self._detector_lock:
+                reload_model()
         finally:
             with self._lock:
                 self._invalidate_detection_for_reload_locked(detector)
@@ -692,15 +726,23 @@ class CameraTuningService:
             runtime = self._runtime_snapshot_locked(now_ns)
             diagnostics = self._latest_diagnostics
             detection = self._detection_snapshot_locked(now_ns)
+            detection_matches = detection.source_sequence == frame.sequence
+            if not detection_matches:
+                detection = self._unavailable_detection_for_frame_locked(frame.sequence)
+            cached_debug = self._latest_detection_debug
             camera_config = parameters.to_camera_config(self._base_config)
             camera_identity = self._camera_identity
         detection_debug = None
-        try:
-            detection_debug = self._inspect_detection_debug(frame)
-        except RuntimeError:
-            detection_debug = None
-        if detection_debug is not None and detection_debug.source_sequence != frame.sequence:
-            detection_debug = None
+        if detection_matches:
+            if cached_debug is not None and cached_debug.source_sequence == frame.sequence:
+                detection_debug = DetectionDebugSnapshot(
+                    cached_debug.source_sequence, copy_debug_images(cached_debug.images)
+                )
+            else:
+                try:
+                    detection_debug = self._inspect_detection_debug(frame)
+                except RuntimeError:
+                    detection_debug = None
         return CaptureSnapshot(
             frame=frame,
             parameters=parameters,
@@ -1366,32 +1408,33 @@ class CameraTuningService:
                 wake_on_change=item is None,
             )
 
-    @staticmethod
     def _detect_board(
+        self,
         detector: DetectorPort,
         frame: Frame,
         *,
         include_debug: bool,
         update_tracker: bool,
     ) -> HybridBoardResult | ClassicalBoardResult | BoardObservation | None:
-        parameters = inspect.signature(detector.detect).parameters
-        supports_structured = all(
-            name in parameters
-            for name in ("source_sequence", "include_debug", "update_tracker")
-        )
-        if supports_structured:
-            return detector.detect(
-                frame.image,
-                captured_ns=frame.captured_ns,
-                source_sequence=frame.sequence,
-                include_debug=include_debug,
-                update_tracker=update_tracker,
+        with self._detector_lock:
+            parameters = inspect.signature(detector.detect).parameters
+            supports_structured = all(
+                name in parameters
+                for name in ("source_sequence", "include_debug", "update_tracker")
             )
-        if include_debug or not update_tracker:
-            raise RuntimeError(
-                "configured detector does not support structured debug results"
-            )
-        return detector.detect(frame.image, captured_ns=frame.captured_ns)  # type: ignore[call-arg]
+            if supports_structured:
+                return detector.detect(
+                    frame.image,
+                    captured_ns=frame.captured_ns,
+                    source_sequence=frame.sequence,
+                    include_debug=include_debug,
+                    update_tracker=update_tracker,
+                )
+            if include_debug or not update_tracker:
+                raise RuntimeError(
+                    "configured detector does not support structured debug results"
+                )
+            return detector.detect(frame.image, captured_ns=frame.captured_ns)  # type: ignore[call-arg]
 
     @staticmethod
     def _snapshot_for_result(
@@ -1548,7 +1591,8 @@ class CameraTuningService:
         detector = self._detector
         reset = getattr(detector, "reset", None) if detector is not None else None
         if callable(reset):
-            reset()
+            with self._detector_lock:
+                reset()
 
     def _wake_analysis_workers(self) -> None:
         self._notify_analysis_worker(self._diagnostics_wakeup)

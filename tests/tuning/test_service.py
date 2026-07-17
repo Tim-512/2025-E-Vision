@@ -382,7 +382,7 @@ def test_detection_frame_and_debug_are_latest_only_cached_and_tracker_safe() -> 
         service.stop()
 
 
-def test_capture_snapshot_inspects_newer_captured_frame_not_stale_detection_frame() -> None:
+def test_capture_snapshot_never_pairs_a_newer_frame_with_stale_detection() -> None:
     detector = RepeatingHybridDetector(hybrid_result())
     camera = FakeCamera([frame(9)])
     service = make_service(
@@ -400,15 +400,31 @@ def test_capture_snapshot_inspects_newer_captured_frame_not_stale_detection_fram
         snapshot = service.capture_snapshot()
 
         assert snapshot.frame.sequence == 10
-        assert snapshot.detection.source_sequence == 9
-        assert snapshot.detection_debug is not None
-        assert snapshot.detection_debug.source_sequence == 10
-        assert len(detector.calls) == calls_before_capture + 1
-        assert detector.calls[-1]["source_sequence"] == 10
-        assert detector.calls[-1]["include_debug"] is True
-        assert detector.calls[-1]["update_tracker"] is False
+        assert snapshot.detection.source_sequence == 10
+        assert snapshot.detection.detected is False
+        assert snapshot.detection.target_valid is False
+        assert snapshot.detection.error == "matching detection unavailable"
+        assert snapshot.detection_debug is None
+        assert len(detector.calls) == calls_before_capture
     finally:
         service.stop()
+
+
+def test_latest_frame_with_detection_returns_explicit_unavailable_for_sequence_mismatch() -> None:
+    service = make_service(FakeFactory([]), detector=RepeatingHybridDetector(hybrid_result()))
+    with service._lock:
+        service._latest_frame = frame(10)
+        service._latest_detection = service._snapshot_for_result(hybrid_result(sequence=9), frame(9))
+        service._detection_computed_ns = service._clock_ns()
+
+    pair = service.latest_frame_with_detection()
+
+    assert pair is not None
+    latest, detection = pair
+    assert latest.sequence == detection.source_sequence == 10
+    assert detection.detected is False
+    assert detection.target_valid is False
+    assert detection.error == "matching detection unavailable"
 
 
 def test_capture_snapshot_inspects_its_copied_frame_for_tracker_safe_debug() -> None:
@@ -2306,3 +2322,126 @@ def test_classical_result_maps_generic_snapshot_and_debug() -> None:
     assert debug is not None
     assert debug.source_sequence == 42
     assert set(debug.images) == {"normalized-gray"}
+
+class DetectorSerializationProbe:
+    model_state = "READY"
+    model_backend = "onnx"
+    model_path = "probe.onnx"
+
+    def __init__(self) -> None:
+        self.config = DetectionConfig()
+        self.first_detect_entered = threading.Event()
+        self.release_first_detect = threading.Event()
+        self.competing_operation_entered = threading.Event()
+        self._calls_lock = threading.Lock()
+        self._detect_calls = 0
+        self.active_calls = 0
+        self.max_active_calls = 0
+
+    def _enter(self, *, first_detect: bool = False) -> None:
+        with self._calls_lock:
+            self.active_calls += 1
+            self.max_active_calls = max(self.max_active_calls, self.active_calls)
+            if not first_detect:
+                self.competing_operation_entered.set()
+
+    def _exit(self) -> None:
+        with self._calls_lock:
+            self.active_calls -= 1
+
+    def detect(
+        self,
+        image: np.ndarray,
+        *,
+        captured_ns: int,
+        source_sequence: int,
+        include_debug: bool = False,
+        update_tracker: bool = True,
+    ) -> HybridBoardResult:
+        with self._calls_lock:
+            self._detect_calls += 1
+            first_detect = self._detect_calls == 1
+        self._enter(first_detect=first_detect)
+        try:
+            if first_detect:
+                self.first_detect_entered.set()
+                assert self.release_first_detect.wait(2.0)
+            return replace(
+                hybrid_result(sequence=source_sequence),
+                timestamp_ns=captured_ns,
+                source_sequence=source_sequence,
+                debug_images={"edges": np.zeros(image.shape[:2], dtype=np.uint8)}
+                if include_debug
+                else {},
+            )
+        finally:
+            self._exit()
+
+    def apply_config(self, config: DetectionConfig) -> None:
+        self._enter()
+        try:
+            self.config = config
+        finally:
+            self._exit()
+
+    def reset(self) -> None:
+        self._enter()
+        self._exit()
+
+    def reload_model(self) -> None:
+        self._enter()
+        self._exit()
+
+
+@pytest.mark.parametrize("operation", ["apply", "reset", "reload", "debug"])
+def test_detector_operations_are_serialized_behind_an_active_detection(operation: str) -> None:
+    detector = DetectorSerializationProbe()
+    service = CameraTuningService(
+        camera_factory=FakeFactory([]),
+        base_config=config(),
+        detector=detector,
+        detection_config=detector.config,
+    )
+    failures: list[BaseException] = []
+
+    def run_detection() -> None:
+        try:
+            service._detect_board(
+                detector,
+                frame(1),
+                include_debug=False,
+                update_tracker=True,
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    detect_thread = threading.Thread(target=run_detection)
+    detect_thread.start()
+    assert detector.first_detect_entered.wait(0.5)
+
+    def run_operation() -> None:
+        try:
+            if operation == "apply":
+                service.apply_detection_config(updated_detection_config())
+            elif operation == "reset":
+                service._reset_detector()
+            elif operation == "reload":
+                service.reload_detection_model()
+            else:
+                service._inspect_detection_debug(frame(2))
+        except BaseException as exc:
+            failures.append(exc)
+
+    operation_thread = threading.Thread(target=run_operation)
+    operation_thread.start()
+    try:
+        assert not detector.competing_operation_entered.wait(0.05)
+    finally:
+        detector.release_first_detect.set()
+    detect_thread.join(1.0)
+    operation_thread.join(1.0)
+
+    assert not detect_thread.is_alive()
+    assert not operation_thread.is_alive()
+    assert failures == []
+    assert detector.max_active_calls == 1

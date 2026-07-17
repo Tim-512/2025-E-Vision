@@ -805,16 +805,17 @@ def create_camera_tuning_app(
 
         async def frames() -> AsyncIterator[bytes]:
             while True:
-                frame = service.latest_frame()
-                if frame is None:
+                matched = service.latest_frame_with_detection()
+                if matched is None:
                     await asyncio.sleep(interval_s)
                     continue
+                frame, frame_detection = matched
                 image = frame.image
                 if options.enabled:
                     image = render_overlay(
                         image,
                         source_sequence=frame.sequence,
-                        detection=service.latest_detection(),
+                        detection=frame_detection,
                         options=options,
                     )
                 image = _resize_max_width(image, max_width)

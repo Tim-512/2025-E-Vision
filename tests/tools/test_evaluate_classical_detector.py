@@ -134,16 +134,49 @@ def test_tar_archive_is_read_without_persisting_extracted_files(tmp_path: Path) 
     assert [frame.source_name for frame in frames] == ["0000.png", "0001.png"]
 
 
-def test_tar_archive_rejects_parent_traversal(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "member_name",
+    [
+        "../escape.png",
+        r"..\escape.png",
+        r"nested\..\escape.png",
+        r"C:\escape.png",
+        "C:/escape.png",
+        r"\\server\share\escape.png",
+        "/absolute.png",
+    ],
+)
+def test_tar_archive_rejects_cross_platform_unsafe_paths(
+    tmp_path: Path, member_name: str
+) -> None:
     archive = tmp_path / "unsafe.tar"
     payload = b"not-an-image"
     with tarfile.open(archive, "w") as bundle:
-        member = tarfile.TarInfo("../escape.png")
+        member = tarfile.TarInfo(member_name)
         member.size = len(payload)
         bundle.addfile(member, io.BytesIO(payload))
 
     with pytest.raises(ValueError, match="unsafe archive member"):
         list(subject.iter_replay_frames(archive, fps=20.0, max_frames=None))
+
+
+def test_tar_archive_is_extracted_member_by_member_without_extractall(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    replay = tmp_path / "replay"
+    write_frames(replay, 1)
+    archive = tmp_path / "capture.tar"
+    with tarfile.open(archive, "w") as bundle:
+        bundle.add(replay / "0000.png", arcname="nested/0000.png")
+
+    def forbidden_extractall(*args, **kwargs):
+        raise AssertionError("extractall must not be used")
+
+    monkeypatch.setattr(tarfile.TarFile, "extractall", forbidden_extractall)
+
+    frames = list(subject.iter_replay_frames(archive, fps=20.0, max_frames=None))
+
+    assert [item.source_name for item in frames] == ["0000.png"]
 
 
 def test_evaluate_reports_measured_sources_latency_and_fps(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
