@@ -16,10 +16,14 @@ from pydantic import BaseModel, ConfigDict, StrictBool, StrictFloat, StrictInt, 
 from ev_vision.config import (
     BoardTrackingConfig,
     CandidateScoringConfig,
+    ClassicalScoringConfig,
     ConfigError,
     DetectionConfig,
+    ImageNormalizationConfig,
     ModelDetectionConfig,
+    RingGeometryConfig,
     RoiGeometryConfig,
+    WhiteBoardConfig,
     _validate_detection,
 )
 from ev_vision.tuning.diagnostics import render_overlay as _render_base_overlay
@@ -84,13 +88,22 @@ _FIXED_FORMAT = {
     "pixel_format": "BayerRG8",
     "buffer_size": 2,
 }
-DEBUG_IMAGE_NAMES = {
+_CLASSICAL_DEBUG_IMAGE_NAMES = frozenset({
+    "normalized-gray",
+    "white-mask",
+    "edge-mask",
+    "ring-arcs",
+    "candidate-scores",
+})
+DEBUG_IMAGE_NAMES = frozenset({
     "model-candidates",
+    "geometry-accepted",
+    "geometry-rejected",
     "roi",
     "roi-edges",
     "roi-geometry",
     "final-overlay",
-}
+}) | _CLASSICAL_DEBUG_IMAGE_NAMES
 _PLACEHOLDER_PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Camera Tuning</title>
 <link rel="stylesheet" href="/static/camera-tuning.css"></head>
@@ -230,37 +243,133 @@ class DetectionCandidateScoringRequest(_FiniteRequest):
 
 
 class DetectionTrackingRequest(_FiniteRequest):
-    confirm_frames: StrictInt
-    predict_frames: StrictInt
-    lost_frames: StrictInt
-    max_center_jump_px: _NUMERIC
-    max_result_age_ms: _NUMERIC
+    confirm_frames: StrictInt | None = None
+    predict_frames: StrictInt | None = None
+    predict_max_frames: StrictInt | None = None
+    predict_max_ms: _NUMERIC | None = None
+    lost_frames: StrictInt | None = None
+    max_single_arc_frames: StrictInt | None = None
+    max_center_jump_px: _NUMERIC | None = None
+    max_scale_jump_fraction: _NUMERIC | None = None
+    max_velocity_px_s: _NUMERIC | None = None
+    max_acceleration_px_s2: _NUMERIC | None = None
+    max_result_age_ms: _NUMERIC | None = None
 
-    def domain(self) -> BoardTrackingConfig:
-        return BoardTrackingConfig(
-            confirm_frames=self.confirm_frames,
-            predict_frames=self.predict_frames,
-            lost_frames=self.lost_frames,
-            max_center_jump_px=float(self.max_center_jump_px),
-            max_result_age_ms=float(self.max_result_age_ms),
-        )
+    def domain(self, current: BoardTrackingConfig) -> BoardTrackingConfig:
+        values = self.model_dump(exclude_none=True)
+        return replace(current, **values)
+
+
+class DetectionNormalizationRequest(_FiniteRequest):
+    gaussian_kernel: StrictInt | None = None
+    clahe_clip_limit: _NUMERIC | None = None
+    clahe_grid_size: StrictInt | None = None
+    illumination_kernel: StrictInt | None = None
+    white_percentile: _NUMERIC | None = None
+    white_local_offset: _NUMERIC | None = None
+    saturation_threshold: StrictInt | None = None
+    canny_low: StrictInt | None = None
+    canny_high: StrictInt | None = None
+
+    def domain(self, current: ImageNormalizationConfig) -> ImageNormalizationConfig:
+        return replace(current, **self.model_dump(exclude_none=True))
+
+
+class DetectionWhiteBoardRequest(_FiniteRequest):
+    expected_aspect_ratio: _NUMERIC | None = None
+    aspect_ratio_tolerance: _NUMERIC | None = None
+    min_area_fraction: _NUMERIC | None = None
+    max_area_fraction: _NUMERIC | None = None
+    min_white_occupancy: _NUMERIC | None = None
+    max_texture_std: _NUMERIC | None = None
+    min_convexity: _NUMERIC | None = None
+    min_side_px: _NUMERIC | None = None
+    border_band_fraction: _NUMERIC | None = None
+
+    def domain(self, current: WhiteBoardConfig) -> WhiteBoardConfig:
+        return replace(current, **self.model_dump(exclude_none=True))
+
+
+class DetectionRingsRequest(_FiniteRequest):
+    expected_radius_ratios: tuple[_NUMERIC, ...] | None = None
+    ratio_tolerance: _NUMERIC | None = None
+    center_tolerance_fraction: _NUMERIC | None = None
+    min_arc_coverage: _NUMERIC | None = None
+    min_multiple_arcs: StrictInt | None = None
+    max_single_arc_frames: StrictInt | None = None
+    saturation_mask_radius_px: StrictInt | None = None
+
+    def domain(self, current: RingGeometryConfig) -> RingGeometryConfig:
+        return replace(current, **self.model_dump(exclude_none=True))
+
+
+class DetectionClassicalScoringRequest(_FiniteRequest):
+    white_weight: _NUMERIC | None = None
+    geometry_weight: _NUMERIC | None = None
+    ring_weight: _NUMERIC | None = None
+    border_weight: _NUMERIC | None = None
+    temporal_weight: _NUMERIC | None = None
+    acquisition_threshold: _NUMERIC | None = None
+    tracking_threshold: _NUMERIC | None = None
+    ambiguity_margin: _NUMERIC | None = None
+    max_texture_penalty: _NUMERIC | None = None
+
+    def domain(self, current: ClassicalScoringConfig) -> ClassicalScoringConfig:
+        return replace(current, **self.model_dump(exclude_none=True))
 
 
 class DetectionConfigRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    model: DetectionModelRequest
-    roi_geometry: DetectionRoiGeometryRequest
-    candidate_scoring: DetectionCandidateScoringRequest
-    tracking: DetectionTrackingRequest
+    backend: str | None = None
+    model: DetectionModelRequest | None = None
+    roi_geometry: DetectionRoiGeometryRequest | None = None
+    candidate_scoring: DetectionCandidateScoringRequest | None = None
+    tracking: DetectionTrackingRequest | None = None
+    normalization: DetectionNormalizationRequest | None = None
+    white_board: DetectionWhiteBoardRequest | None = None
+    rings: DetectionRingsRequest | None = None
+    classical_scoring: DetectionClassicalScoringRequest | None = None
 
     def domain(self, current: DetectionConfig) -> DetectionConfig:
-        candidate = DetectionConfig(
-            backend=current.backend,
-            model=self.model.domain(current.model),
-            roi_geometry=self.roi_geometry.domain(),
-            candidate_scoring=self.candidate_scoring.domain(),
-            tracking=self.tracking.domain(),
+        if self.backend is not None and self.backend != current.backend:
+            raise ConfigError("detection backend cannot be changed while camera is running")
+        candidate = replace(
+            current,
+            model=current.model if self.model is None else self.model.domain(current.model),
+            roi_geometry=(
+                current.roi_geometry
+                if self.roi_geometry is None
+                else self.roi_geometry.domain()
+            ),
+            candidate_scoring=(
+                current.candidate_scoring
+                if self.candidate_scoring is None
+                else self.candidate_scoring.domain()
+            ),
+            tracking=(
+                current.tracking
+                if self.tracking is None
+                else self.tracking.domain(current.tracking)
+            ),
+            normalization=(
+                current.normalization
+                if self.normalization is None
+                else self.normalization.domain(current.normalization)
+            ),
+            white_board=(
+                current.white_board
+                if self.white_board is None
+                else self.white_board.domain(current.white_board)
+            ),
+            rings=(
+                current.rings if self.rings is None else self.rings.domain(current.rings)
+            ),
+            classical_scoring=(
+                current.classical_scoring
+                if self.classical_scoring is None
+                else self.classical_scoring.domain(current.classical_scoring)
+            ),
         )
         _validate_detection(candidate)
         return candidate
@@ -297,6 +406,15 @@ _DETECTION_STATUS_FIELDS = (
     "detected",
     "source_sequence",
     "observation",
+    "observation_source",
+    "confidence",
+    "scale_px_per_mm",
+    "velocity_px_s",
+    "predicted_frames",
+    "source_age_us",
+    "near_image_edge",
+    "partially_outside",
+    "rejection_reasons",
     "error",
     "target_valid",
     "tracking_state",
@@ -332,12 +450,17 @@ def _detection_status_response(value: Any) -> dict[str, Any]:
 
 def _detection_config_response(value: DetectionConfig) -> dict[str, Any]:
     return {
+        "backend": value.backend,
         "model": {
             "confidence_threshold": value.model.confidence_threshold,
             "max_candidates": value.model.max_candidates,
         },
         "roi_geometry": _json_value(value.roi_geometry),
         "candidate_scoring": _json_value(value.candidate_scoring),
+        "normalization": _json_value(value.normalization),
+        "white_board": _json_value(value.white_board),
+        "rings": _json_value(value.rings),
+        "classical_scoring": _json_value(value.classical_scoring),
         "tracking": _json_value(value.tracking),
     }
 
@@ -382,6 +505,13 @@ def _encode_jpeg(image: np.ndarray) -> bytes:
     ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 85])
     if not ok:
         raise RuntimeError("OpenCV failed to encode preview JPEG")
+    return encoded.tobytes()
+
+
+def _encode_png(image: np.ndarray) -> bytes:
+    ok, encoded = cv2.imencode(".png", image)
+    if not ok:
+        raise RuntimeError("OpenCV failed to encode detection debug PNG")
     return encoded.tobytes()
 
 
@@ -511,10 +641,11 @@ def create_camera_tuning_app(
                     raise HTTPException(status_code=404, detail="detection debug image unavailable")
         except StaleDetectionFrameError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        jpeg = _encode_jpeg(image)
+        classical_debug = image_name in _CLASSICAL_DEBUG_IMAGE_NAMES
+        encoded = _encode_png(image) if classical_debug else _encode_jpeg(image)
         return Response(
-            content=jpeg,
-            media_type="image/jpeg",
+            content=encoded,
+            media_type="image/png" if classical_debug else "image/jpeg",
             headers={"Cache-Control": "no-store"},
         )
 
@@ -535,6 +666,9 @@ def create_camera_tuning_app(
     @app.post("/api/detection/reload")
     @app.post("/api/detection/model/reload")
     def reload_detection_model() -> dict[str, Any]:
+        config = service.detection_config()
+        if config.backend == "classical":
+            return {"status": "ready", "backend": "classical", "reloaded": False}
         try:
             service.reload_detection_model()
         except Exception as exc:

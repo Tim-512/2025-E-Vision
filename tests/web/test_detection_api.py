@@ -91,7 +91,9 @@ def detection_snapshot() -> DetectionSnapshot:
 
 
 def valid_detection_payload() -> dict[str, Any]:
+    config = DetectionConfig(backend="hybrid")
     return {
+        "backend": "hybrid",
         "model": {"confidence_threshold": 0.45, "max_candidates": 3},
         "roi_geometry": {
             "padding_fraction": 0.08,
@@ -112,19 +114,17 @@ def valid_detection_payload() -> dict[str, Any]:
             "temporal_weight": 0.10,
             "ambiguity_margin": 0.08,
         },
-        "tracking": {
-            "confirm_frames": 3,
-            "predict_frames": 2,
-            "lost_frames": 3,
-            "max_center_jump_px": 160.0,
-            "max_result_age_ms": 100.0,
-        },
+        "normalization": {field: getattr(config.normalization, field) for field in config.normalization.__dataclass_fields__},
+        "white_board": {field: getattr(config.white_board, field) for field in config.white_board.__dataclass_fields__},
+        "rings": {field: list(getattr(config.rings, field)) if field == "expected_radius_ratios" else getattr(config.rings, field) for field in config.rings.__dataclass_fields__},
+        "classical_scoring": {field: getattr(config.classical_scoring, field) for field in config.classical_scoring.__dataclass_fields__},
+        "tracking": {field: getattr(config.tracking, field) for field in config.tracking.__dataclass_fields__},
     }
 
 
 class FakeService:
     def __init__(self) -> None:
-        self.config = DetectionConfig()
+        self.config = DetectionConfig(backend="hybrid")
         self.snapshot = detection_snapshot()
         self.apply_calls: list[EditableCameraParameters] = []
         self.detection_apply_calls: list[DetectionConfig] = []
@@ -368,6 +368,15 @@ def detection_snapshot_payload(snapshot: DetectionSnapshot) -> dict[str, Any]:
         "detected": snapshot.detected,
         "source_sequence": snapshot.source_sequence,
         "observation": None,
+        "observation_source": snapshot.observation_source,
+        "confidence": snapshot.confidence,
+        "scale_px_per_mm": snapshot.scale_px_per_mm,
+        "velocity_px_s": list(snapshot.velocity_px_s) if snapshot.velocity_px_s is not None else None,
+        "predicted_frames": snapshot.predicted_frames,
+        "source_age_us": snapshot.source_age_us,
+        "near_image_edge": snapshot.near_image_edge,
+        "partially_outside": snapshot.partially_outside,
+        "rejection_reasons": list(snapshot.rejection_reasons),
         "error": snapshot.error,
         "target_valid": snapshot.target_valid,
         "tracking_state": snapshot.tracking_state,
@@ -395,3 +404,110 @@ def detection_snapshot_payload(snapshot: DetectionSnapshot) -> dict[str, Any]:
         "center_px": list(snapshot.center_px) if snapshot.center_px is not None else None,
         "candidates": fake_candidate_payloads(),
     }
+
+
+def classical_detection_payload() -> dict[str, Any]:
+    return {
+        "backend": "classical",
+        "normalization": {
+            "gaussian_kernel": 3, "clahe_clip_limit": 2.4,
+            "clahe_grid_size": 8, "illumination_kernel": 81,
+            "white_percentile": 72.0, "white_local_offset": 10.0,
+            "saturation_threshold": 250, "canny_low": 40, "canny_high": 120,
+        },
+        "white_board": {
+            "expected_aspect_ratio": 210.0 / 297.0,
+            "aspect_ratio_tolerance": 0.24, "min_area_fraction": 0.015,
+            "max_area_fraction": 0.92, "min_white_occupancy": 0.55,
+            "max_texture_std": 58.0, "min_convexity": 0.90,
+            "min_side_px": 45.0, "border_band_fraction": 0.045,
+        },
+        "rings": {
+            "expected_radius_ratios": [1, 2, 3, 4, 5],
+            "ratio_tolerance": 0.20, "center_tolerance_fraction": 0.08,
+            "min_arc_coverage": 0.18, "min_multiple_arcs": 2,
+            "max_single_arc_frames": 2, "saturation_mask_radius_px": 12,
+        },
+        "classical_scoring": {
+            "white_weight": 0.24, "geometry_weight": 0.22,
+            "ring_weight": 0.30, "border_weight": 0.08,
+            "temporal_weight": 0.16, "acquisition_threshold": 0.66,
+            "tracking_threshold": 0.50, "ambiguity_margin": 0.08,
+            "max_texture_penalty": 0.20,
+        },
+        "tracking": {
+            "confirm_frames": 3, "predict_frames": 2,
+            "predict_max_frames": 3, "predict_max_ms": 150.0,
+            "lost_frames": 4, "max_single_arc_frames": 2,
+            "max_center_jump_px": 160.0, "max_scale_jump_fraction": 0.30,
+            "max_velocity_px_s": 5000.0,
+            "max_acceleration_px_s2": 30000.0,
+            "max_result_age_ms": 100.0,
+        },
+    }
+
+
+def test_config_exposes_classical_sections(client: TestClient, service: FakeService) -> None:
+    service.config = DetectionConfig(backend="classical")
+    payload = client.get("/api/detection/config").json()
+    assert payload["backend"] == "classical"
+    assert payload["normalization"]["clahe_clip_limit"] == 2.0
+    assert payload["rings"]["expected_radius_ratios"] == [1.0, 2.0, 3.0, 4.0, 5.0]
+    assert "red_threshold" not in str(payload).lower()
+
+
+def test_put_classical_config_preserves_hybrid_sections_and_does_not_restart_camera(
+    client: TestClient, service: FakeService
+) -> None:
+    service.config = DetectionConfig(backend="classical")
+    service.camera_generation = 7
+    response = client.put("/api/detection/config", json=classical_detection_payload())
+    assert response.status_code == 200
+    assert service.camera_generation == 7
+    changed = service.detection_apply_calls[-1]
+    assert changed.backend == "classical"
+    assert changed.model == DetectionConfig().model
+    assert changed.roi_geometry == DetectionConfig().roi_geometry
+    assert changed.normalization.clahe_clip_limit == 2.4
+    assert changed.white_board.min_white_occupancy == 0.55
+    assert changed.rings.ratio_tolerance == 0.20
+    assert changed.classical_scoring.tracking_threshold == 0.50
+
+
+def test_status_reports_classical_source_and_prediction(client: TestClient, service: FakeService) -> None:
+    service.snapshot = DetectionSnapshot(
+        enabled=True, detected=True, source_sequence=42, target_valid=True,
+        tracking_state="PREDICTING", observation_source="PREDICTED",
+        confidence=0.77, source_age_us=45000, predicted_frames=2,
+        model_state="READY", model_backend="classical",
+    )
+    payload = client.get("/api/detection/status").json()
+    assert payload["observation_source"] == "PREDICTED"
+    assert payload["confidence"] == pytest.approx(0.77)
+    assert payload["source_age_us"] == 45000
+    assert payload["predicted_frames"] == 2
+
+
+@pytest.mark.parametrize("name", [
+    "normalized-gray", "white-mask", "edge-mask",
+    "ring-arcs", "candidate-scores",
+])
+def test_classical_debug_route_returns_png(
+    client: TestClient, service: FakeService, name: str
+) -> None:
+    service.debug_images[name] = np.full((10, 15), 127, dtype=np.uint8)
+    response = client.get(f"/api/detection/debug/{name}", params={"sequence": 42})
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+
+
+def test_classical_reload_route_is_ready_no_op(
+    client: TestClient, service: FakeService
+) -> None:
+    service.config = DetectionConfig(backend="classical")
+    response = client.post("/api/detection/model/reload")
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ready", "backend": "classical", "reloaded": False
+    }
+    assert service.reload_calls == 0
