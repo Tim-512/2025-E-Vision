@@ -82,6 +82,6 @@ class RateCommand:
     yaw_rate_deg_s: float = 0.0
     pitch_rate_deg_s: float = 0.0
     target_valid: bool = False
-    laser_mode: LaserMode = LaserMode.OFF
+    laser_mode: LaserMode = LaserMode.OFF  # Legacy V1 only; ignored by protocol V2.
     flags: ControlFlags = ControlFlags(0)
     source_age_us: int = 0

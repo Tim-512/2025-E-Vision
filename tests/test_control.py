@@ -39,3 +39,15 @@ def test_motion_predictor_projects_constant_velocity() -> None:
     predictor.observe((0.0, 0.0), 0)
     predictor.observe((1.0, -2.0), 1_000_000_000)
     assert predictor.predict(1_500_000_000) == pytest.approx((1.5, -3.0))
+
+
+def test_visual_servo_stale_update_explicitly_returns_zero_motion() -> None:
+    servo = VisualServo.simple(
+        kp=1.0, max_rate=20.0, max_accel=1000.0, source_timeout_ms=100
+    )
+
+    stale = servo.update((5.0, -4.0), now_ns=100_000_001, source_ns=0)
+
+    assert stale.target_valid is False
+    assert stale.yaw_rate_deg_s == 0.0
+    assert stale.pitch_rate_deg_s == 0.0

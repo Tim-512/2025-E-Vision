@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from ev_vision.detection.contracts import ObservationSource
 from ev_vision.vision_result import VisionTargetResult
 
 
@@ -32,6 +33,105 @@ def hybrid_result(**overrides: object) -> SimpleNamespace:
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def classical_result(**overrides: object) -> SimpleNamespace:
+    values: dict[str, object] = {
+        "timestamp_ns": 50_000_000,
+        "source_sequence": 17,
+        "target_valid": True,
+        "tracking_state": "TRACKING",
+        "observation_source": ObservationSource.FULL_BOARD,
+        "confidence": 0.92,
+        "center_px": (700.0, 480.0),
+        "corners_px": CORNERS,
+        "homography_valid": True,
+        "target_x_mm": 0.0,
+        "target_y_mm": 0.0,
+        "predicted_frames": 0,
+        "near_image_edge": False,
+        "partially_outside": False,
+        "failure_reason": None,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_generic_full_board_requires_four_corners_and_homography() -> None:
+    valid = VisionTargetResult.from_detection(
+        classical_result(), image_size=(1280, 1024), now_ns=90_000_000
+    )
+    assert valid.target_valid is True
+    assert valid.observation_source == "FULL_BOARD"
+
+    for overrides in ({"corners_px": CORNERS[:3]}, {"homography_valid": False}):
+        invalid = VisionTargetResult.from_detection(
+            classical_result(**overrides),
+            image_size=(1280, 1024),
+            now_ns=90_000_000,
+        )
+        assert invalid.target_valid is False
+
+
+def test_confirmed_partial_source_needs_center_but_not_corners() -> None:
+    result = VisionTargetResult.from_detection(
+        classical_result(
+            observation_source=ObservationSource.CONCENTRIC_ARCS,
+            corners_px=(),
+            homography_valid=False,
+            target_x_mm=None,
+            target_y_mm=None,
+        ),
+        image_size=(1280, 1024),
+        now_ns=90_000_000,
+    )
+
+    assert result.target_valid is True
+    assert result.observation_source == "CONCENTRIC_ARCS"
+    assert result.corners == ()
+
+
+def test_prediction_validity_uses_both_three_frames_and_150_ms() -> None:
+    base = dict(
+        tracking_state="PREDICTING",
+        observation_source=ObservationSource.PREDICTED,
+        corners_px=(),
+        homography_valid=False,
+        target_x_mm=None,
+        target_y_mm=None,
+    )
+    assert VisionTargetResult.from_detection(
+        classical_result(**base, predicted_frames=3),
+        image_size=(1280, 1024),
+        now_ns=150_000_000,
+        predict_max_frames=3,
+        predict_max_ms=150.0,
+    ).target_valid
+    assert not VisionTargetResult.from_detection(
+        classical_result(**base, predicted_frames=4),
+        image_size=(1280, 1024),
+        now_ns=150_000_000,
+        predict_max_frames=3,
+        predict_max_ms=150.0,
+    ).target_valid
+    assert not VisionTargetResult.from_detection(
+        classical_result(**base, timestamp_ns=0, predicted_frames=1),
+        image_size=(1280, 1024),
+        now_ns=150_000_001,
+        predict_max_frames=3,
+        predict_max_ms=150.0,
+    ).target_valid
+
+
+@pytest.mark.parametrize("state", ["SEARCHING", "CONFIRMING", "LOST", "FAULT"])
+def test_noncontrolling_classical_states_are_invalid(state: str) -> None:
+    result = VisionTargetResult.from_detection(
+        classical_result(tracking_state=state),
+        image_size=(1280, 1024),
+        now_ns=60_000_000,
+    )
+
+    assert result.target_valid is False
 
 
 def test_tracking_result_maps_to_valid_gimbal_semantics() -> None:
