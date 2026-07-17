@@ -38,7 +38,9 @@ def test_motion_predictor_projects_constant_velocity() -> None:
     predictor = MotionPredictor()
     predictor.observe((0.0, 0.0), 0)
     predictor.observe((1.0, -2.0), 1_000_000_000)
-    assert predictor.predict(1_500_000_000) == pytest.approx((1.5, -3.0))
+    assert predictor.predict(
+        1_500_000_000, max_horizon_ns=500_000_000
+    ) == pytest.approx((1.5, -3.0))
 
 
 def test_visual_servo_stale_update_explicitly_returns_zero_motion() -> None:
