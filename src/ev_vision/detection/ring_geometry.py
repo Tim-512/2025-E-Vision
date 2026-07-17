@@ -130,6 +130,7 @@ def _ratio_match(
         return 0.0, None, ()
     observed_sets = combinations(arcs, count) if len(arcs) > count else (arcs,)
     best: tuple[float, float | None, tuple[ArcFit, ...]] = (0.0, None, ())
+    best_rank = -1.0
     for observed_group in observed_sets:
         observed_group = tuple(sorted(observed_group, key=lambda item: item.equivalent_radius_px))
         observed = np.asarray([item.equivalent_radius_px for item in observed_group])
@@ -140,13 +141,18 @@ def _ratio_match(
                 continue
             relative = np.abs(observed - unit * expected_subset) / np.maximum(unit * expected_subset, 1e-6)
             rms = float(np.sqrt(np.mean(relative ** 2)))
-            score = float(np.clip(1.0 - rms / config.ratio_tolerance, 0.0, 1.0))
+            ratio_score = float(np.clip(1.0 - rms / config.ratio_tolerance, 0.0, 1.0))
+            scale = unit / 20.0
+            scale_compatibility = 1.0
             if expected_scale_px_per_mm is not None:
-                scale = unit / 20.0
                 scale_error = abs(scale - expected_scale_px_per_mm) / max(expected_scale_px_per_mm, 1e-6)
-                score *= float(np.clip(1.0 - scale_error, 0.0, 1.0))
-            if score > best[0]:
-                best = (score, unit / 20.0, observed_group)
+                scale_compatibility = float(np.clip(1.0 - scale_error, 0.0, 1.0))
+            # History selects the most plausible radius assignment; it must not
+            # lower the current frame's independent ring-ratio confidence.
+            rank = ratio_score * scale_compatibility
+            if rank > best_rank:
+                best_rank = rank
+                best = (ratio_score, scale, observed_group)
     return best
 
 

@@ -53,6 +53,20 @@ def test_partial_multiple_arcs_recover_center_near_edge():
     assert result.center_px == pytest.approx(target.center_px, abs=15.0)
 
 
+def test_partial_arcs_keep_ratio_valid_with_small_expected_scale_difference():
+    target = render_ring_target(board_center=(0.0, 360.0))
+    result = detect_concentric_arcs(
+        ring_edges(target.image),
+        RingGeometryConfig(min_arc_coverage=0.12),
+        expected_scale_px_per_mm=1.5735,
+    )
+
+    assert result.valid is True
+    assert result.visible_arc_count >= 2
+    assert result.center_px == pytest.approx(target.center_px, abs=15.0)
+    assert result.scale_px_per_mm == pytest.approx(1.657, abs=0.03)
+
+
 def test_saturated_spot_does_not_form_multiple_ring_identity():
     image = np.zeros((360, 480), np.uint8)
     cv2.circle(image, (240, 180), 8, 255, -1)
