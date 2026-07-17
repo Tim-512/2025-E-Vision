@@ -1,13 +1,15 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import IntEnum
+from enum import IntEnum, IntFlag
 import struct
 
 from ev_vision.models import ChassisProgress, ControlFlags, LaserMode, OperatingMode
 
 MAGIC = b"\xAA\x55"
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION_V1 = 1
+PROTOCOL_VERSION_V2 = 2
+PROTOCOL_VERSION = PROTOCOL_VERSION_V2
 HEADER = struct.Struct("<2sBBHH")
 CRC = struct.Struct("<H")
 MAX_PAYLOAD_LENGTH = 1024
@@ -35,7 +37,47 @@ class DecodedFrame:
 
 
 _CONTROL_STRUCT = struct.Struct("<BBBBhhhhHHI")
+_CONTROL_V2_STRUCT = struct.Struct("<BBBBHHhhhhhhII")  # 28 bytes
+_GIMBAL_V2_STRUCT = struct.Struct("<BBHiihhHHI")       # 24 bytes
 _CHASSIS_STRUCT = struct.Struct("<BBHI")
+
+
+class TrackingStateCode(IntEnum):
+    SEARCHING = 0
+    CONFIRMING = 1
+    TRACKING = 2
+    PREDICTING = 3
+    LOST = 4
+    FAULT = 5
+
+
+class ObservationSourceCode(IntEnum):
+    NONE = 0
+    FULL_BOARD = 1
+    CONCENTRIC_ARCS = 2
+    SINGLE_ARC = 3
+    WHITE_REGION = 4
+    FUSED_PARTIAL = 5
+    PREDICTED = 6
+
+
+class VisionControlFlagsV2(IntFlag):
+    CAMERA_HEALTHY = 1 << 0
+    FULL_BOARD_VISIBLE = 1 << 1
+    HOMOGRAPHY_VALID = 1 << 2
+    MULTIPLE_ARCS_VALID = 1 << 3
+    SINGLE_ARC_VALID = 1 << 4
+    WHITE_REGION_VALID = 1 << 5
+    USING_PREDICTION = 1 << 6
+    TARGET_NEAR_IMAGE_EDGE = 1 << 7
+    TARGET_PARTIALLY_OUTSIDE = 1 << 8
+    OBSERVATION_STALE = 1 << 9
+    CENTER_JUMP_REJECTED = 1 << 10
+    SCALE_JUMP_REJECTED = 1 << 11
+    FEEDBACK_STALE = 1 << 12
+    GIMBAL_FAULT_RECEIVED = 1 << 13
+    RESERVED = 1 << 14
+    EMERGENCY_STOP = 1 << 15
 
 
 @dataclass(frozen=True)
@@ -74,6 +116,87 @@ class VisionControlPayload:
             board_confidence_permille=values[8], laser_confidence_permille=values[9],
             source_age_us=values[10],
         )
+
+
+@dataclass(frozen=True)
+class VisionControlPayloadV2:
+    operating_mode: OperatingMode
+    target_valid: bool
+    tracking_state: TrackingStateCode
+    observation_source: ObservationSourceCode
+    flags: VisionControlFlagsV2
+    confidence_permille: int
+    yaw_rate_cdeg_s: int
+    pitch_rate_cdeg_s: int
+    error_yaw_mdeg: int
+    error_pitch_mdeg: int
+    target_x_px: int
+    target_y_px: int
+    source_age_us: int
+    source_frame_sequence: int
+
+    def pack(self) -> bytes:
+        yaw_rate = self.yaw_rate_cdeg_s if self.target_valid else 0
+        pitch_rate = self.pitch_rate_cdeg_s if self.target_valid else 0
+        return _CONTROL_V2_STRUCT.pack(
+            int(self.operating_mode), int(self.target_valid),
+            int(self.tracking_state), int(self.observation_source),
+            int(self.flags), self.confidence_permille,
+            yaw_rate, pitch_rate, self.error_yaw_mdeg,
+            self.error_pitch_mdeg, self.target_x_px, self.target_y_px,
+            self.source_age_us, self.source_frame_sequence,
+        )
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "VisionControlPayloadV2":
+        if len(data) != _CONTROL_V2_STRUCT.size:
+            raise ProtocolError(f"control V2 payload must be {_CONTROL_V2_STRUCT.size} bytes")
+        values = _CONTROL_V2_STRUCT.unpack(data)
+        return cls(
+            operating_mode=OperatingMode(values[0]),
+            target_valid=bool(values[1]),
+            tracking_state=TrackingStateCode(values[2]),
+            observation_source=ObservationSourceCode(values[3]),
+            flags=VisionControlFlagsV2(values[4]),
+            confidence_permille=values[5],
+            yaw_rate_cdeg_s=values[6],
+            pitch_rate_cdeg_s=values[7],
+            error_yaw_mdeg=values[8],
+            error_pitch_mdeg=values[9],
+            target_x_px=values[10],
+            target_y_px=values[11],
+            source_age_us=values[12],
+            source_frame_sequence=values[13],
+        )
+
+
+@dataclass(frozen=True)
+class GimbalFeedbackPayloadV2:
+    state: int = 0
+    fault_flags: int = 0
+    ack_sequence: int = 0
+    yaw_angle_mdeg: int = 0
+    pitch_angle_mdeg: int = 0
+    yaw_rate_cdeg_s: int = 0
+    pitch_rate_cdeg_s: int = 0
+    control_latency_us: int = 0
+    reserved: int = 0
+    controller_time_us: int = 0
+
+    def pack(self) -> bytes:
+        return _GIMBAL_V2_STRUCT.pack(
+            self.state, self.fault_flags, self.ack_sequence,
+            self.yaw_angle_mdeg, self.pitch_angle_mdeg,
+            self.yaw_rate_cdeg_s, self.pitch_rate_cdeg_s,
+            self.control_latency_us, self.reserved,
+            self.controller_time_us,
+        )
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "GimbalFeedbackPayloadV2":
+        if len(data) != _GIMBAL_V2_STRUCT.size:
+            raise ProtocolError(f"gimbal feedback V2 payload must be {_GIMBAL_V2_STRUCT.size} bytes")
+        return cls(*_GIMBAL_V2_STRUCT.unpack(data))
 
 
 def crc16_ccitt_false(data: bytes) -> int:
