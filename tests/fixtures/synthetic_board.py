@@ -163,3 +163,131 @@ def geometry_failure_fixture(
         return image, (188.0, 55.0, 455.0, 420.0)
 
     raise ValueError(f"unknown geometry failure fixture: {fixture_name}")
+
+
+@dataclass(frozen=True)
+class SyntheticRingTarget:
+    image: np.ndarray
+    center_px: tuple[float, float]
+    corners_px: tuple[tuple[float, float], ...]
+    radii_px: tuple[float, ...]
+    partially_outside: bool
+
+
+def render_ring_target(
+    *,
+    image_size: tuple[int, int] = (720, 960),
+    board_center: tuple[float, float] | None = None,
+    perspective: float = 0.0,
+    shadow_strength: float = 0.0,
+    blur_sigma: float = 0.0,
+    ring_gray: int = 92,
+    ring_thickness_px: int = 3,
+    gradient_strength: float = 0.0,
+    noise_sigma: float = 0.0,
+    distractors: bool = False,
+    seed: int = 0,
+) -> SyntheticRingTarget:
+    height, width = image_size
+    center = board_center or (width / 2.0, height / 2.0)
+    pixels_per_mm = min(width / 420.0, height / 420.0)
+    canonical_width = max(2, int(round(210.0 * pixels_per_mm)))
+    canonical_height = max(2, int(round(297.0 * pixels_per_mm)))
+    canonical = np.full((canonical_height, canonical_width, 3), 242, np.uint8)
+    tape_px = max(2, int(round(18.0 * pixels_per_mm)))
+    cv2.rectangle(
+        canonical,
+        (0, 0),
+        (canonical_width - 1, canonical_height - 1),
+        (18, 18, 18),
+        tape_px,
+        cv2.LINE_AA,
+    )
+    canonical_center = (canonical_width // 2, canonical_height // 2)
+    radii = tuple(
+        float(int(round(radius_mm * pixels_per_mm)))
+        for radius_mm in (20.0, 40.0, 60.0, 80.0, 100.0)
+    )
+    for radius_px in radii:
+        cv2.circle(
+            canonical,
+            canonical_center,
+            int(radius_px),
+            (ring_gray, ring_gray, ring_gray),
+            ring_thickness_px,
+            cv2.LINE_AA,
+        )
+
+    half_w = canonical_width / 2.0
+    half_h = canonical_height / 2.0
+    skew_x = perspective * canonical_width
+    skew_y = perspective * canonical_height
+    destination = np.asarray(
+        [
+            [center[0] - half_w + skew_x, center[1] - half_h + skew_y],
+            [center[0] + half_w - skew_x, center[1] - half_h],
+            [center[0] + half_w, center[1] + half_h - skew_y],
+            [center[0] - half_w, center[1] + half_h],
+        ],
+        np.float32,
+    )
+    source = np.asarray(
+        [
+            [0.0, 0.0],
+            [canonical_width - 1.0, 0.0],
+            [canonical_width - 1.0, canonical_height - 1.0],
+            [0.0, canonical_height - 1.0],
+        ],
+        np.float32,
+    )
+    transform = cv2.getPerspectiveTransform(source, destination)
+    background = np.full((height, width, 3), 35, np.uint8)
+    warped = cv2.warpPerspective(
+        canonical, transform, (width, height), borderValue=(0, 0, 0)
+    )
+    alpha = cv2.warpPerspective(
+        np.full((canonical_height, canonical_width), 255, np.uint8),
+        transform,
+        (width, height),
+        borderValue=0,
+    )
+    image = np.where(alpha[..., None] > 0, warped, background)
+
+    if gradient_strength:
+        gradient = np.linspace(
+            1.0 - gradient_strength, 1.0 + gradient_strength, width, dtype=np.float32
+        )
+        image = np.clip(image.astype(np.float32) * gradient[None, :, None], 0, 255).astype(np.uint8)
+    if shadow_strength:
+        shadow = np.ones((height, width), np.float32)
+        polygon = np.asarray(
+            [[0, 0], [int(width * 0.58), 0], [int(width * 0.42), height], [0, height]],
+            np.int32,
+        )
+        cv2.fillConvexPoly(shadow, polygon, max(0.0, 1.0 - shadow_strength))
+        image = np.clip(image.astype(np.float32) * shadow[..., None], 0, 255).astype(np.uint8)
+    if distractors:
+        cv2.rectangle(image, (25, 25), (135, 125), (215, 215, 215), -1)
+        cv2.circle(image, (width - 80, 80), 35, (100, 100, 100), 4, cv2.LINE_AA)
+    if noise_sigma:
+        noise = np.random.default_rng(seed).normal(0.0, noise_sigma, image.shape)
+        image = np.clip(image.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+    if blur_sigma:
+        image = cv2.GaussianBlur(image, (0, 0), blur_sigma)
+
+    projected_center = cv2.perspectiveTransform(
+        np.asarray([[canonical_center]], np.float32), transform
+    )[0, 0]
+    outside = bool(
+        np.any(destination[:, 0] < 0)
+        or np.any(destination[:, 0] >= width)
+        or np.any(destination[:, 1] < 0)
+        or np.any(destination[:, 1] >= height)
+    )
+    return SyntheticRingTarget(
+        image=image,
+        center_px=(float(projected_center[0]), float(projected_center[1])),
+        corners_px=tuple((float(x), float(y)) for x, y in destination),
+        radii_px=radii,
+        partially_outside=outside,
+    )
