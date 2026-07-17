@@ -9,7 +9,8 @@ from typing import Iterable
 import numpy as np
 import pytest
 
-from ev_vision.config import CameraConfig, DetectionConfig
+from ev_vision.config import CameraConfig, DetectionConfig, RingGeometryConfig
+from ev_vision.detection.contracts import ClassicalBoardResult, ObservationSource
 from ev_vision.detection.failures import (
     CandidateEvaluation,
     DetectionFailure,
@@ -2205,3 +2206,103 @@ def test_reconfigurable_camera_rolls_back_in_place_after_candidate_failure() -> 
         assert service.runtime_snapshot().state == "Connected"
     finally:
         service.stop()
+
+
+class ClassicalDetectorFake:
+    model_state = "READY"
+    model_backend = "classical"
+    model_path = None
+
+    def __init__(self) -> None:
+        self.config = DetectionConfig(backend="classical")
+        self.reload_calls = 0
+        self.reset_calls = 0
+
+    def detect(
+        self, image: np.ndarray, *, captured_ns: int, source_sequence: int,
+        include_debug: bool = False, update_tracker: bool = True,
+    ) -> ClassicalBoardResult:
+        return ClassicalBoardResult(
+            timestamp_ns=captured_ns, source_sequence=source_sequence,
+            detected=False, target_valid=False, tracking_state="SEARCHING",
+            observation_source=ObservationSource.NONE, confidence=0.0,
+            center_px=None, debug_images={
+                "normalized-gray": np.zeros(image.shape[:2], dtype=np.uint8)
+            } if include_debug else {},
+        )
+
+    def reset(self) -> None:
+        self.reset_calls += 1
+
+    def apply_config(self, config: DetectionConfig) -> None:
+        self.config = config
+
+    def reload_model(self) -> None:
+        self.reload_calls += 1
+
+
+def test_detector_config_update_does_not_replace_camera() -> None:
+    camera = FakeCamera([frame(index) for index in range(1, 200)])
+    detector = ClassicalDetectorFake()
+    service = CameraTuningService(
+        camera_factory=FakeFactory([camera]), base_config=config(),
+        detector=detector, detection_config=detector.config,
+        read_timeout_ms=2, confirm_timeout_s=0.05,
+        diagnostics_fps=100.0, detection_fps=100.0,
+        disconnect_timeout_threshold=1000,
+    )
+    service.start()
+    try:
+        wait_until(lambda: service.runtime_snapshot().frame_count >= 1)
+        original_camera = service.active_camera
+        original_count = service.runtime_snapshot().frame_count
+        changed = replace(
+            service.detection_config(),
+            rings=RingGeometryConfig(ratio_tolerance=0.20),
+        )
+        service.apply_detection_config(changed)
+        assert service.active_camera is original_camera
+        wait_until(lambda: service.runtime_snapshot().frame_count > original_count)
+        assert service.runtime_snapshot().state == "Connected"
+        assert camera.close_count == 0
+    finally:
+        service.stop()
+
+
+def test_classical_reload_is_clean_no_op() -> None:
+    detector = ClassicalDetectorFake()
+    service = make_service(
+        FakeFactory([FakeCamera([frame(1)])]), detector=detector  # type: ignore[arg-type]
+    )
+    service.reload_detection_model()
+    status = service.latest_detection()
+    assert status.model_state == "READY"
+    assert status.model_backend == "classical"
+    assert detector.reload_calls == 0
+
+
+def test_classical_result_maps_generic_snapshot_and_debug() -> None:
+    source = frame(42)
+    result = ClassicalBoardResult(
+        timestamp_ns=source.captured_ns, source_sequence=source.sequence,
+        detected=True, target_valid=True, tracking_state="PREDICTING",
+        observation_source=ObservationSource.PREDICTED, confidence=0.73,
+        center_px=(5.0, 4.0), scale_px_per_mm=3.2,
+        velocity_px_s=(12.0, -4.0), predicted_frames=2, source_age_us=8000,
+        near_image_edge=True, partially_outside=True,
+        debug_images={"normalized-gray": np.zeros((8, 10), dtype=np.uint8)},
+    )
+    snapshot = CameraTuningService._snapshot_for_result(result, source)
+    assert snapshot.observation_source == "PREDICTED"
+    assert snapshot.confidence == pytest.approx(0.73)
+    assert snapshot.scale_px_per_mm == pytest.approx(3.2)
+    assert snapshot.velocity_px_s == (12.0, -4.0)
+    assert snapshot.predicted_frames == 2
+    assert snapshot.source_age_us == 8000
+    assert snapshot.near_image_edge is True
+    assert snapshot.partially_outside is True
+    assert snapshot.rejection_reasons == ()
+    debug = CameraTuningService._debug_snapshot_for_result(result, source)
+    assert debug is not None
+    assert debug.source_sequence == 42
+    assert set(debug.images) == {"normalized-gray"}

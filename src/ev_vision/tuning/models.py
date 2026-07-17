@@ -129,6 +129,15 @@ class DetectionSnapshot:
     error: str | None = None
     target_valid: bool = False
     tracking_state: str = "SEARCHING"
+    observation_source: str = "NONE"
+    confidence: float = 0.0
+    scale_px_per_mm: float | None = None
+    velocity_px_s: tuple[float, float] | None = None
+    predicted_frames: int = 0
+    source_age_us: int = 0
+    near_image_edge: bool = False
+    partially_outside: bool = False
+    rejection_reasons: tuple[str, ...] = ()
     model_state: str = "UNAVAILABLE"
     model_backend: str = "none"
     model_path: str | None = None

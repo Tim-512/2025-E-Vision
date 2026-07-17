@@ -10,6 +10,7 @@ import uvicorn
 
 from ev_vision.camera.hikrobot import HikrobotCamera, MvsApi, create_native_api
 from ev_vision.config import BoardConfig, CameraConfig, DetectionConfig, load_config
+from ev_vision.detection.classical_board import ClassicalBoardDetector
 from ev_vision.detection.hybrid_board import DetectionBackendSelection, HybridBoardDetector
 from ev_vision.detection.yolo_board import InferencePort, UltralyticsBackend, YoloBoardDetector
 from ev_vision.tracking.board_tracker import BoardTracker
@@ -55,7 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="ev-camera-tuning",
         description=(
             "Jetson Hikrobot camera tuning dashboard. Bind 0.0.0.0 only on a trusted LAN; "
-            "the 405 nm laser must remain disconnected and OFF."
+            "the 405 nm laser is hardware-always-on whenever powered; Jetson/V2 cannot control it."
         ),
         epilog=(
             "Default binding is local-only. If --host 0.0.0.0 is used, never expose or "
@@ -124,7 +125,12 @@ def build_detector(
     *,
     board: BoardConfig | None = None,
     backend_factory: Callable[..., InferencePort] = UltralyticsBackend,
-) -> HybridBoardDetector:
+) -> ClassicalBoardDetector | HybridBoardDetector:
+    if config.backend == "classical":
+        return ClassicalBoardDetector(config)
+    if config.backend != "hybrid":
+        raise ValueError(f"unsupported detection backend: {config.backend}")
+
     def model_loader(candidate: DetectionConfig) -> DetectionBackendSelection:
         return build_detection_backend(candidate, backend_factory=backend_factory)
 
@@ -210,7 +216,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("SAFETY: 0.0.0.0 is for a trusted LAN only; do not expose or port-forward this service.")
     else:
         print("Network: local-only binding. Use --host 0.0.0.0 only on a trusted LAN.")
-    print("SAFETY: keep the 405 nm laser physically disconnected and OFF during tuning.")
+    print("SAFETY: the 405 nm laser is hardware-always-on whenever powered; Jetson and protocol V2 cannot turn it off, so software cannot make it safe.")
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
     return 0
 

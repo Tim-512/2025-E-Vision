@@ -10,6 +10,7 @@ from typing import Callable, Mapping, Protocol
 import numpy as np
 
 from ev_vision.config import CameraConfig, DetectionConfig
+from ev_vision.detection.contracts import ClassicalBoardResult, ClassicalCandidateEvaluation
 from ev_vision.detection.failures import CandidateEvaluation, HybridBoardResult
 from ev_vision.models import BoardObservation, Frame
 from ev_vision.tuning.diagnostics import compute_diagnostics
@@ -47,7 +48,7 @@ class DetectorPort(Protocol):
         source_sequence: int,
         include_debug: bool = False,
         update_tracker: bool = True,
-    ) -> HybridBoardResult:
+    ) -> HybridBoardResult | ClassicalBoardResult:
         raise NotImplementedError
 
     def reset(self) -> None:
@@ -515,6 +516,11 @@ class CameraTuningService:
                         self._active_mutations -= 1
                 self._finish_shutdown_after_mutation()
 
+    @property
+    def active_camera(self) -> CameraPort | None:
+        with self._lock:
+            return self._camera
+
     def applied_parameters(self) -> EditableCameraParameters:
         with self._lock:
             return self._applied
@@ -602,24 +608,23 @@ class CameraTuningService:
         detector = self._detector
         if detector is None:
             return None
-        result = self._detect_hybrid(
+        result = self._detect_board(
             detector,
             frame,
             include_debug=True,
             update_tracker=False,
         )
-        if not isinstance(result, HybridBoardResult):
-            raise RuntimeError("configured detector does not support hybrid debug results")
-        if result.source_sequence != frame.sequence:
-            return None
-        return DetectionDebugSnapshot(
-            result.source_sequence, copy_debug_images(result.debug_images)
-        )
+        return self._debug_snapshot_for_result(result, frame)
 
     def reload_detection_model(self) -> None:
         detector = self._detector
         if detector is None:
             raise RuntimeError("no detector is configured")
+        if str(getattr(detector, "model_backend", "none")) == "classical":
+            with self._lock:
+                self._invalidate_detection_for_reload_locked(detector)
+            self._notify_analysis_worker(self._detection_wakeup)
+            return
         reload_model = getattr(detector, "reload_model", None)
         if not callable(reload_model):
             raise RuntimeError("configured detector does not support model reload")
@@ -1314,7 +1319,7 @@ class CameraTuningService:
             if item is not None:
                 key, frame = item
                 try:
-                    result = self._detect_hybrid(
+                    result = self._detect_board(
                         detector,
                         frame,
                         include_debug=False,
@@ -1362,19 +1367,19 @@ class CameraTuningService:
             )
 
     @staticmethod
-    def _detect_hybrid(
+    def _detect_board(
         detector: DetectorPort,
         frame: Frame,
         *,
         include_debug: bool,
         update_tracker: bool,
-    ) -> HybridBoardResult | BoardObservation | None:
+    ) -> HybridBoardResult | ClassicalBoardResult | BoardObservation | None:
         parameters = inspect.signature(detector.detect).parameters
-        supports_hybrid = all(
+        supports_structured = all(
             name in parameters
             for name in ("source_sequence", "include_debug", "update_tracker")
         )
-        if supports_hybrid:
+        if supports_structured:
             return detector.detect(
                 frame.image,
                 captured_ns=frame.captured_ns,
@@ -1384,21 +1389,62 @@ class CameraTuningService:
             )
         if include_debug or not update_tracker:
             raise RuntimeError(
-                "configured detector does not support hybrid debug results"
+                "configured detector does not support structured debug results"
             )
         return detector.detect(frame.image, captured_ns=frame.captured_ns)  # type: ignore[call-arg]
 
     @staticmethod
     def _snapshot_for_result(
-        result: HybridBoardResult | BoardObservation | None,
+        result: HybridBoardResult | ClassicalBoardResult | BoardObservation | None,
         frame: Frame,
     ) -> DetectionSnapshot:
+        if isinstance(result, ClassicalBoardResult):
+            observation = None
+            if result.detected and result.center_px is not None:
+                observation = BoardObservation(
+                    captured_ns=result.timestamp_ns,
+                    corners_px=tuple(result.corners_px),
+                    center_px=result.center_px,
+                    confidence=result.confidence,
+                    homography_valid=result.homography_valid,
+                )
+            rejection_reasons = tuple(getattr(result, "rejection_reasons", ())) or tuple(
+                reason
+                for candidate in result.candidates
+                for reason in candidate.rejection_reasons
+            )
+            return DetectionSnapshot(
+                enabled=True, detected=result.detected,
+                source_sequence=result.source_sequence, observation=observation,
+                target_valid=result.target_valid, tracking_state=result.tracking_state,
+                observation_source=CameraTuningService._enum_value(result.observation_source) or "NONE",
+                confidence=float(result.confidence),
+                scale_px_per_mm=result.scale_px_per_mm,
+                velocity_px_s=result.velocity_px_s,
+                predicted_frames=int(result.predicted_frames),
+                source_age_us=int(result.source_age_us),
+                near_image_edge=bool(result.near_image_edge),
+                partially_outside=bool(result.partially_outside),
+                rejection_reasons=rejection_reasons,
+                model_state="READY", model_backend="classical", model_path=None,
+                combined_score=float(result.confidence),
+                candidate_count=len(result.candidates),
+                failure_reason=CameraTuningService._enum_value(result.failure_reason),
+                inference_ms=float(result.timings_ms.get("detection", 0.0)),
+                geometry_ms=float(result.timings_ms.get("geometry", 0.0)),
+                total_ms=float(result.timings_ms.get("total", 0.0)),
+                homography_valid=result.homography_valid,
+                target_x_mm=result.target_x_mm, target_y_mm=result.target_y_mm,
+                corners_px=tuple(result.corners_px), center_px=result.center_px,
+                candidates=tuple(
+                    CameraTuningService._classical_candidate_snapshot(candidate)
+                    for candidate in result.candidates
+                ),
+            )
         if not isinstance(result, HybridBoardResult):
             return DetectionSnapshot(
-                enabled=True,
-                detected=result is not None,
-                source_sequence=frame.sequence,
-                observation=result,
+                enabled=True, detected=result is not None,
+                source_sequence=frame.sequence, observation=result,
             )
         observation = None
         corners = tuple(result.corners_px or ())
@@ -1443,6 +1489,37 @@ class CameraTuningService:
             corners_px=corners,
             center_px=result.center_px,
             candidates=candidates,
+        )
+
+    @staticmethod
+    def _debug_snapshot_for_result(
+        result: HybridBoardResult | ClassicalBoardResult | BoardObservation | None,
+        frame: Frame,
+    ) -> DetectionDebugSnapshot | None:
+        if not isinstance(result, (HybridBoardResult, ClassicalBoardResult)):
+            raise RuntimeError("configured detector does not support structured debug results")
+        if result.source_sequence != frame.sequence:
+            return None
+        return DetectionDebugSnapshot(
+            result.source_sequence, copy_debug_images(result.debug_images)
+        )
+
+    @staticmethod
+    def _classical_candidate_snapshot(
+        candidate: ClassicalCandidateEvaluation,
+    ) -> DetectionCandidateSnapshot:
+        xs = tuple(point[0] for point in candidate.corners_px)
+        ys = tuple(point[1] for point in candidate.corners_px)
+        xyxy = (min(xs), min(ys), max(xs), max(ys)) if xs and ys else (0.0, 0.0, 0.0, 0.0)
+        return DetectionCandidateSnapshot(
+            xyxy_px=tuple(float(value) for value in xyxy),
+            accepted=candidate.accepted, model_confidence=0.0,
+            geometry_score=float(candidate.geometry_score),
+            edge_support_score=float(candidate.ring_score),
+            structure_score=float(candidate.white_score),
+            temporal_score=float(candidate.temporal_score),
+            combined_score=float(candidate.combined_score),
+            failure_reason=CameraTuningService._enum_value(candidate.failure_reason),
         )
 
     @staticmethod

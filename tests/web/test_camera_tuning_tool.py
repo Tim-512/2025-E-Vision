@@ -29,7 +29,22 @@ def test_parser_defaults_and_safety_help() -> None:
     assert "0.0.0.0" in help_text
     assert "trusted lan" in help_text
     assert "laser" in help_text
-    assert "off" in help_text
+    assert "hardware-always-on" in help_text
+    assert "jetson/v2" in help_text and "cannot" in help_text
+
+
+def test_build_detector_uses_classical_without_model_factory() -> None:
+    from ev_vision.config import BoardConfig, DetectionConfig
+    from ev_vision.detection.classical_board import ClassicalBoardDetector
+    from ev_vision.web.camera_tuning_server import build_detector
+
+    detector = build_detector(
+        DetectionConfig(backend="classical"),
+        board=BoardConfig(),
+        backend_factory=lambda *_args, **_kwargs: pytest.fail("YOLO factory called"),
+    )
+
+    assert isinstance(detector, ClassicalBoardDetector)
 
 
 def test_parser_rejects_non_positive_rates_ports_and_timeout() -> None:
@@ -138,7 +153,8 @@ def test_main_prints_safety_and_runs_uvicorn(monkeypatch, capsys) -> None:
     assert recorded == {"app": fake_app, "host": "0.0.0.0", "port": 8123, "log_level": "warning"}
     output = capsys.readouterr().out.lower()
     assert "trusted lan" in output
-    assert "laser" in output and "off" in output
+    assert "laser" in output and "hardware-always-on" in output
+    assert "cannot make it safe" in output
     assert "http://0.0.0.0:8123" in output
 
 
@@ -207,6 +223,7 @@ def test_server_prefers_engine_then_falls_back_to_onnx(tmp_path: Path) -> None:
     onnx.write_bytes(b"onnx")
     loader = _RecordingBackendFactory(fail_paths={engine})
     config = DetectionConfig(
+        backend="hybrid",
         model=ModelDetectionConfig(
             path=str(engine),
             fallback_path=str(onnx),
@@ -267,6 +284,7 @@ def test_missing_models_builds_invalid_diagnostic_detector_without_blocking_app(
     from ev_vision.detection.failures import DetectionFailure
 
     detection = DetectionConfig(
+        backend="hybrid",
         model=ModelDetectionConfig(
             path=str(tmp_path / "missing.engine"),
             fallback_path=str(tmp_path / "missing.onnx"),
