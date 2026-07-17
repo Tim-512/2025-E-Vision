@@ -536,3 +536,39 @@ def test_hybrid_overlay_draws_candidate_decisions_and_tracking_semantics(monkeyp
     assert "valid" in overlay_text.lower()
     assert "score=0.860" in overlay_text
     assert "GEOMETRY_REJECTED" in overlay_text
+
+
+def test_dashboard_contains_classical_controls_and_status() -> None:
+    joined = (_static_text("camera-tuning.html") + _static_text("camera-tuning.js")).lower()
+    for token in (
+        "clahe-clip-limit", "min-white-occupancy",
+        "ring-ratio-tolerance", "min-arc-coverage",
+        "predict-max-frames", "predict-max-ms",
+        "observation-source", "predicted-frames",
+        "normalized-gray", "white-mask", "edge-mask",
+        "ring-arcs", "candidate-scores",
+    ):
+        assert token in joined
+    assert "red-threshold" not in joined
+    assert "hsv" not in joined
+
+
+def test_classical_hides_model_reload_and_uses_sequence_matched_debug() -> None:
+    script = _static_text("camera-tuning.js")
+    assert 'backend === "classical"' in script
+    assert 'modelReloadButton.hidden = classical' in script
+    assert '"?sequence=" + encodeURIComponent(sourceSequence)' in script
+
+
+def test_detection_apply_does_not_touch_camera_or_reload_routes() -> None:
+    script = _static_text("camera-tuning.js")
+    function = _javascript_function(script, "applyDetectionConfig")
+    assert 'api("/api/detection/config"' in function
+    assert "/api/parameters" not in function
+    assert "/api/detection/model/reload" not in function
+
+
+def test_dashboard_states_hardware_always_on_laser_is_not_software_safe() -> None:
+    joined = (_static_text("camera-tuning.html") + _static_text("camera-tuning.js")).lower()
+    for token in ("hardware-always-on", "jetson/v2", "cannot control", "software cannot make it safe"):
+        assert token in joined

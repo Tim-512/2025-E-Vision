@@ -253,8 +253,22 @@ function updateDiagnostics(payload) {
   drawRoi(data);
 }
 
+function updateBackendVisibility(config) {
+  const classical = config.backend === "classical";
+  const classicalControls = $("classical-controls");
+  const hybridControls = $("hybrid-controls");
+  const modelReloadButton = $("reload-detection-model");
+  classicalControls.hidden = !classical;
+  hybridControls.hidden = classical;
+  modelReloadButton.hidden = classical;
+  $("hybrid-model-status").hidden = classical;
+  $("classical-debug-grid").hidden = !classical;
+  $("detection-backend-badge").textContent = classical ? "CLASSICAL" : "HYBRID";
+}
+
 function renderDetectionConfig(config) {
   detectionConfig = config;
+  updateBackendVisibility(config);
   $("detection-confidence-threshold").value = config.model.confidence_threshold;
   $("detection-max-candidates").value = config.model.max_candidates;
   $("detection-canny-low").value = config.roi_geometry.canny_low;
@@ -266,31 +280,66 @@ function renderDetectionConfig(config) {
   $("detection-structure-weight").value = config.candidate_scoring.structure_weight;
   $("detection-temporal-weight").value = config.candidate_scoring.temporal_weight;
   $("detection-ambiguity-margin").value = config.candidate_scoring.ambiguity_margin;
+  $("clahe-clip-limit").value = config.normalization.clahe_clip_limit;
+  $("min-white-occupancy").value = config.white_board.min_white_occupancy;
+  $("ring-ratio-tolerance").value = config.rings.ratio_tolerance;
+  $("min-arc-coverage").value = config.rings.min_arc_coverage;
+  $("classical-tracking-threshold").value = config.classical_scoring.tracking_threshold;
+  $("classical-acquisition-threshold").value = config.classical_scoring.acquisition_threshold;
   $("detection-confirm-frames").value = config.tracking.confirm_frames;
   $("detection-predict-frames").value = config.tracking.predict_frames;
+  $("predict-max-frames").value = config.tracking.predict_max_frames;
+  $("predict-max-ms").value = config.tracking.predict_max_ms;
   $("detection-lost-frames").value = config.tracking.lost_frames;
   $("detection-max-center-jump-px").value = config.tracking.max_center_jump_px;
   $("detection-max-result-age-ms").value = config.tracking.max_result_age_ms;
 }
 
 function readDetectionConfigForm() {
-  const value = JSON.parse(JSON.stringify(detectionConfig));
-  value.model.confidence_threshold = Number($("detection-confidence-threshold").value);
-  value.model.max_candidates = Number($("detection-max-candidates").value);
-  value.roi_geometry.canny_low = Number($("detection-canny-low").value);
-  value.roi_geometry.canny_high = Number($("detection-canny-high").value);
-  value.roi_geometry.min_edge_support = Number($("detection-min-edge-support").value);
-  value.roi_geometry.min_geometry_score = Number($("detection-min-geometry-score").value);
-  value.candidate_scoring.model_weight = Number($("detection-model-weight").value);
-  value.candidate_scoring.geometry_weight = Number($("detection-geometry-weight").value);
-  value.candidate_scoring.structure_weight = Number($("detection-structure-weight").value);
-  value.candidate_scoring.temporal_weight = Number($("detection-temporal-weight").value);
-  value.candidate_scoring.ambiguity_margin = Number($("detection-ambiguity-margin").value);
-  value.tracking.confirm_frames = Number($("detection-confirm-frames").value);
-  value.tracking.predict_frames = Number($("detection-predict-frames").value);
-  value.tracking.lost_frames = Number($("detection-lost-frames").value);
-  value.tracking.max_center_jump_px = Number($("detection-max-center-jump-px").value);
-  value.tracking.max_result_age_ms = Number($("detection-max-result-age-ms").value);
+  const classical = detectionConfig.backend === "classical";
+  const value = {
+    backend: detectionConfig.backend,
+    tracking: {
+      confirm_frames: Number($("detection-confirm-frames").value),
+      predict_frames: Number($("detection-predict-frames").value),
+      predict_max_frames: Number($("predict-max-frames").value),
+      predict_max_ms: Number($("predict-max-ms").value),
+      lost_frames: Number($("detection-lost-frames").value),
+      max_center_jump_px: Number($("detection-max-center-jump-px").value),
+      max_result_age_ms: Number($("detection-max-result-age-ms").value),
+    },
+  };
+  if (classical) {
+    value.normalization = {clahe_clip_limit: Number($("clahe-clip-limit").value)};
+    value.white_board = {min_white_occupancy: Number($("min-white-occupancy").value)};
+    value.rings = {
+      ratio_tolerance: Number($("ring-ratio-tolerance").value),
+      min_arc_coverage: Number($("min-arc-coverage").value),
+    };
+    value.classical_scoring = {
+      tracking_threshold: Number($("classical-tracking-threshold").value),
+      acquisition_threshold: Number($("classical-acquisition-threshold").value),
+    };
+  } else {
+    value.model = {
+      confidence_threshold: Number($("detection-confidence-threshold").value),
+      max_candidates: Number($("detection-max-candidates").value),
+    };
+    value.roi_geometry = {
+      ...detectionConfig.roi_geometry,
+      canny_low: Number($("detection-canny-low").value),
+      canny_high: Number($("detection-canny-high").value),
+      min_edge_support: Number($("detection-min-edge-support").value),
+      min_geometry_score: Number($("detection-min-geometry-score").value),
+    };
+    value.candidate_scoring = {
+      model_weight: Number($("detection-model-weight").value),
+      geometry_weight: Number($("detection-geometry-weight").value),
+      structure_weight: Number($("detection-structure-weight").value),
+      temporal_weight: Number($("detection-temporal-weight").value),
+      ambiguity_margin: Number($("detection-ambiguity-margin").value),
+    };
+  }
   return value;
 }
 
@@ -301,45 +350,75 @@ function renderDetectionStatus(status) {
   $("detection-model-path").textContent = status.model_path || "--";
   $("detection-tracking-state").textContent = status.tracking_state || "--";
   $("detection-failure-reason").textContent = status.failure_reason || "NONE";
+  $("observation-source").textContent = status.observation_source || "NONE";
+  $("detection-source-age").textContent = `Source age ${status.source_age_us == null ? "--" : (finiteNumber(status.source_age_us) / 1000).toFixed(1)} ms`;
   $("detection-target-valid").textContent = status.target_valid ? "目标有效" : "目标无效";
   $("detection-confirmation-count").textContent = status.confirmation_count ?? 0;
   $("detection-miss-count").textContent = status.miss_count ?? 0;
-  $("detection-result-age").textContent = `结果年龄 ${status.result_age_ms == null ? "--" : finiteNumber(status.result_age_ms).toFixed(1)} ms`;
+  $("predicted-frames").textContent = status.predicted_frames ?? 0;
+  $("detection-result-age").textContent = `Result age ${status.result_age_ms == null ? "--" : finiteNumber(status.result_age_ms).toFixed(1)} ms`;
+  $("detection-edge-flags").textContent = `Near edge ${Boolean(status.near_image_edge)} / partially outside ${Boolean(status.partially_outside)}`;
+  $("detection-confidence").textContent = finiteNumber(status.confidence).toFixed(3);
+  const velocity = Array.isArray(status.velocity_px_s) ? status.velocity_px_s.map((item) => finiteNumber(item).toFixed(1)).join(", ") : "--";
+  $("detection-motion").textContent = `?? ${velocity} px/s / ?? ${status.scale_px_per_mm == null ? "--" : finiteNumber(status.scale_px_per_mm).toFixed(3)} px/mm`;
+  $("detection-rejection-reasons").textContent = (status.rejection_reasons || []).join("; ") || "NONE";
   $("detection-candidate-count").textContent = status.candidate_count ?? 0;
-  $("detection-latency").textContent = `推理 ${finiteNumber(status.inference_ms).toFixed(1)} / 几何 ${finiteNumber(status.geometry_ms).toFixed(1)} / 总计 ${finiteNumber(status.total_ms).toFixed(1)} ms`;
-  $("detection-score-components").textContent = `M ${finiteNumber(status.model_confidence).toFixed(3)} · G ${finiteNumber(status.geometry_score).toFixed(3)} · E ${finiteNumber(status.edge_support_score).toFixed(3)} · S ${finiteNumber(status.structure_score).toFixed(3)} · T ${finiteNumber(status.temporal_score).toFixed(3)} · C ${finiteNumber(status.combined_score).toFixed(3)}`;
+  $("detection-latency").textContent = `?? ${finiteNumber(status.inference_ms).toFixed(1)} / ?? ${finiteNumber(status.geometry_ms).toFixed(1)} / ?? ${finiteNumber(status.total_ms).toFixed(1)} ms`;
+  $("detection-score-components").textContent = `M ${finiteNumber(status.model_confidence).toFixed(3)} ? G ${finiteNumber(status.geometry_score).toFixed(3)} ? E ${finiteNumber(status.edge_support_score).toFixed(3)} ? S ${finiteNumber(status.structure_score).toFixed(3)} ? T ${finiteNumber(status.temporal_score).toFixed(3)} ? C ${finiteNumber(status.combined_score).toFixed(3)}`;
   const list = $("detection-candidate-list"); list.replaceChildren();
   (status.candidates || []).forEach((candidate, index) => {
     const item = document.createElement("li");
     if (!candidate.accepted) item.className = "rejected";
-    item.textContent = `#${index + 1} M ${finiteNumber(candidate.model_confidence).toFixed(3)} G ${finiteNumber(candidate.geometry_score).toFixed(3)} E ${finiteNumber(candidate.edge_support_score).toFixed(3)} S ${finiteNumber(candidate.structure_score).toFixed(3)} T ${finiteNumber(candidate.temporal_score).toFixed(3)} C ${finiteNumber(candidate.combined_score).toFixed(3)} ${candidate.failure_reason || "ACCEPTED"}`;
+    item.textContent = `#${index + 1} C ${finiteNumber(candidate.combined_score).toFixed(3)} ${candidate.failure_reason || "ACCEPTED"}`;
     list.append(item);
   });
+  if (!list.children.length) list.append(document.createElement("li"));
 }
 
 async function refreshDetectionStatus() {
   const status = await api("/api/detection/status");
   renderDetectionStatus(status);
+  if (detectionConfig && detectionConfig.backend === "classical") refreshClassicalDebug(status.source_sequence);
 }
 
 async function applyDetectionConfig() {
   const button = $("apply-detection-config"); button.disabled = true;
-  try { renderDetectionConfig(await api("/api/detection/config", {method:"PUT", body:JSON.stringify(readDetectionConfigForm())})); setMessage("检测参数已应用。", "success"); }
-  catch (error) { reportError("应用检测参数失败", error); }
+  try {
+    const applied = await api("/api/detection/config", {method: "PUT", body: JSON.stringify(readDetectionConfigForm())});
+    renderDetectionConfig(applied);
+    setMessage("Detection settings applied without restarting camera acquisition.", "success");
+  } catch (error) { reportError("Reload model failed", error); }
   finally { button.disabled = false; }
 }
 
 async function reloadDetectionModel() {
   const button = $("reload-detection-model"); button.disabled = true;
-  try { renderDetectionStatus(await api("/api/detection/model/reload", {method:"POST", body:"{}"})); setMessage("模型已重新加载。", "success"); }
-  catch (error) { reportError("重新加载模型失败", error); }
+  try { renderDetectionStatus(await api("/api/detection/model/reload", {method:"POST", body:"{}"})); setMessage("Reload model failed", "success"); }
+  catch (error) { reportError("Reload model failed", error); }
   finally { button.disabled = false; }
+}
+
+function setDebugImage(name, sourceSequence) {
+  const query = sourceSequence == null
+    ? ""
+    : "?sequence=" + encodeURIComponent(sourceSequence);
+  const selected = $("detection-debug-image");
+  selected.src = "/api/detection/debug/" + encodeURIComponent(name) + query + (query ? "&" : "?") + "t=" + Date.now();
+}
+
+function refreshClassicalDebug(sourceSequence) {
+  const names = ["normalized-gray", "white-mask", "edge-mask", "ring-arcs", "candidate-scores"];
+  names.forEach((name) => {
+    const image = $("debug-" + name);
+    const query = sourceSequence == null ? "" : "?sequence=" + encodeURIComponent(sourceSequence);
+    image.src = "/api/detection/debug/" + encodeURIComponent(name) + query + (query ? "&" : "?") + "t=" + Date.now();
+  });
 }
 
 async function refreshDetectionDebug() {
   const view = $("detection-debug-view").value;
   if (!view || latestDetectionSequence == null) { $("detection-debug-image").hidden = true; return; }
-  $("detection-debug-image").src = `/api/detection/debug/${encodeURIComponent(view)}?sequence=${latestDetectionSequence}&t=${Date.now()}`;
+  setDebugImage(view, latestDetectionSequence);
   $("detection-debug-image").hidden = false;
 }
 

@@ -130,42 +130,87 @@
     </section>
 
     <section class="panel detection-panel" aria-labelledby="detection-title">
-      <div class="panel-heading compact"><div><p class="section-kicker">HYBRID DETECTION</p><h2 id="detection-title">混合靶面检测</h2></div></div>
-      <div class="detection-status-grid">
-        <article>模型 <strong id="detection-model-state">--</strong><small id="detection-model-backend">--</small><small id="detection-model-path">--</small></article>
-        <article>跟踪 <strong id="detection-tracking-state">--</strong><small id="detection-failure-reason">--</small></article>
-        <article>目标有效性 <strong id="detection-target-valid">--</strong><small id="detection-result-age">结果年龄 -- ms</small></article>
-        <article>检测速率 <strong id="detection-processing-rate">--</strong><small>FPS</small></article>
-        <article>时序计数 <strong><span id="detection-confirmation-count">--</span> / <span id="detection-miss-count">--</span></strong><small>确认帧 / 丢失帧</small></article>
-        <article>候选 <strong id="detection-candidate-count">--</strong><small id="detection-latency">--</small></article>
-        <article class="wide">评分分量 <strong id="detection-score-components">--</strong><small>M 模型 / G 几何 / E 边缘 / S 结构 / T 时序 / C 综合</small></article>
+      <div class="panel-heading compact">
+        <div><p class="section-kicker">TARGET DETECTION</p><h2 id="detection-title">Target detection and tracking</h2></div>
+        <span id="detection-backend-badge" class="draft-badge">--</span>
       </div>
-      <ol id="detection-candidate-list" class="candidate-list"><li>等待候选</li></ol>
+      <aside class="laser-safety-warning" role="alert">
+        LASER SAFETY: 405 nm laser is hardware-always-on whenever powered. Jetson/V2 cannot control or switch it off; software cannot make it safe. Disconnect laser power before entering the beam path.
+      </aside>
+      <div class="detection-status-grid">
+        <article id="hybrid-model-status">Model <strong id="detection-model-state">--</strong><small id="detection-model-backend">--</small><small id="detection-model-path">--</small></article>
+        <article>Tracking <strong id="detection-tracking-state">--</strong><small id="detection-failure-reason">--</small></article>
+        <article>Observation source <strong id="observation-source">--</strong><small id="detection-source-age">Source age -- ms</small></article>
+        <article>Target validity <strong id="detection-target-valid">--</strong><small id="detection-result-age">Result age -- ms</small></article>
+        <article>Detection rate <strong id="detection-processing-rate">--</strong><small>FPS</small></article>
+        <article>Temporal counts <strong><span id="detection-confirmation-count">--</span> / <span id="detection-miss-count">--</span></strong><small>confirm / miss</small></article>
+        <article>Predicted frames <strong id="predicted-frames">--</strong><small id="detection-edge-flags">edge / partial --</small></article>
+        <article>Confidence <strong id="detection-confidence">--</strong><small id="detection-motion">velocity / scale --</small></article>
+        <article>Candidates <strong id="detection-candidate-count">--</strong><small id="detection-latency">--</small></article>
+        <article class="wide">Score components <strong id="detection-score-components">--</strong><small>M model / G geometry / E edge / S structure / T temporal / C combined</small></article>
+        <article class="wide">Rejection reasons <strong id="detection-rejection-reasons">--</strong></article>
+      </div>
+      <ol id="detection-candidate-list" class="candidate-list"><li>Waiting for candidates</li></ol>
       <form id="detection-config-form" class="detection-config-form">
-        <label>置信度<input id="detection-confidence-threshold" type="number" step="0.01"></label>
-        <label>最大候选数<input id="detection-max-candidates" type="number" step="1"></label>
-        <label>Canny 低阈值<input id="detection-canny-low" type="number" step="1"></label>
-        <label>Canny 高阈值<input id="detection-canny-high" type="number" step="1"></label>
-        <label>边缘支持<input id="detection-min-edge-support" type="number" step="0.01"></label>
-        <label>几何阈值<input id="detection-min-geometry-score" type="number" step="0.01"></label>
-        <label>模型权重<input id="detection-model-weight" type="number" step="0.01"></label>
-        <label>几何权重<input id="detection-geometry-weight" type="number" step="0.01"></label>
-        <label>结构权重<input id="detection-structure-weight" type="number" step="0.01"></label>
-        <label>时序权重<input id="detection-temporal-weight" type="number" step="0.01"></label>
-        <label>歧义间隔<input id="detection-ambiguity-margin" type="number" step="0.01"></label>
-        <label>确认帧数<input id="detection-confirm-frames" type="number" step="1"></label>
-        <label>预测帧数<input id="detection-predict-frames" type="number" step="1"></label>
-        <label>丢失帧数<input id="detection-lost-frames" type="number" step="1"></label>
-        <label>最大中心跳变（px）<input id="detection-max-center-jump-px" type="number" step="1"></label>
-        <label>最大结果年龄（ms）<input id="detection-max-result-age-ms" type="number" step="1"></label>
-        <button id="apply-detection-config" type="button" class="button primary">应用检测参数</button>
-        <button id="restore-detection-defaults" type="button" class="button secondary">恢复当前配置</button>
-        <button id="reload-detection-model" type="button" class="button danger">重新加载模型</button>
+        <fieldset id="hybrid-controls" class="control-group">
+          <legend>混合靶面检测 (Hybrid model and ROI)</legend>
+          <label>Confidence threshold<input id="detection-confidence-threshold" type="number" step="0.01"></label>
+          <label>Maximum candidates<input id="detection-max-candidates" type="number" step="1"></label>
+          <label>Canny low<input id="detection-canny-low" type="number" step="1"></label>
+          <label>Canny high<input id="detection-canny-high" type="number" step="1"></label>
+          <label>Minimum edge support<input id="detection-min-edge-support" type="number" step="0.01"></label>
+          <label>Minimum geometry score<input id="detection-min-geometry-score" type="number" step="0.01"></label>
+          <label>Model weight<input id="detection-model-weight" type="number" step="0.01"></label>
+          <label>Geometry weight<input id="detection-geometry-weight" type="number" step="0.01"></label>
+          <label>Structure weight<input id="detection-structure-weight" type="number" step="0.01"></label>
+          <label>Temporal weight<input id="detection-temporal-weight" type="number" step="0.01"></label>
+          <label>Ambiguity margin<input id="detection-ambiguity-margin" type="number" step="0.01"></label>
+        </fieldset>
+        <fieldset id="classical-controls" class="control-group" hidden>
+          <legend>Classical grayscale white-board and concentric rings</legend>
+          <label>CLAHE clip limit<input id="clahe-clip-limit" type="number" step="0.1"></label>
+          <label>Minimum white occupancy<input id="min-white-occupancy" type="number" step="0.01"></label>
+          <label>Ring ratio tolerance<input id="ring-ratio-tolerance" type="number" step="0.01"></label>
+          <label>Minimum arc coverage<input id="min-arc-coverage" type="number" step="0.01"></label>
+          <label>Tracking threshold<input id="classical-tracking-threshold" type="number" step="0.01"></label>
+          <label>Acquisition threshold<input id="classical-acquisition-threshold" type="number" step="0.01"></label>
+        </fieldset>
+        <fieldset class="control-group tracking-controls">
+          <legend>Tracking and bounded prediction</legend>
+          <label>确认帧数<input id="detection-confirm-frames" type="number" step="1"></label>
+          <label>Prediction frames<input id="detection-predict-frames" type="number" step="1"></label>
+          <label>Maximum prediction frames<input id="predict-max-frames" type="number" step="1"></label>
+          <label>Maximum prediction time ms<input id="predict-max-ms" type="number" step="1"></label>
+          <label>Lost frames<input id="detection-lost-frames" type="number" step="1"></label>
+          <label>最大中心跳变 px<input id="detection-max-center-jump-px" type="number" step="1"></label>
+          <label>Maximum result age ms<input id="detection-max-result-age-ms" type="number" step="1"></label>
+        </fieldset>
+        <div class="detection-actions">
+          <button id="apply-detection-config" type="button" class="button primary">Apply detection settings</button>
+          <button id="restore-detection-defaults" type="button" class="button secondary">Restore current configuration</button>
+          <button id="reload-detection-model" type="button" class="button danger">重新加载模型</button>
+        </div>
       </form>
       <div class="detection-debug">
-        <select id="detection-debug-view"><option value="">选择调试视图</option><option value="model-candidates">模型候选</option><option value="roi">ROI</option><option value="roi-edges">ROI 边缘</option><option value="roi-geometry">ROI 几何</option><option value="final-overlay">最终叠加</option></select>
-        <button id="refresh-detection-debug" type="button" class="button secondary">刷新调试图</button>
-        <img id="detection-debug-image" alt="检测调试图" hidden>
+        <label for="detection-debug-view">Debug view</label>
+        <select id="detection-debug-view">
+          <option value="">Select debug view</option>
+          <optgroup label="Classical">
+            <option value="normalized-gray">Normalized gray</option><option value="white-mask">White mask</option><option value="edge-mask">Edge mask</option><option value="ring-arcs">Ring arcs</option><option value="candidate-scores">Candidate scores</option>
+          </optgroup>
+          <optgroup label="Hybrid">
+            <option value="model-candidates">Model candidates</option><option value="geometry-accepted">Geometry accepted</option><option value="geometry-rejected">Geometry rejected</option><option value="roi">ROI</option><option value="roi-edges">ROI edges</option><option value="roi-geometry">ROI geometry</option><option value="final-overlay">Final overlay</option>
+          </optgroup>
+        </select>
+        <button id="refresh-detection-debug" type="button" class="button secondary">Refresh debug image</button>
+        <div class="classical-debug-grid" id="classical-debug-grid">
+          <figure><figcaption>Normalized gray</figcaption><img id="debug-normalized-gray" alt="normalized-gray"></figure>
+          <figure><figcaption>White mask</figcaption><img id="debug-white-mask" alt="white-mask"></figure>
+          <figure><figcaption>Edge mask</figcaption><img id="debug-edge-mask" alt="edge-mask"></figure>
+          <figure><figcaption>Ring arcs</figcaption><img id="debug-ring-arcs" alt="ring-arcs"></figure>
+          <figure><figcaption>Candidate scores</figcaption><img id="debug-candidate-scores" alt="candidate-scores"></figure>
+        </div>
+        <img id="detection-debug-image" alt="Detection debug image" hidden>
       </div>
     </section>
 
