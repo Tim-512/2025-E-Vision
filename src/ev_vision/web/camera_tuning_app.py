@@ -543,6 +543,11 @@ _CAPTURE_RESPONSE_FILES = frozenset(
         "model-candidates.png",
         "geometry-accepted.png",
         "geometry-rejected.png",
+        "normalized-gray.png",
+        "white-mask.png",
+        "edge-mask.png",
+        "ring-arcs.png",
+        "candidate-scores.png",
     }
 )
 

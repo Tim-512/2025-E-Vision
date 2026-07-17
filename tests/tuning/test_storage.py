@@ -497,6 +497,79 @@ def test_capture_saves_only_available_current_hybrid_debug_images(tmp_path: Path
     }
 
 
+def test_classical_capture_saves_current_debug_products(tmp_path: Path) -> None:
+    storage = make_storage(tmp_path)
+    debug_images = {
+        "normalized-gray": np.full((12, 16), 10, dtype=np.uint8),
+        "white-mask": np.full((12, 16), 20, dtype=np.uint8),
+        "edge-mask": np.full((12, 16), 30, dtype=np.uint8),
+        "ring-arcs": np.full((12, 16, 3), 40, dtype=np.uint8),
+        "candidate-scores": np.full((12, 16, 3), 50, dtype=np.uint8),
+    }
+    snapshot = make_capture_snapshot(
+        detection_debug=DetectionDebugSnapshot(source_sequence=42, images=debug_images)
+    )
+    snapshot = replace(
+        snapshot,
+        detection=replace(
+            snapshot.detection,
+            observation_source="FULL_BOARD",
+            confidence=0.91,
+        ),
+    )
+
+    capture_dir = storage.save_capture(snapshot, snapshot.frame.image)
+
+    expected = {
+        "original.png",
+        "overlay.png",
+        "normalized-gray.png",
+        "white-mask.png",
+        "edge-mask.png",
+        "ring-arcs.png",
+        "candidate-scores.png",
+        "metadata.yaml",
+    }
+    assert expected <= {path.name for path in capture_dir.iterdir()}
+    for debug_name, expected_image in debug_images.items():
+        saved = cv2.imdecode(
+            np.fromfile(capture_dir / f"{debug_name}.png", dtype=np.uint8),
+            cv2.IMREAD_UNCHANGED,
+        )
+        assert np.array_equal(saved, expected_image)
+
+    metadata = yaml.safe_load(
+        (capture_dir / "metadata.yaml").read_text(encoding="utf-8")
+    )
+    assert metadata["detection"]["observation_source"] == "FULL_BOARD"
+    assert metadata["detection_debug"] == {
+        "source_sequence": 42,
+        "images": sorted(debug_images),
+    }
+
+
+def test_classical_capture_omits_debug_from_different_sequence(tmp_path: Path) -> None:
+    storage = make_storage(tmp_path)
+    snapshot = make_capture_snapshot(
+        detection_debug=DetectionDebugSnapshot(
+            source_sequence=41,
+            images={
+                "normalized-gray": np.full((12, 16), 10, dtype=np.uint8),
+                "ring-arcs": np.full((12, 16, 3), 40, dtype=np.uint8),
+            },
+        )
+    )
+
+    capture_dir = storage.save_capture(snapshot, snapshot.frame.image)
+
+    assert not (capture_dir / "normalized-gray.png").exists()
+    assert not (capture_dir / "ring-arcs.png").exists()
+    metadata = yaml.safe_load(
+        (capture_dir / "metadata.yaml").read_text(encoding="utf-8")
+    )
+    assert metadata["detection_debug"] is None
+
+
 def test_capture_omits_unavailable_hybrid_debug_images(tmp_path: Path) -> None:
     storage = make_storage(tmp_path)
     snapshot = make_capture_snapshot(

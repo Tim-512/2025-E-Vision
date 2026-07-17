@@ -234,6 +234,11 @@ class FakeStorage:
             "metadata.yaml",
             "model-candidates.png",
             "geometry-accepted.png",
+            "normalized-gray.png",
+            "white-mask.png",
+            "edge-mask.png",
+            "ring-arcs.png",
+            "candidate-scores.png",
         ):
             (capture_dir / name).write_bytes(b"capture")
         (capture_dir / "subdirectory").mkdir(exist_ok=True)
@@ -467,11 +472,16 @@ def test_capture_renders_overlay_saves_snapshot_and_returns_safe_relative_contra
     assert response.json() == {
         "capture": "captures/20260715_010203_456",
         "files": [
+            "candidate-scores.png",
+            "edge-mask.png",
             "geometry-accepted.png",
             "metadata.yaml",
             "model-candidates.png",
+            "normalized-gray.png",
             "original.png",
             "overlay.png",
+            "ring-arcs.png",
+            "white-mask.png",
         ],
     }
     assert storage.saved_capture is not None
@@ -585,5 +595,8 @@ def test_dashboard_contains_required_camera_tuning_controls_without_actuator_con
     assert "/static/camera-tuning.css" in html
     assert "/static/camera-tuning.js" in html
     lowered = html.lower()
-    assert "laser" not in lowered
+    assert "laser safety" in lowered
+    assert "hardware-always-on" in lowered
+    assert "jetson/v2 cannot control" in lowered
+    assert "software cannot make it safe" in lowered
     assert "gimbal" not in lowered

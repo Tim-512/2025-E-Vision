@@ -35,6 +35,11 @@ _CAPTURE_DEBUG_FILES = {
     "model-candidates": "model-candidates.png",
     "geometry-accepted": "geometry-accepted.png",
     "geometry-rejected": "geometry-rejected.png",
+    "normalized-gray": "normalized-gray.png",
+    "white-mask": "white-mask.png",
+    "edge-mask": "edge-mask.png",
+    "ring-arcs": "ring-arcs.png",
+    "candidate-scores": "candidate-scores.png",
 }
 
 
@@ -625,17 +630,17 @@ def _remove_directory_if_identity_matches(
     path: Path, expected: _PathIdentity
 ) -> bool:
     """Best-effort cleanup without recursively deleting a public path."""
+    debug_files = tuple(_CAPTURE_DEBUG_FILES.values())
     known_files = (
         "original.tmp.png",
         "original.png",
         "overlay.tmp.png",
         "overlay.png",
-        "model-candidates.tmp.png",
-        "model-candidates.png",
-        "geometry-accepted.tmp.png",
-        "geometry-accepted.png",
-        "geometry-rejected.tmp.png",
-        "geometry-rejected.png",
+        *(
+            name
+            for filename in debug_files
+            for name in (f"{filename.removesuffix('.png')}.tmp.png", filename)
+        ),
         "metadata.yaml",
     )
     try:
