@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, Mapping, TypeVar
 
@@ -121,23 +121,97 @@ class CandidateScoringConfig:
 
 
 @dataclass(frozen=True)
+class ImageNormalizationConfig:
+    gaussian_kernel: int = 3
+    clahe_clip_limit: float = 2.0
+    clahe_grid_size: int = 8
+    illumination_kernel: int = 81
+    white_percentile: float = 72.0
+    white_local_offset: float = 10.0
+    saturation_threshold: int = 250
+    canny_low: int = 40
+    canny_high: int = 120
+
+
+@dataclass(frozen=True)
+class WhiteBoardConfig:
+    expected_aspect_ratio: float = 210.0 / 297.0
+    aspect_ratio_tolerance: float = 0.24
+    min_area_fraction: float = 0.015
+    max_area_fraction: float = 0.92
+    min_white_occupancy: float = 0.58
+    max_texture_std: float = 58.0
+    min_convexity: float = 0.90
+    min_side_px: float = 45.0
+    border_band_fraction: float = 0.045
+
+
+@dataclass(frozen=True)
+class RingGeometryConfig:
+    expected_radius_ratios: tuple[float, ...] = (1.0, 2.0, 3.0, 4.0, 5.0)
+    ratio_tolerance: float = 0.18
+    center_tolerance_fraction: float = 0.08
+    min_arc_coverage: float = 0.18
+    min_multiple_arcs: int = 2
+    max_single_arc_frames: int = 2
+    saturation_mask_radius_px: int = 12
+
+
+@dataclass(frozen=True)
+class ClassicalScoringConfig:
+    white_weight: float = 0.24
+    geometry_weight: float = 0.22
+    ring_weight: float = 0.30
+    border_weight: float = 0.08
+    temporal_weight: float = 0.16
+    acquisition_threshold: float = 0.66
+    tracking_threshold: float = 0.52
+    ambiguity_margin: float = 0.08
+    max_texture_penalty: float = 0.20
+
+    @property
+    def weights(self) -> tuple[float, float, float, float, float]:
+        return (
+            self.white_weight,
+            self.geometry_weight,
+            self.ring_weight,
+            self.border_weight,
+            self.temporal_weight,
+        )
+
+
+@dataclass(frozen=True)
 class BoardTrackingConfig:
     confirm_frames: int = 3
     predict_frames: int = 2
-    lost_frames: int = 3
+    predict_max_frames: int = 3
+    predict_max_ms: float = 150.0
+    lost_frames: int = 4
+    max_single_arc_frames: int = 2
     max_center_jump_px: float = 160.0
+    max_scale_jump_fraction: float = 0.30
+    max_velocity_px_s: float = 5000.0
+    max_acceleration_px_s2: float = 30000.0
     max_result_age_ms: float = 100.0
 
 
 @dataclass(frozen=True)
 class DetectionConfig:
-    backend: str = "hybrid"
+    backend: str = "classical"
     model: ModelDetectionConfig = field(default_factory=ModelDetectionConfig)
     roi_geometry: RoiGeometryConfig = field(default_factory=RoiGeometryConfig)
     candidate_scoring: CandidateScoringConfig = field(
         default_factory=CandidateScoringConfig
     )
     tracking: BoardTrackingConfig = field(default_factory=BoardTrackingConfig)
+    normalization: ImageNormalizationConfig = field(
+        default_factory=ImageNormalizationConfig
+    )
+    white_board: WhiteBoardConfig = field(default_factory=WhiteBoardConfig)
+    rings: RingGeometryConfig = field(default_factory=RingGeometryConfig)
+    classical_scoring: ClassicalScoringConfig = field(
+        default_factory=ClassicalScoringConfig
+    )
 
 
 @dataclass(frozen=True)
@@ -165,6 +239,10 @@ _DETECTION_SECTIONS: dict[str, type[Any]] = {
     "roi_geometry": RoiGeometryConfig,
     "candidate_scoring": CandidateScoringConfig,
     "tracking": BoardTrackingConfig,
+    "normalization": ImageNormalizationConfig,
+    "white_board": WhiteBoardConfig,
+    "rings": RingGeometryConfig,
+    "classical_scoring": ClassicalScoringConfig,
 }
 
 
@@ -314,11 +392,155 @@ def _validate_detection(cfg: DetectionConfig) -> None:
 
     _positive_integer("detection.tracking.confirm_frames", cfg.tracking.confirm_frames)
     _positive_integer("detection.tracking.predict_frames", cfg.tracking.predict_frames)
+    _positive_integer(
+        "detection.tracking.predict_max_frames", cfg.tracking.predict_max_frames
+    )
+    _positive("detection.tracking.predict_max_ms", cfg.tracking.predict_max_ms)
     _positive_integer("detection.tracking.lost_frames", cfg.tracking.lost_frames)
+    _positive_integer(
+        "detection.tracking.max_single_arc_frames",
+        cfg.tracking.max_single_arc_frames,
+    )
+    if cfg.tracking.max_single_arc_frames > cfg.tracking.predict_max_frames:
+        raise ConfigError(
+            "detection.tracking.max_single_arc_frames must not exceed "
+            "predict_max_frames"
+        )
     _positive(
         "detection.tracking.max_center_jump_px", cfg.tracking.max_center_jump_px
     )
+    _positive(
+        "detection.tracking.max_scale_jump_fraction",
+        cfg.tracking.max_scale_jump_fraction,
+    )
+    _positive(
+        "detection.tracking.max_velocity_px_s", cfg.tracking.max_velocity_px_s
+    )
+    _positive(
+        "detection.tracking.max_acceleration_px_s2",
+        cfg.tracking.max_acceleration_px_s2,
+    )
     _positive("detection.tracking.max_result_age_ms", cfg.tracking.max_result_age_ms)
+
+    for name in ("gaussian_kernel", "illumination_kernel"):
+        value = getattr(cfg.normalization, name)
+        _positive_integer(f"detection.normalization.{name}", value)
+        if value % 2 == 0:
+            raise ConfigError(f"detection.normalization.{name} must be odd")
+    _positive_integer(
+        "detection.normalization.clahe_grid_size",
+        cfg.normalization.clahe_grid_size,
+    )
+    _positive(
+        "detection.normalization.clahe_clip_limit",
+        cfg.normalization.clahe_clip_limit,
+    )
+    _unit_interval(
+        "detection.normalization.white_percentile",
+        cfg.normalization.white_percentile / 100.0,
+    )
+    _non_negative(
+        "detection.normalization.white_local_offset",
+        cfg.normalization.white_local_offset,
+    )
+    for name in ("saturation_threshold", "canny_low", "canny_high"):
+        value = _non_negative_integer(
+            f"detection.normalization.{name}", getattr(cfg.normalization, name)
+        )
+        if value > 255:
+            raise ConfigError(f"detection.normalization.{name} must be within [0, 255]")
+    if cfg.normalization.canny_low >= cfg.normalization.canny_high:
+        raise ConfigError(
+            "detection.normalization.canny_low must be less than canny_high"
+        )
+
+    _positive(
+        "detection.white_board.expected_aspect_ratio",
+        cfg.white_board.expected_aspect_ratio,
+    )
+    _non_negative(
+        "detection.white_board.aspect_ratio_tolerance",
+        cfg.white_board.aspect_ratio_tolerance,
+    )
+    _positive(
+        "detection.white_board.min_area_fraction",
+        cfg.white_board.min_area_fraction,
+    )
+    _positive(
+        "detection.white_board.max_area_fraction",
+        cfg.white_board.max_area_fraction,
+    )
+    if cfg.white_board.min_area_fraction >= cfg.white_board.max_area_fraction:
+        raise ConfigError(
+            "detection.white_board.min_area_fraction must be less than "
+            "max_area_fraction"
+        )
+    _unit_interval(
+        "detection.white_board.min_white_occupancy",
+        cfg.white_board.min_white_occupancy,
+    )
+    _positive(
+        "detection.white_board.max_texture_std", cfg.white_board.max_texture_std
+    )
+    _unit_interval(
+        "detection.white_board.min_convexity", cfg.white_board.min_convexity
+    )
+    _positive("detection.white_board.min_side_px", cfg.white_board.min_side_px)
+    _positive(
+        "detection.white_board.border_band_fraction",
+        cfg.white_board.border_band_fraction,
+    )
+
+    ratios = tuple(cfg.rings.expected_radius_ratios)
+    if not ratios or any(
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value <= 0
+        for value in ratios
+    ) or any(left >= right for left, right in zip(ratios, ratios[1:])):
+        raise ConfigError(
+            "detection.rings.expected_radius_ratios must be finite, positive, "
+            "and strictly increasing"
+        )
+    _positive("detection.rings.ratio_tolerance", cfg.rings.ratio_tolerance)
+    _positive(
+        "detection.rings.center_tolerance_fraction",
+        cfg.rings.center_tolerance_fraction,
+    )
+    _unit_interval("detection.rings.min_arc_coverage", cfg.rings.min_arc_coverage)
+    _positive_integer(
+        "detection.rings.min_multiple_arcs", cfg.rings.min_multiple_arcs
+    )
+    _positive_integer(
+        "detection.rings.max_single_arc_frames",
+        cfg.rings.max_single_arc_frames,
+    )
+    _non_negative_integer(
+        "detection.rings.saturation_mask_radius_px",
+        cfg.rings.saturation_mask_radius_px,
+    )
+
+    for name, value in zip(
+        ("white_weight", "geometry_weight", "ring_weight", "border_weight", "temporal_weight"),
+        cfg.classical_scoring.weights,
+        strict=True,
+    ):
+        _non_negative(f"detection.classical_scoring.{name}", value)
+    if abs(sum(cfg.classical_scoring.weights) - 1.0) > 1e-6:
+        raise ConfigError(
+            "detection.classical_scoring weights must sum to 1.0"
+        )
+    for name in (
+        "acquisition_threshold",
+        "tracking_threshold",
+        "ambiguity_margin",
+        "max_texture_penalty",
+    ):
+        _unit_interval(
+            f"detection.classical_scoring.{name}",
+            getattr(cfg.classical_scoring, name),
+        )
 
 
 def _build_detection(values: Mapping[str, Any] | None) -> DetectionConfig:
@@ -334,6 +556,12 @@ def _build_detection(values: Mapping[str, Any] | None) -> DetectionConfig:
         name: _build(cls, values.get(name), f"detection.{name}")
         for name, cls in _DETECTION_SECTIONS.items()
     }
+    rings = nested["rings"]
+    assert isinstance(rings, RingGeometryConfig)
+    nested["rings"] = replace(
+        rings, expected_radius_ratios=tuple(rings.expected_radius_ratios)
+    )
+
     scoring = nested["candidate_scoring"]
     assert isinstance(scoring, CandidateScoringConfig)
     for name, value in zip(
@@ -358,7 +586,7 @@ def _build_detection(values: Mapping[str, Any] | None) -> DetectionConfig:
         ambiguity_margin=scoring.ambiguity_margin,
     )
 
-    cfg = DetectionConfig(backend=values.get("backend", "hybrid"), **nested)
+    cfg = DetectionConfig(backend=values.get("backend", "classical"), **nested)
     _validate_detection(cfg)
     return cfg
 

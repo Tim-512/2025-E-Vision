@@ -1,3 +1,4 @@
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -164,4 +165,40 @@ def test_detection_ranges_reject_non_finite_values(
 ) -> None:
     path = write_detection_config(tmp_path, patch)
     with pytest.raises(ConfigError, match=message):
+        load_config(path)
+
+
+def test_default_detection_backend_is_classical() -> None:
+    config = load_config("config/default.yaml")
+
+    assert config.detection.backend == "classical"
+    assert config.detection.normalization.clahe_clip_limit == 2.0
+    assert config.detection.white_board.expected_aspect_ratio == pytest.approx(210 / 297)
+    assert config.detection.rings.expected_radius_ratios == (1.0, 2.0, 3.0, 4.0, 5.0)
+    assert config.detection.tracking.predict_max_frames == 3
+    assert config.detection.tracking.predict_max_ms == 150.0
+    assert not any(
+        "red" in item.name.lower()
+        for item in dataclasses.fields(config.detection.rings)
+    )
+
+
+def test_rejects_invalid_prediction_limit(tmp_path: Path) -> None:
+    path = write_config(
+        tmp_path, {"detection": {"tracking": {"predict_max_frames": 0}}}
+    )
+    with pytest.raises(ConfigError, match="predict_max_frames"):
+        load_config(path)
+
+
+def test_rejects_non_monotonic_ring_ratios(tmp_path: Path) -> None:
+    path = write_config(
+        tmp_path,
+        {
+            "detection": {
+                "rings": {"expected_radius_ratios": [1, 2, 2, 4, 5]}
+            }
+        },
+    )
+    with pytest.raises(ConfigError, match="expected_radius_ratios"):
         load_config(path)
