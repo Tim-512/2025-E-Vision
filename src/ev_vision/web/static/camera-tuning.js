@@ -377,6 +377,7 @@ function renderDetectionStatus(status) {
 
 async function refreshDetectionStatus() {
   const status = await api("/api/detection/status");
+  if (!status) return;
   renderDetectionStatus(status);
   if (detectionConfig && detectionConfig.backend === "classical") refreshClassicalDebug(status.source_sequence);
 }
@@ -407,11 +408,12 @@ function setDebugImage(name, sourceSequence) {
 }
 
 function refreshClassicalDebug(sourceSequence) {
+  if (sourceSequence == null) return;
   const names = ["normalized-gray", "white-mask", "edge-mask", "ring-arcs", "candidate-scores"];
   names.forEach((name) => {
     const image = $("debug-" + name);
-    const query = sourceSequence == null ? "" : "?sequence=" + encodeURIComponent(sourceSequence);
-    image.src = "/api/detection/debug/" + encodeURIComponent(name) + query + (query ? "&" : "?") + "t=" + Date.now();
+    const query = "?sequence=" + encodeURIComponent(sourceSequence);
+    image.src = "/api/detection/debug/" + encodeURIComponent(name) + query + "&t=" + Date.now();
   });
 }
 

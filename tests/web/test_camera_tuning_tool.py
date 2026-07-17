@@ -560,6 +560,23 @@ def test_classical_hides_model_reload_and_uses_sequence_matched_debug() -> None:
     assert '"?sequence=" + encodeURIComponent(sourceSequence)' in script
 
 
+def test_classical_debug_waits_for_a_published_detection_sequence() -> None:
+    script = _static_text("camera-tuning.js")
+    start = script.index("function refreshClassicalDebug")
+    end = script.index("\nasync function refreshDetectionDebug", start)
+    function = script[start:end]
+
+    assert "if (sourceSequence == null)" in function
+    assert "return;" in function
+
+
+def test_detection_status_poll_handles_an_empty_response() -> None:
+    script = _static_text("camera-tuning.js")
+    function = _javascript_function(script, "refreshDetectionStatus")
+
+    assert "if (!status) return;" in function
+
+
 def test_detection_apply_does_not_touch_camera_or_reload_routes() -> None:
     script = _static_text("camera-tuning.js")
     function = _javascript_function(script, "applyDetectionConfig")

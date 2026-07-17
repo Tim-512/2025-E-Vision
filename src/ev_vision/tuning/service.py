@@ -1629,22 +1629,21 @@ class CameraTuningService:
                 wakeup.condition.wait_for(stop_event.is_set, timeout_s)
 
     def _diagnostics_key_is_current_locked(self, key: tuple[int, int]) -> bool:
-        return (
-            self._session_active
-            and self._latest_frame is not None
-            and key[0] == self._session_generation
-            and key[1] == self._latest_frame.sequence
-        )
+        # Acquisition can advance many frames while diagnostics are computed.
+        # A completed result remains valid for the active camera session even
+        # when it is no longer the newest acquired frame.
+        return self._session_active and key[0] == self._session_generation
 
     def _detection_key_is_current_locked(self, key: tuple[int, int, int]) -> bool:
+        # Detection is intentionally decoupled from acquisition rate. Reject
+        # results from an obsolete session/config generation, but publish a
+        # completed frame even if acquisition advanced while it was processed.
         return (
             self._session_active
             and self._detection_enabled
             and not self._detection_reload_in_progress
-            and self._latest_frame is not None
             and key[0] == self._session_generation
             and key[1] == self._detection_generation
-            and key[2] == self._latest_frame.sequence
         )
 
     def _reset_derived_locked(self) -> None:

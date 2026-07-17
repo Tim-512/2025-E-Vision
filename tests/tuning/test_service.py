@@ -693,6 +693,100 @@ def test_stale_diagnostics_failure_does_not_pollute_newer_success(
         service.stop()
 
 
+def test_diagnostics_publishes_completed_frame_after_acquisition_advances(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ev_vision.tuning.service as service_module
+
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+    release_second = threading.Event()
+    real_compute = service_module.compute_diagnostics
+
+    def controlled_compute(image, *, source_sequence, computed_ns):
+        if source_sequence == 1:
+            first_started.set()
+            assert release_first.wait(1.0)
+        elif source_sequence == 2:
+            second_started.set()
+            assert release_second.wait(1.0)
+        return real_compute(
+            image,
+            source_sequence=source_sequence,
+            computed_ns=computed_ns,
+        )
+
+    monkeypatch.setattr(service_module, "compute_diagnostics", controlled_compute)
+    camera = FakeCamera([frame(1)])
+    service = make_service(FakeFactory([camera]), diagnostics_fps=100.0)
+    service.start()
+    try:
+        assert first_started.wait(0.5)
+        with camera._lock:
+            camera.items.append(frame(2))
+        wait_until(
+            lambda: service.latest_frame() is not None
+            and service.latest_frame().sequence == 2
+        )
+
+        release_first.set()
+        assert second_started.wait(0.5)
+        diagnostics = service.latest_diagnostics()
+        assert diagnostics is not None
+        assert diagnostics.source_sequence == 1
+    finally:
+        release_first.set()
+        release_second.set()
+        service.stop()
+
+
+def test_detection_publishes_completed_frame_after_acquisition_advances() -> None:
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+    release_second = threading.Event()
+
+    class ControlledDetector:
+        def detect(
+            self, image: np.ndarray, *, captured_ns: int
+        ) -> BoardObservation | None:
+            sequence = int(image[0, 0, 0])
+            if sequence == 1:
+                first_started.set()
+                assert release_first.wait(1.0)
+            elif sequence == 2:
+                second_started.set()
+                assert release_second.wait(1.0)
+            return observation(captured_ns)
+
+    camera = FakeCamera([frame(1)])
+    service = make_service(
+        FakeFactory([camera]),
+        detector=ControlledDetector(),  # type: ignore[arg-type]
+        detection_fps=100.0,
+    )
+    service.start()
+    try:
+        assert first_started.wait(0.5)
+        with camera._lock:
+            camera.items.append(frame(2))
+        wait_until(
+            lambda: service.latest_frame() is not None
+            and service.latest_frame().sequence == 2
+        )
+
+        release_first.set()
+        assert second_started.wait(0.5)
+        detection = service.latest_detection()
+        assert detection.source_sequence == 1
+        assert service.detection_frame_for_latest() is not None
+    finally:
+        release_first.set()
+        release_second.set()
+        service.stop()
+
+
 def test_slow_detection_does_not_block_diagnostics_or_acquisition() -> None:
     class SlowDetector(FakeDetector):
         def detect(self, image: np.ndarray, *, captured_ns: int) -> BoardObservation | None:
