@@ -175,6 +175,7 @@ class CameraTuningService:
         self._lock = threading.RLock()
         self._operation_lock = threading.Lock()
         self._detector_lock = threading.RLock()
+        self._detection_debug_lock = threading.Lock()
         self._camera: CameraPort | None = None
         # A claimed camera handle is closed exactly once by its dedicated worker.
         # A failed operation deliberately retains its owner/result as a terminal
@@ -219,6 +220,13 @@ class CameraTuningService:
         self._detection_computed_ns: int | None = None
         self._latest_detection_frame: Frame | None = None
         self._latest_detection_debug: DetectionDebugSnapshot | None = None
+        self._recent_detection_debug: deque[DetectionDebugSnapshot] = deque(maxlen=8)
+        # Keep about one second of detection inputs at the default web tuning
+        # rate. The browser reads status first and then requests several debug
+        # views, so the referenced frame can stop being the latest meanwhile.
+        self._recent_detection_frames: deque[tuple[Frame, DetectionSnapshot]] = (
+            deque(maxlen=8)
+        )
 
         self._frame_count = 0
         self._timeout_count = 0
@@ -575,6 +583,8 @@ class CameraTuningService:
             self._detection_generation += 1
             self._latest_detection_frame = None
             self._latest_detection_debug = None
+            self._recent_detection_frames.clear()
+            self._recent_detection_debug.clear()
         self._notify_analysis_worker(self._detection_wakeup)
         return config
 
@@ -602,38 +612,55 @@ class CameraTuningService:
         expected_sequence: int | None = None,
     ) -> tuple[Frame, DetectionSnapshot] | None:
         with self._lock:
-            frame = copy_frame(self._latest_detection_frame)
-            snapshot = self._detection_snapshot_locked(self._clock_ns())
-        if frame is None or snapshot.source_sequence != frame.sequence:
-            return None
-        if expected_sequence is not None and frame.sequence != expected_sequence:
-            raise StaleDetectionFrameError(expected_sequence, frame.sequence)
-        return frame, snapshot
+            latest_frame = self._latest_detection_frame
+            latest_snapshot = self._detection_snapshot_locked(self._clock_ns())
+            if latest_frame is None or latest_snapshot.source_sequence != latest_frame.sequence:
+                return None
+            if expected_sequence is None or latest_frame.sequence == expected_sequence:
+                return copy_frame(latest_frame), latest_snapshot
+            for retained_frame, retained_snapshot in reversed(
+                self._recent_detection_frames
+            ):
+                if retained_frame.sequence == expected_sequence:
+                    return copy_frame(retained_frame), retained_snapshot
+            raise StaleDetectionFrameError(expected_sequence, latest_frame.sequence)
 
     def detection_debug_for_latest(
         self,
         *,
         expected_sequence: int | None = None,
     ) -> DetectionDebugSnapshot | None:
-        """Inspect the retained detection input frame without advancing the tracker."""
-        pair = self.detection_frame_for_latest(expected_sequence=expected_sequence)
-        if pair is None:
-            return None
-        frame, _snapshot = pair
-        with self._lock:
-            cached = self._latest_detection_debug
-        if cached is not None and cached.source_sequence == frame.sequence:
-            return cached
-        snapshot = self._inspect_detection_debug(frame)
-        if snapshot is None:
-            return None
-        with self._lock:
-            if (
-                self._latest_detection_frame is not None
-                and self._latest_detection_frame.sequence == frame.sequence
-            ):
-                self._latest_detection_debug = snapshot
-        return snapshot
+        """Inspect a recently published detection frame without advancing the tracker."""
+        with self._detection_debug_lock:
+            pair = self.detection_frame_for_latest(
+                expected_sequence=expected_sequence
+            )
+            if pair is None:
+                return None
+            frame, _snapshot = pair
+            with self._lock:
+                cached = next(
+                    (
+                        item
+                        for item in reversed(self._recent_detection_debug)
+                        if item.source_sequence == frame.sequence
+                    ),
+                    None,
+                )
+            if cached is not None:
+                return cached
+            snapshot = self._inspect_detection_debug(frame)
+            if snapshot is None:
+                return None
+            with self._lock:
+                retained = any(
+                    retained_frame.sequence == frame.sequence
+                    for retained_frame, _retained_snapshot in self._recent_detection_frames
+                )
+                if retained:
+                    self._latest_detection_debug = snapshot
+                    self._recent_detection_debug.append(snapshot)
+            return snapshot
 
     def _inspect_detection_debug(
         self, frame: Frame
@@ -685,6 +712,8 @@ class CameraTuningService:
         self._detection_computed_ns = None
         self._latest_detection_frame = None
         self._latest_detection_debug = None
+        self._recent_detection_frames.clear()
+        self._recent_detection_debug.clear()
         self._latest_detection = DetectionSnapshot(
             enabled=self._detection_enabled,
             detected=False,
@@ -709,6 +738,8 @@ class CameraTuningService:
             self._detection_computed_ns = None
             self._latest_detection_frame = None
             self._latest_detection_debug = None
+            self._recent_detection_frames.clear()
+            self._recent_detection_debug.clear()
             self._latest_detection = DetectionSnapshot(enabled=enabled, detected=False)
         if not enabled:
             self._reset_detector()
@@ -1380,7 +1411,12 @@ class CameraTuningService:
                                 model_state="ERROR",
                                 failure_reason="MODEL_ERROR",
                             )
-                            self._latest_detection_frame = copy_frame(frame)
+                            retained_frame = copy_frame(frame)
+                            assert retained_frame is not None
+                            self._latest_detection_frame = retained_frame
+                            self._recent_detection_frames.append(
+                                (retained_frame, self._latest_detection)
+                            )
                             self._latest_detection_debug = None
                             self._detection_computed_ns = now_ns
                             self._detection_rate.record(now_ns)
@@ -1392,7 +1428,12 @@ class CameraTuningService:
                             self._latest_detection = self._snapshot_for_result(
                                 result, frame
                             )
-                            self._latest_detection_frame = copy_frame(frame)
+                            retained_frame = copy_frame(frame)
+                            assert retained_frame is not None
+                            self._latest_detection_frame = retained_frame
+                            self._recent_detection_frames.append(
+                                (retained_frame, self._latest_detection)
+                            )
                             self._latest_detection_debug = None
                             self._detection_computed_ns = now_ns
                             self._detection_rate.record(now_ns)
@@ -1652,6 +1693,8 @@ class CameraTuningService:
         self._detection_computed_ns = None
         self._latest_detection_frame = None
         self._latest_detection_debug = None
+        self._recent_detection_frames.clear()
+        self._recent_detection_debug.clear()
         self._latest_detection = DetectionSnapshot(
             enabled=self._detection_enabled, detected=False
         )

@@ -382,6 +382,35 @@ def test_detection_frame_and_debug_are_latest_only_cached_and_tracker_safe() -> 
         service.stop()
 
 
+def test_recent_detection_frame_remains_available_for_debug_after_new_result() -> None:
+    camera = FakeCamera([frame(9)])
+    detector = RepeatingHybridDetector(hybrid_result())
+    service = make_service(
+        FakeFactory([camera]), detector=detector, detection_fps=1000.0
+    )
+    service.start()
+    try:
+        wait_until(lambda: service.latest_detection().source_sequence == 9)
+        debug = service.detection_debug_for_latest(expected_sequence=9)
+        assert debug is not None and debug.source_sequence == 9
+        calls_after_debug = len(detector.calls)
+
+        with camera._lock:
+            camera.items.append(frame(10))
+        wait_until(lambda: service.latest_detection().source_sequence == 10)
+        calls_after_new_detection = len(detector.calls)
+
+        pair = service.detection_frame_for_latest(expected_sequence=9)
+        assert pair is not None
+        assert pair[0].sequence == pair[1].source_sequence == 9
+        assert service.detection_debug_for_latest(expected_sequence=9) is debug
+        assert np.all(debug.images["edges"] == 7)
+        assert calls_after_new_detection == calls_after_debug + 1
+        assert len(detector.calls) == calls_after_new_detection
+    finally:
+        service.stop()
+
+
 def test_capture_snapshot_never_pairs_a_newer_frame_with_stale_detection() -> None:
     detector = RepeatingHybridDetector(hybrid_result())
     camera = FakeCamera([frame(9)])
