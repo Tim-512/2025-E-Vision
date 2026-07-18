@@ -73,3 +73,7 @@ python tools/camera_tuning_server.py --config config/default.yaml --host 0.0.0.0
 在 Jetson 本机打开 `http://127.0.0.1:8000`，或在可信隔离局域网内使用 Jetson 的实际 IP 访问。该开发服务没有登录认证，不得暴露到公网、设置路由器端口转发或在不可信 Wi-Fi 上运行。
 
 完整逐项流程见 [Jetson 传统视觉部署与实机验收手册](docs/jetson-classical-vision-acceptance.md)。
+
+## Jetson 本地低延迟预览
+
+只运行本地 OpenCV 检测窗口、以及网页与本地窗口联合运行的命令见 `docs/runbooks/jetson-local-preview.md`。纯本地模式从 YAML 的 `camera:` 段读取网页实测后保存的曝光、增益和采集帧率，不启动 FastAPI/Uvicorn。405 nm 激光在硬件上电后常亮，软件不能关闭，调试时必须物理断电或可靠遮光。

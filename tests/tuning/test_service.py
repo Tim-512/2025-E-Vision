@@ -2568,3 +2568,37 @@ def test_detector_operations_are_serialized_behind_an_active_detection(operation
     assert not operation_thread.is_alive()
     assert failures == []
     assert detector.max_active_calls == 1
+
+
+def test_service_can_disable_diagnostics_worker_without_disabling_detection() -> None:
+    camera = FakeCamera([frame(1), frame(2)])
+    detector = FakeDetector([None])
+    service = CameraTuningService(
+        camera_factory=FakeFactory([camera]),
+        base_config=CameraConfig(),
+        detector=detector,
+        diagnostics_fps=None,
+        detection_fps=100.0,
+        read_timeout_ms=2,
+        confirm_timeout_s=0.05,
+    )
+
+    service.start()
+    try:
+        assert service._diagnostics_thread is None
+        assert service._detection_thread is not None
+        assert service._detection_thread.is_alive()
+    finally:
+        service.stop()
+
+
+def test_service_local_mode_keeps_only_one_detection_frame() -> None:
+    service = CameraTuningService(
+        camera_factory=FakeFactory([FakeCamera([frame(1)])]),
+        base_config=CameraConfig(),
+        detector=FakeDetector([None]),
+        diagnostics_fps=None,
+        detection_history_size=1,
+    )
+    assert service._recent_detection_frames.maxlen == 1
+    assert service._recent_detection_debug.maxlen == 1

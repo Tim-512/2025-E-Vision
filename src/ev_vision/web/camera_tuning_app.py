@@ -565,6 +565,7 @@ def create_camera_tuning_app(
     storage: Any,
     project_defaults: EditableCameraParameters,
     preview_fps: float = 20.0,
+    manage_service_lifecycle: bool = True,
 ) -> FastAPI:
     if isinstance(preview_fps, bool) or not isinstance(preview_fps, (int, float)):
         raise ValueError("preview_fps must be numeric")
@@ -575,6 +576,9 @@ def create_camera_tuning_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        if not manage_service_lifecycle:
+            yield
+            return
         try:
             service.start()
             yield

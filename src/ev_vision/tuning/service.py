@@ -141,22 +141,27 @@ class CameraTuningService:
         camera_identity: CameraIdentity | None = None,
         read_timeout_ms: int = 100,
         confirm_timeout_s: float = 1.0,
-        diagnostics_fps: float = 10.0,
+        diagnostics_fps: float | None = 10.0,
         detection_fps: float = 15.0,
         shutdown_timeout_s: float = 0.25,
         disconnect_timeout_threshold: int = 3,
+        detection_history_size: int = 8,
         clock_ns: Callable[[], int] = time.monotonic_ns,
     ) -> None:
         if read_timeout_ms <= 0:
             raise ValueError("read_timeout_ms must be positive")
         if confirm_timeout_s <= 0:
             raise ValueError("confirm_timeout_s must be positive")
-        if diagnostics_fps <= 0 or detection_fps <= 0:
-            raise ValueError("analysis rates must be positive")
+        if diagnostics_fps is not None and diagnostics_fps <= 0:
+            raise ValueError("diagnostics_fps must be positive when enabled")
+        if detection_fps <= 0:
+            raise ValueError("detection_fps must be positive")
         if shutdown_timeout_s <= 0:
             raise ValueError("shutdown_timeout_s must be positive")
         if disconnect_timeout_threshold <= 0:
             raise ValueError("disconnect_timeout_threshold must be positive")
+        if isinstance(detection_history_size, bool) or detection_history_size <= 0:
+            raise ValueError("detection_history_size must be positive")
 
         self._camera_factory = camera_factory
         self._base_config = base_config
@@ -166,10 +171,13 @@ class CameraTuningService:
         self._camera_identity = camera_identity or CameraIdentity(model="", serial="")
         self._read_timeout_ms = int(read_timeout_ms)
         self._confirm_timeout_s = float(confirm_timeout_s)
-        self._diagnostics_period_s = 1.0 / float(diagnostics_fps)
+        self._diagnostics_period_s = (
+            None if diagnostics_fps is None else 1.0 / float(diagnostics_fps)
+        )
         self._detection_period_s = 1.0 / float(detection_fps)
         self._shutdown_timeout_s = float(shutdown_timeout_s)
         self._disconnect_timeout_threshold = int(disconnect_timeout_threshold)
+        self._detection_history_size = int(detection_history_size)
         self._clock_ns = clock_ns
 
         self._lock = threading.RLock()
@@ -220,12 +228,14 @@ class CameraTuningService:
         self._detection_computed_ns: int | None = None
         self._latest_detection_frame: Frame | None = None
         self._latest_detection_debug: DetectionDebugSnapshot | None = None
-        self._recent_detection_debug: deque[DetectionDebugSnapshot] = deque(maxlen=8)
+        self._recent_detection_debug: deque[DetectionDebugSnapshot] = deque(
+            maxlen=self._detection_history_size
+        )
         # Keep about one second of detection inputs at the default web tuning
         # rate. The browser reads status first and then requests several debug
         # views, so the referenced frame can stop being the latest meanwhile.
         self._recent_detection_frames: deque[tuple[Frame, DetectionSnapshot]] = (
-            deque(maxlen=8)
+            deque(maxlen=self._detection_history_size)
         )
 
         self._frame_count = 0
@@ -807,12 +817,14 @@ class CameraTuningService:
                 self._diagnostics_thread = None
                 self._detection_thread = None
             self._analysis_stop = threading.Event()
-            diagnostics = threading.Thread(
-                target=self._diagnostics_loop,
-                args=(self._analysis_stop,),
-                name="camera-tuning-diagnostics",
-                daemon=True,
-            )
+            diagnostics = None
+            if self._diagnostics_period_s is not None:
+                diagnostics = threading.Thread(
+                    target=self._diagnostics_loop,
+                    args=(self._analysis_stop,),
+                    name="camera-tuning-diagnostics",
+                    daemon=True,
+                )
             detection = threading.Thread(
                 target=self._detection_loop,
                 args=(self._analysis_stop,),
@@ -822,7 +834,8 @@ class CameraTuningService:
             self._diagnostics_thread = diagnostics
             self._detection_thread = detection
         detection.start()
-        diagnostics.start()
+        if diagnostics is not None:
+            diagnostics.start()
 
     def _stop_analysis_workers(self, *, timeout_s: float | None = None) -> bool:
         with self._lock:

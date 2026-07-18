@@ -19,6 +19,7 @@ training = ["ultralytics>=8.3"]
 [project.scripts]
 ev-vision = "ev_vision.cli:main"
 ev-camera-tuning = "ev_vision.web.camera_tuning_server:main"
+ev-camera-preview = "ev_vision.preview.cli:main"
 
 [tool.setuptools]
 py-modules = ["ev_vision_mvs_adapter"]

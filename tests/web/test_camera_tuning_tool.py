@@ -24,6 +24,9 @@ def test_parser_defaults_and_safety_help() -> None:
     assert args.timeout_ms == 100
     assert args.shutdown_timeout == 2.0
     assert args.log_level == "info"
+    assert args.local_preview is False
+    assert args.local_preview_width == 640
+    assert args.local_preview_fps == 30.0
 
     help_text = parser.format_help().lower()
     assert "0.0.0.0" in help_text
@@ -157,6 +160,130 @@ def test_main_prints_safety_and_runs_uvicorn(monkeypatch, capsys) -> None:
     assert "cannot make it safe" in output
     assert "http://0.0.0.0:8123" in output
 
+
+
+
+def test_main_runs_combined_local_preview_with_one_service_lifecycle(monkeypatch) -> None:
+    import ev_vision.web.camera_tuning_server as server
+
+    class FakeService:
+        def __init__(self) -> None:
+            self.start_calls = 0
+            self.stop_calls = 0
+
+        def start(self) -> None:
+            self.start_calls += 1
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+
+    service = FakeService()
+    fake_app = SimpleNamespace(state=SimpleNamespace(service=service))
+    recorded: dict[str, Any] = {}
+
+    class FakeConfig:
+        def __init__(self, app, **kwargs):
+            recorded["config"] = (app, kwargs)
+
+    class FakeServer:
+        def __init__(self, config):
+            recorded["server"] = self
+            self.should_exit = False
+            self.started = False
+
+        def run(self):
+            recorded["ran"] = True
+            self.started = True
+
+    class FakeThread:
+        def __init__(self, *, target, name, daemon):
+            self.target = target
+            self.alive = False
+            recorded["thread"] = (name, daemon)
+
+        def start(self):
+            self.alive = True
+            self.target()
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout=None):
+            recorded["join_timeout"] = timeout
+
+    monkeypatch.setattr(server, "build_application", lambda args: fake_app)
+    monkeypatch.setattr(server.uvicorn, "Config", FakeConfig)
+    monkeypatch.setattr(server.uvicorn, "Server", FakeServer)
+    monkeypatch.setattr(server.threading, "Thread", FakeThread)
+    monkeypatch.setattr(
+        server,
+        "run_local_preview",
+        lambda candidate, **kwargs: recorded.update(preview=(candidate, kwargs)) or "key",
+    )
+
+    result = server.main([
+        "--local-preview",
+        "--local-preview-width", "720",
+        "--local-preview-fps", "25",
+    ])
+
+    assert result == 0
+    assert service.start_calls == 1
+    assert service.stop_calls == 1
+    assert recorded["preview"] == (
+        service,
+        {"max_width": 720, "display_fps": 25.0},
+    )
+    assert recorded["server"].should_exit is True
+def test_combined_mode_stops_service_when_start_fails(monkeypatch) -> None:
+    import ev_vision.web.camera_tuning_server as server
+
+    class FakeService:
+        def __init__(self) -> None:
+            self.stop_calls = 0
+
+        def start(self) -> None:
+            raise RuntimeError("camera start failed")
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+
+    class FakeThread:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def start(self) -> None:
+            pytest.fail("web thread must not start")
+
+        def join(self, timeout=None) -> None:
+            del timeout
+            pytest.fail('unstarted web thread must not be joined')
+
+    class FakeServer:
+        def __init__(self, _config) -> None:
+            self.should_exit = False
+
+        def run(self) -> None:
+            pass
+
+    service = FakeService()
+    fake_app = SimpleNamespace(state=SimpleNamespace(service=service))
+    monkeypatch.setattr(server, "build_application", lambda args: fake_app)
+    monkeypatch.setattr(server.uvicorn, "Config", lambda *args, **kwargs: object())
+    monkeypatch.setattr(server.uvicorn, "Server", FakeServer)
+    monkeypatch.setattr(server.threading, "Thread", FakeThread)
+
+    assert server.main(["--local-preview"]) == 3
+    assert service.stop_calls == 1
+
+def test_wait_for_web_server_rejects_a_thread_that_exits_before_startup() -> None:
+    import ev_vision.web.camera_tuning_server as server
+
+    fake_server = SimpleNamespace(started=False)
+    fake_thread = SimpleNamespace(is_alive=lambda: False)
+
+    with pytest.raises(RuntimeError, match="stopped before startup"):
+        server._wait_for_web_server(fake_server, fake_thread, timeout_s=0.1)
 
 def test_main_reports_build_errors_without_starting_uvicorn(monkeypatch, capsys) -> None:
     import ev_vision.web.camera_tuning_server as server

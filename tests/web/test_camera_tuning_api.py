@@ -635,3 +635,16 @@ def test_dashboard_contains_required_camera_tuning_controls_without_actuator_con
     assert "jetson/v2 cannot control" in lowered
     assert "software cannot make it safe" in lowered
     assert "gimbal" not in lowered
+
+
+def test_lifespan_can_leave_service_lifecycle_to_local_preview(service: FakeService, storage: FakeStorage) -> None:
+    app = create_camera_tuning_app(
+        service,
+        storage,
+        DEFAULTS,
+        manage_service_lifecycle=False,
+    )
+    with TestClient(app) as client:
+        assert client.get("/api/status").status_code == 200
+    assert service.start_calls == 0
+    assert service.stop_calls == 0

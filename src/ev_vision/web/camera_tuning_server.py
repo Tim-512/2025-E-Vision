@@ -1,9 +1,11 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import math
 from pathlib import Path
 import sys
+import threading
+import time
 from typing import Callable, Sequence
 
 import uvicorn
@@ -13,6 +15,7 @@ from ev_vision.config import BoardConfig, CameraConfig, DetectionConfig, load_co
 from ev_vision.detection.classical_board import ClassicalBoardDetector
 from ev_vision.detection.hybrid_board import DetectionBackendSelection, HybridBoardDetector
 from ev_vision.detection.yolo_board import InferencePort, UltralyticsBackend, YoloBoardDetector
+from ev_vision.preview.local import run_local_preview
 from ev_vision.tracking.board_tracker import BoardTracker
 from ev_vision.tuning.models import CameraIdentity, EditableCameraParameters, ParameterBounds
 from ev_vision.tuning.service import CameraTuningService
@@ -71,6 +74,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--preview-fps", type=_positive_float, default=20.0)
     parser.add_argument("--detection-fps", type=_positive_float, default=15.0)
     parser.add_argument("--diagnostic-fps", type=_positive_float, default=10.0)
+    parser.add_argument(
+        "--local-preview",
+        action="store_true",
+        help="also show a low-latency OpenCV window on the Jetson display",
+    )
+    parser.add_argument("--local-preview-width", type=_positive_int, default=640)
+    parser.add_argument("--local-preview-fps", type=_positive_float, default=30.0)
     parser.add_argument("--timeout-ms", type=_positive_int, default=100)
     parser.add_argument(
         "--shutdown-timeout",
@@ -196,11 +206,27 @@ def build_application(
         storage,
         defaults,
         preview_fps=args.preview_fps,
+        manage_service_lifecycle=not args.local_preview,
     )
     state = getattr(app, "state", None)
     if state is not None:
         state.service = service
     return app
+
+
+def _wait_for_web_server(
+    server: object,
+    thread: threading.Thread,
+    *,
+    timeout_s: float,
+) -> None:
+    deadline = time.monotonic() + timeout_s
+    while not bool(getattr(server, "started", False)):
+        if not thread.is_alive():
+            raise RuntimeError("web server stopped before startup")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("web server did not start before timeout")
+        time.sleep(0.01)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -217,7 +243,51 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         print("Network: local-only binding. Use --host 0.0.0.0 only on a trusted LAN.")
     print("SAFETY: the 405 nm laser is hardware-always-on whenever powered; Jetson and protocol V2 cannot turn it off, so software cannot make it safe.")
-    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
+    if not args.local_preview:
+        uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
+        return 0
+
+    service = app.state.service
+    web_server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host=args.host,
+            port=args.port,
+            log_level=args.log_level,
+        )
+    )
+    web_thread = threading.Thread(
+        target=web_server.run,
+        name="camera-tuning-web",
+        daemon=True,
+    )
+    web_thread_started = False
+    try:
+        service.start()
+        web_thread.start()
+        web_thread_started = True
+        _wait_for_web_server(
+            web_server,
+            web_thread,
+            timeout_s=args.shutdown_timeout,
+        )
+        run_local_preview(
+            service,
+            max_width=args.local_preview_width,
+            display_fps=args.local_preview_fps,
+        )
+    except KeyboardInterrupt:
+        pass
+    except Exception as exc:
+        print(f"camera tuning local preview failed: {exc}", file=sys.stderr)
+        return 3
+    finally:
+        web_server.should_exit = True
+        try:
+            if web_thread_started:
+                web_thread.join(timeout=args.shutdown_timeout)
+        finally:
+            service.stop()
     return 0
 
 
