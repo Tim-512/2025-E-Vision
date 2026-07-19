@@ -184,17 +184,17 @@ def render_capture_overlay(
     analysis: ChessboardFrameAnalysis,
     saved_count: int,
     duplicate_warning: bool,
+    *,
+    pattern_size: tuple[int, int],
 ) -> np.ndarray:
     rendered = image.copy()
     if analysis.corners is not None:
-        pattern_size = _infer_pattern_size(len(analysis.corners))
-        if pattern_size is not None:
-            cv2.drawChessboardCorners(
-                rendered,
-                pattern_size,
-                analysis.corners.reshape(-1, 1, 2),
-                analysis.found,
-            )
+        cv2.drawChessboardCorners(
+            rendered,
+            pattern_size,
+            analysis.corners.reshape(-1, 1, 2),
+            analysis.found,
+        )
 
     color = (0, 220, 0) if analysis.save_allowed else (0, 0, 255)
     lines = [

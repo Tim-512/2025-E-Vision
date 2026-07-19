@@ -294,11 +294,17 @@ def test_render_overlay_returns_copy_and_reports_capture_state(
     monkeypatch.setattr(module.cv2, "drawChessboardCorners", draw)
     monkeypatch.setattr(module.cv2, "putText", put_text)
 
-    rendered = render_capture_overlay(image, analysis, saved_count=3, duplicate_warning=True)
+    rendered = render_capture_overlay(
+        image,
+        analysis,
+        saved_count=3,
+        duplicate_warning=True,
+        pattern_size=(10, 4),
+    )
 
     assert rendered is not image
     assert np.array_equal(rendered, image)
-    assert draw_calls == [((8, 5), (40, 1, 2), True)]
+    assert draw_calls == [((10, 4), (40, 1, 2), True)]
     combined = "\n".join(text_lines)
     assert "saved=3" in combined
     assert "focus=125.5" in combined
