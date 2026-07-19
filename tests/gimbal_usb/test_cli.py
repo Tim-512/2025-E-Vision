@@ -269,14 +269,14 @@ def test_run_application_uses_existing_local_preview(monkeypatch) -> None:
         width=720,
         display_fps=40.0,
     ) == 0
-    assert recorded == {
-        "service": runtime.service,
-        "kwargs": {"max_width": 720, "display_fps": 40.0},
-    }
+    assert recorded["service"] is runtime.service
+    assert recorded["kwargs"]["max_width"] == 720
+    assert recorded["kwargs"]["display_fps"] == 40.0
+    assert recorded["kwargs"]["stop_event"] is not None
     assert events == ["service.start", "worker.start", "worker.stop:5", "service.stop"]
 
 
-def test_camera_start_failure_returns_startup_code_without_stopping_unstarted_components(capsys) -> None:
+def test_camera_start_failure_returns_startup_code_after_best_effort_service_stop(capsys) -> None:
     events: list[str] = []
 
     result = cli.run_application(
@@ -287,7 +287,7 @@ def test_camera_start_failure_returns_startup_code_without_stopping_unstarted_co
     )
 
     assert result == 2
-    assert events == ["service.start"]
+    assert events == ["service.start", "service.stop"]
     assert "camera startup failed" in capsys.readouterr().err
 
 
@@ -398,22 +398,62 @@ def test_main_passes_runtime_options_to_camera_builder(monkeypatch) -> None:
     }
 
 
-def test_display_mode_does_not_replace_keyboard_interrupt_signal_handling(monkeypatch) -> None:
+def test_display_mode_installs_sigterm_only_and_preserves_sigint(monkeypatch) -> None:
     events: list[str] = []
     runtime = camera_runtime(events)
-    monkeypatch.setattr(cli.sys, "platform", "win32")
+    installed = []
+    restored = []
+    handlers = {cli.signal.SIGINT: "old-int", cli.signal.SIGTERM: "old-term"}
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    monkeypatch.setenv("DISPLAY", ":0")
     monkeypatch.setattr(cli, "load_gimbal_usb_config", lambda path: gimbal_config())
     monkeypatch.setattr(cli, "build_camera_runtime", lambda **kwargs: runtime)
     monkeypatch.setattr(cli, "build_angle_converter", lambda *args, **kwargs: UnavailableTargetAngleConverter("test"))
     monkeypatch.setattr(cli, "build_worker", lambda *args, **kwargs: FakeWorker(events))
-    monkeypatch.setattr(
-        cli,
-        "_install_stop_handlers",
-        lambda event: pytest.fail("display mode must retain normal KeyboardInterrupt handling"),
-    )
-    monkeypatch.setattr(cli, "run_application", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(cli.signal, "getsignal", lambda candidate: handlers[candidate])
+
+    def install(candidate, handler):
+        if handler in handlers.values():
+            restored.append((candidate, handler))
+        else:
+            installed.append((candidate, handler))
+
+    monkeypatch.setattr(cli.signal, "signal", install)
+
+    def run_application(*args, stop_event, **kwargs):
+        del args, kwargs
+        installed[0][1](cli.signal.SIGTERM, None)
+        assert stop_event.is_set()
+        return 0
+
+    monkeypatch.setattr(cli, "run_application", run_application)
 
     assert cli.main(["--display"]) == 0
+    assert [candidate for candidate, _ in installed] == [cli.signal.SIGTERM]
+    assert restored == [(cli.signal.SIGTERM, "old-term")]
+
+
+def test_display_stop_event_reaches_preview_and_cleanup_is_worker_first(monkeypatch) -> None:
+    events: list[str] = []
+    stop_event = cli.threading.Event()
+    runtime = camera_runtime(events)
+
+    def preview(service, **kwargs):
+        assert service is runtime.service
+        assert kwargs["stop_event"] is stop_event
+        stop_event.set()
+        return "stop"
+
+    monkeypatch.setattr(cli, "run_local_preview", preview)
+
+    assert cli.run_application(
+        runtime,
+        FakeWorker(events),
+        display=True,
+        stop_event=stop_event,
+    ) == 0
+    assert stop_event.is_set()
+    assert events == ["service.start", "worker.start", "worker.stop:5", "service.stop"]
 
 
 def test_cli_source_has_no_web_server_imports() -> None:

@@ -35,18 +35,21 @@ def test_cli_prints_loaded_and_usable_counts(tmp_path, monkeypatch, capsys) -> N
     for index in range(12):
         (image_dir / f"capture-{index:03d}.png").write_bytes(b"image")
     monkeypatch.setattr(module.cv2, "imread", lambda *a: np.zeros((1024, 1280, 3), np.uint8))
-    monkeypatch.setattr(
-        module,
-        "solve_chessboard_with_report",
-        lambda *a, **k: ChessboardCalibrationResult(calibration(), 12, 10, 2),
-    )
+    solve_args = {}
+
+    def solve(frames, **kwargs):
+        solve_args.update(kwargs)
+        return ChessboardCalibrationResult(calibration(), 12, 10, 2)
+
+    monkeypatch.setattr(module, "solve_chessboard_with_report", solve)
     monkeypatch.setattr(module, "save_calibration", lambda path, value: Path(path).write_text("saved"))
     output = tmp_path / "camera.yaml"
 
     assert module.main([
         str(image_dir), "--output", str(output),
-        "--columns", "8", "--rows", "5", "--square-mm", "22", "--max-rms", "0.5",
+        "--square-mm", "22", "--max-rms", "0.5",
     ]) == 0
+    assert solve_args == {"pattern_size": (8, 5), "square_size_mm": 22.0}
     assert capsys.readouterr().out == (
         f"images=12 usable_poses=10 rejected=2 rms_px=0.3100 output={output}\n"
     )

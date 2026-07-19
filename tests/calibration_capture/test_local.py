@@ -247,6 +247,18 @@ def test_saved_image_keeps_original_pixels_and_remove_is_session_scoped(
     assert remove_last_saved(session_paths) is None
 
 
+def test_save_original_frame_refuses_to_overwrite_existing_capture(tmp_path: Path) -> None:
+    output = tmp_path / "captures"
+    output.mkdir()
+    existing = output / "calibration-001.png"
+    existing.write_bytes(b"original")
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        save_original_frame(output, np.zeros((20, 30, 3), np.uint8), index=1)
+
+    assert existing.read_bytes() == b"original"
+
+
 def test_failed_imwrite_raises_oserror(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -224,6 +224,64 @@ def test_capture_saves_original_frame_despite_duplicate_and_resizes_only_preview
     assert all(image.shape == (768, 960, 3) for image in cv.images)
 
 
+def test_capture_continues_after_highest_existing_calibration_index(monkeypatch, tmp_path) -> None:
+    import ev_vision.calibration_capture.cli as cli
+
+    (tmp_path / "calibration-001.png").write_bytes(b"old-one")
+    (tmp_path / "calibration-004.png").write_bytes(b"old-four")
+    (tmp_path / "calibration-bad.png").write_bytes(b"ignore")
+    events = []
+    frame = np.zeros((20, 30, 3), np.uint8)
+    camera = FakeCamera(events, [frame, frame])
+    cv = FakeCv(events, [ord(" "), ord("q")])
+    saved = []
+    monkeypatch.setattr(cli, "analyze_chessboard_frame", lambda image, **kwargs: _analysis(save_allowed=True))
+    monkeypatch.setattr(cli, "render_capture_overlay", lambda image, *args, **kwargs: image.copy())
+    monkeypatch.setattr(
+        cli,
+        "save_original_frame",
+        lambda output, image, index: saved.append(index) or output / f"calibration-{index:03d}.png",
+    )
+
+    assert cli.run_capture_session(
+        camera,
+        pattern_size=(8, 5),
+        square_mm=22.0,
+        output=tmp_path,
+        preview_width=960,
+        timeout_ms=100,
+        cv=cv,
+    ) == "key"
+    assert saved == [5]
+    assert (tmp_path / "calibration-001.png").read_bytes() == b"old-one"
+    assert (tmp_path / "calibration-004.png").read_bytes() == b"old-four"
+
+
+def test_remove_without_current_session_capture_never_touches_old_session(monkeypatch, tmp_path) -> None:
+    import ev_vision.calibration_capture.cli as cli
+
+    old = tmp_path / "calibration-001.png"
+    old.write_bytes(b"old")
+    events = []
+    frames = [np.zeros((20, 30, 3), np.uint8) for _ in range(2)]
+    camera = FakeCamera(events, frames)
+    cv = FakeCv(events, [ord("r"), ord("q")])
+    monkeypatch.setattr(cli, "analyze_chessboard_frame", lambda image, **kwargs: _analysis(save_allowed=False))
+    monkeypatch.setattr(cli, "render_capture_overlay", lambda image, *args, **kwargs: image.copy())
+    monkeypatch.setattr(cli, "remove_last_saved", lambda paths: pytest.fail("old-session file must not be removed"))
+
+    assert cli.run_capture_session(
+        camera,
+        pattern_size=(8, 5),
+        square_mm=22.0,
+        output=tmp_path,
+        preview_width=960,
+        timeout_ms=100,
+        cv=cv,
+    ) == "key"
+    assert old.read_bytes() == b"old"
+
+
 def test_space_only_saves_allowed_and_remove_is_current_session_scoped(monkeypatch, tmp_path) -> None:
     import ev_vision.calibration_capture.cli as cli
 

@@ -76,6 +76,15 @@ def build_camera(config_path: Path, serial: str) -> tuple[HikrobotCamera, AppCon
     return camera, config
 
 
+def _next_capture_index(output: Path) -> int:
+    highest = 0
+    for path in Path(output).glob("calibration-*.png"):
+        suffix = path.stem.removeprefix("calibration-")
+        if suffix.isdigit():
+            highest = max(highest, int(suffix))
+    return highest + 1
+
+
 def run_capture_session(
     camera: HikrobotCamera,
     *,
@@ -89,6 +98,7 @@ def run_capture_session(
 ) -> str:
     del square_mm
     saved_paths: list[Path] = []
+    next_index = _next_capture_index(output)
     signatures = session_signatures if session_signatures is not None else []
 
     cv.namedWindow(WINDOW_NAME, cv.WINDOW_NORMAL)
@@ -133,7 +143,8 @@ def run_capture_session(
             if cv.getWindowProperty(WINDOW_NAME, cv.WND_PROP_VISIBLE) < 1:
                 return "window"
             if key == ord(" ") and analysis.save_allowed:
-                path = save_original_frame(output, frame.image, index=len(saved_paths) + 1)
+                path = save_original_frame(output, frame.image, index=next_index)
+                next_index += 1
                 saved_paths.append(path)
                 if analysis.pose_signature is not None:
                     signatures.append(analysis.pose_signature)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import threading
 
 import numpy as np
 
@@ -87,4 +88,23 @@ def test_run_local_preview_uses_latest_detection_frame_and_closes_on_q() -> None
     assert result == "key"
     assert service.calls == 1
     assert len(cv.images) == 1
+    assert cv.destroyed is True
+
+
+def test_run_local_preview_exits_when_stop_event_is_set() -> None:
+    service = _Service()
+    cv = _Cv()
+    stop_event = threading.Event()
+    stop_event.set()
+
+    result = run_local_preview(
+        service,
+        max_width=640,
+        display_fps=30.0,
+        cv=cv,
+        stop_event=stop_event,
+    )
+
+    assert result == "stop"
+    assert service.calls == 0
     assert cv.destroyed is True

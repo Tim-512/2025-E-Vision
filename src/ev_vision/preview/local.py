@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import threading
 import time
 from typing import Any, Callable
 
@@ -81,6 +82,7 @@ def run_local_preview(
     window_name: str = _WINDOW_NAME,
     cv: Any = cv2,
     sleep: Callable[[float], None] = time.sleep,
+    stop_event: threading.Event | None = None,
 ) -> str:
     """Run a latest-only OpenCV GUI loop. The caller owns service lifecycle."""
     if isinstance(display_fps, bool) or not isinstance(display_fps, (int, float)):
@@ -95,6 +97,8 @@ def run_local_preview(
     cv.namedWindow(window_name, cv.WINDOW_NORMAL)
     try:
         while True:
+            if stop_event is not None and stop_event.is_set():
+                return "stop"
             matched = service.detection_frame_for_latest()
             if matched is not None:
                 frame, detection = matched

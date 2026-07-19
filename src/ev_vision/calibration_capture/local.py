@@ -151,6 +151,8 @@ def save_original_frame(output: Path, image: np.ndarray, *, index: int) -> Path:
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     path = calibration_image_path(output, index)
+    if path.exists():
+        raise FileExistsError(f"calibration image already exists: {path}")
     if not cv2.imwrite(str(path), image):
         raise OSError(f"failed to write calibration image: {path}")
     return path

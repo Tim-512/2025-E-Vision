@@ -136,8 +136,10 @@ def _new_stop_event() -> threading.Event:
 
 def _install_stop_handlers(
     stop_event: threading.Event,
+    *,
+    include_sigint: bool = True,
 ) -> Callable[[], None]:
-    """Make SIGINT/SIGTERM request an orderly worker-first shutdown."""
+    """Make selected termination signals request an orderly shutdown."""
     if threading.current_thread() is not threading.main_thread():
         return lambda: None
 
@@ -147,7 +149,8 @@ def _install_stop_handlers(
         del signum, frame
         stop_event.set()
 
-    for candidate in (signal.SIGINT, signal.SIGTERM):
+    candidates = (signal.SIGINT, signal.SIGTERM) if include_sigint else (signal.SIGTERM,)
+    for candidate in candidates:
         try:
             previous[candidate] = signal.getsignal(candidate)
             signal.signal(candidate, request_stop)
@@ -265,8 +268,16 @@ def run_application(
     try:
         camera_runtime.service.start()
     except KeyboardInterrupt:
+        try:
+            camera_runtime.service.stop()
+        except Exception:
+            pass
         return 0
     except Exception as exc:
+        try:
+            camera_runtime.service.stop()
+        except Exception:
+            pass
         print(f"gimbal vision camera startup failed: {exc}", file=sys.stderr)
         return 2
 
@@ -286,6 +297,7 @@ def run_application(
                 camera_runtime.service,
                 max_width=width,
                 display_fps=display_fps,
+                stop_event=stop_event,
             )
         else:
             while not stop_event.wait(1.0):
@@ -347,10 +359,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print_startup_summary(camera_runtime, gimbal_config, converter)
     stop_event = _new_stop_event()
-    restore_handlers = (
-        (lambda: None)
-        if args.display
-        else _install_stop_handlers(stop_event)
+    restore_handlers = _install_stop_handlers(
+        stop_event,
+        include_sigint=not args.display,
     )
     try:
         return run_application(
