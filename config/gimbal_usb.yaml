@@ -1,0 +1,12 @@
+﻿port: /dev/serial/by-id/usb-RoboMaster_Gimbal_Vision_USB_3065356E3034-if00
+baudrate: 115200
+output_hz: 50.0
+reconnect_interval_s: 1.0
+calibration_path: config/camera_calibration.yaml
+max_calibration_rms_px: 0.5
+max_result_age_ms: 60.0
+predicted_control_max_frames: 3
+predicted_control_max_age_ms: 60.0
+predicted_max_angle_step_deg: 1.5
+yaw_sign: 1
+pitch_sign: 1

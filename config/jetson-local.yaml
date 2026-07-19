@@ -1,0 +1,130 @@
+﻿camera:
+  width: 1280
+  height: 1024
+  pixel_format: BayerRG8
+  acquisition_fps: 50
+  exposure_us: 15000
+  gain_db: 14.0
+  auto_exposure: false
+  auto_gain: false
+  auto_white_balance: false
+  buffer_size: 2
+
+board:
+  width_cm: 21.0
+  height_cm: 29.7
+  rectified_px_per_cm: 40.0
+
+circle:
+  radius_cm: 6.0
+  start_phase_deg: 0.0
+  phase_direction: 1
+  progress_timeout_ms: 300
+  max_phase_correction_deg_s: 45.0
+
+control:
+  command_hz: 100
+  estimated_latency_ms: 25.0
+  source_timeout_ms: 100
+  kp_yaw: 1.0
+  kd_yaw: 0.0
+  kp_pitch: 1.0
+  kd_pitch: 0.0
+  derivative_alpha: 0.25
+  deadband_enter_mdeg: 50
+  deadband_exit_mdeg: 100
+  max_yaw_rate_deg_s: null
+  max_pitch_rate_deg_s: null
+  max_yaw_accel_deg_s2: null
+  max_pitch_accel_deg_s2: null
+  yaw_sign: 1
+  pitch_sign: 1
+  swap_axes: false
+
+serial:
+  port: /dev/ttyUSB0
+  baudrate: 921600
+  feedback_timeout_ms: 300
+
+laser:
+  backend: mock
+  active_high: true
+  gpio_line: null
+
+detection:
+  backend: classical
+  model:
+    path: models/target-board.engine
+    fallback_path: models/target-board.onnx
+    input_width: 640
+    input_height: 640
+    confidence_threshold: 0.45
+    max_candidates: 3
+    device: 0
+  roi_geometry:
+    padding_fraction: 0.08
+    canny_low: 60
+    canny_high: 180
+    min_edge_support: 0.45
+    min_geometry_score: 0.55
+    expected_aspect_ratio: 0.707
+    aspect_ratio_tolerance: 0.35
+    minimum_side_px: 40.0
+    minimum_area_fraction: 0.25
+    maximum_area_fraction: 1.15
+  candidate_scoring:
+    model_weight: 0.45
+    geometry_weight: 0.30
+    structure_weight: 0.15
+    temporal_weight: 0.10
+    ambiguity_margin: 0.08
+  tracking:
+    confirm_frames: 3
+    predict_frames: 2
+    predict_max_frames: 3
+    predict_max_ms: 150.0
+    lost_frames: 4
+    max_single_arc_frames: 2
+    max_center_jump_px: 160.0
+    max_scale_jump_fraction: 0.30
+    max_velocity_px_s: 5000.0
+    max_acceleration_px_s2: 30000.0
+    max_result_age_ms: 100.0
+  normalization:
+    gaussian_kernel: 3
+    clahe_clip_limit: 2.0
+    clahe_grid_size: 8
+    illumination_kernel: 81
+    white_percentile: 72.0
+    white_local_offset: 10.0
+    saturation_threshold: 250
+    canny_low: 40
+    canny_high: 120
+  white_board:
+    expected_aspect_ratio: 0.7070707070707071
+    aspect_ratio_tolerance: 0.24
+    min_area_fraction: 0.015
+    max_area_fraction: 0.92
+    min_white_occupancy: 0.58
+    max_texture_std: 58.0
+    min_convexity: 0.90
+    min_side_px: 45.0
+    border_band_fraction: 0.045
+  rings:
+    expected_radius_ratios: [1.0, 2.0, 3.0, 4.0, 5.0]
+    ratio_tolerance: 0.18
+    center_tolerance_fraction: 0.08
+    min_arc_coverage: 0.18
+    min_multiple_arcs: 2
+    max_single_arc_frames: 2
+    saturation_mask_radius_px: 12
+  classical_scoring:
+    white_weight: 0.24
+    geometry_weight: 0.22
+    ring_weight: 0.30
+    border_weight: 0.08
+    temporal_weight: 0.16
+    acquisition_threshold: 0.66
+    tracking_threshold: 0.52
+    ambiguity_margin: 0.08
+    max_texture_penalty: 0.20
