@@ -77,3 +77,7 @@ python tools/camera_tuning_server.py --config config/default.yaml --host 0.0.0.0
 ## Jetson 本地低延迟预览
 
 只运行本地 OpenCV 检测窗口、以及网页与本地窗口联合运行的命令见 `docs/runbooks/jetson-local-preview.md`。纯本地模式从 YAML 的 `camera:` 段读取网页实测后保存的曝光、增益和采集帧率，不启动 FastAPI/Uvicorn。405 nm 激光在硬件上电后常亮，软件不能关闭，调试时必须物理断电或可靠遮光。
+
+## Jetson USB 云台与标定运行手册
+
+- [棋盘格标定、USB 云台联调与安全验收](docs/runbooks/jetson-gimbal-vision.md)
