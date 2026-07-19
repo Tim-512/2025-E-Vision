@@ -103,34 +103,67 @@ def load_calibration(path: str | Path) -> Calibration:
         raise CalibrationError("invalid calibration values") from exc
 
 
+@dataclass(frozen=True)
+class ChessboardCalibrationResult:
+    calibration: Calibration
+    input_images: int
+    usable_poses: int
+    rejected_images: int
+
+
+def _has_complete_corner_set(corners: np.ndarray | None, expected_count: int) -> bool:
+    return corners is not None and np.asarray(corners).shape == (expected_count, 1, 2)
+
+
+def solve_chessboard_with_report(
+    images: list[np.ndarray],
+    *,
+    pattern_size: tuple[int, int],
+    square_size_mm: float,
+) -> ChessboardCalibrationResult:
+    if not images:
+        raise CalibrationError("no calibration images")
+    sizes = []
+    for image in images:
+        if image.ndim not in (2, 3):
+            raise CalibrationError("calibration images must be gray or BGR arrays")
+        sizes.append((int(image.shape[1]), int(image.shape[0])))
+    if len(set(sizes)) != 1:
+        raise CalibrationError("all calibration images must have the same size")
+    image_size = sizes[0]
+    object_template = Calibration.chessboard_object_points(pattern_size, square_size_mm)
+    expected_corners = pattern_size[0] * pattern_size[1]
+    object_points: list[np.ndarray] = []
+    image_points: list[np.ndarray] = []
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+    for image in images:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+        found, corners = cv2.findChessboardCorners(gray, pattern_size)
+        if not found or not _has_complete_corner_set(corners, expected_corners):
+            continue
+        refined = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+        if not _has_complete_corner_set(refined, expected_corners):
+            continue
+        object_points.append(object_template.copy())
+        image_points.append(refined)
+    usable = len(image_points)
+    if usable < 10:
+        raise CalibrationError(f"need at least 10 usable chessboard poses, got {usable}")
+    rms, matrix, distortion, _, _ = cv2.calibrateCamera(
+        object_points, image_points, image_size, None, None
+    )
+    value = Calibration(image_size, matrix, distortion, float(rms))
+    return ChessboardCalibrationResult(value, len(images), usable, len(images) - usable)
+
+
 def solve_chessboard(
     images: list[np.ndarray],
     *,
     pattern_size: tuple[int, int],
     square_size_mm: float,
 ) -> Calibration:
-    if not images:
-        raise CalibrationError("no calibration images")
-    object_template = Calibration.chessboard_object_points(pattern_size, square_size_mm)
-    object_points: list[np.ndarray] = []
-    image_points: list[np.ndarray] = []
-    image_size: tuple[int, int] | None = None
-    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 40, 0.001)
-    for image in images:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
-        size = (gray.shape[1], gray.shape[0])
-        if image_size is None:
-            image_size = size
-        elif size != image_size:
-            raise CalibrationError("calibration images have different sizes")
-        found, corners = cv2.findChessboardCorners(gray, pattern_size)
-        if not found:
-            continue
-        refined = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
-        object_points.append(object_template.copy())
-        image_points.append(refined)
-    if len(image_points) < 10:
-        raise CalibrationError(f"only {len(image_points)} usable chessboard poses; at least 10 required")
-    assert image_size is not None
-    rms, matrix, distortion, _, _ = cv2.calibrateCamera(object_points, image_points, image_size, None, None)
-    return Calibration(image_size, matrix, distortion, float(rms))
+    return solve_chessboard_with_report(
+        images,
+        pattern_size=pattern_size,
+        square_size_mm=square_size_mm,
+    ).calibration

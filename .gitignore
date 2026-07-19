@@ -38,3 +38,4 @@ datasets/target_board/images/
 datasets/target_board/labels/
 datasets/target_board/staging/
 datasets/target_board/*.cache
+config/camera_calibration.yaml

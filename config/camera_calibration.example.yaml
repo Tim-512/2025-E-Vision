@@ -1,8 +1,8 @@
-﻿image_width: 1280
-image_height: 1024
+schema_version: 1
+image_size: [1280, 1024]
 camera_matrix:
-  - [null, 0.0, null]
-  - [0.0, null, null]
+  - [900.0, 0.0, 640.0]
+  - [0.0, 900.0, 512.0]
   - [0.0, 0.0, 1.0]
-distortion: [null, null, null, null, null]
-rms_px: null
+distortion: [0.0, 0.0, 0.0, 0.0, 0.0]
+rms_px: 0.5
