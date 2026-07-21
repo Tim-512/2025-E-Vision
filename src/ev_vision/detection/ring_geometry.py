@@ -196,17 +196,14 @@ def detect_concentric_arcs(
     ratio_score, scale, matched = _ratio_match(arcs, config, expected_scale_px_per_mm)
     coverage_score = float(np.mean([arc.coverage for arc in matched or arcs]))
     visible_count = len(matched or arcs)
-    valid = (
+    valid = bool(
         visible_count >= config.min_multiple_arcs
-        and common_center_score >= 0.60
-        and ratio_score >= 0.70
+        and scale is not None
+        and np.isfinite(scale)
+        and scale > 0.0
+        and np.all(np.isfinite(center))
     )
-    if ratio_score < 0.70:
-        reason = DetectionFailure.RING_RATIO_INVALID
-    elif common_center_score < 0.60:
-        reason = DetectionFailure.RING_CENTER_INCONSISTENT
-    else:
-        reason = None
+    reason = None if valid else DetectionFailure.RING_RATIO_INVALID
     return RingGeometryResult(
         valid=valid,
         center_px=(float(center[0]), float(center[1])),

@@ -48,7 +48,7 @@ def test_classifies_strong_medium_and_rejected_rings() -> None:
         ring_result(count=3, common_center=0.80, ratio=0.85, coverage=0.25), config
     ) is RingQuality.STRONG
     assert classify_ring(
-        ring_result(count=2, common_center=0.70, ratio=0.75, coverage=0.18), config
+        ring_result(count=2, common_center=0.62, ratio=0.66, coverage=0.13), config
     ) is RingQuality.MEDIUM
     assert classify_ring(
         ring_result(count=1, common_center=0.95, ratio=0.95, coverage=0.90), config

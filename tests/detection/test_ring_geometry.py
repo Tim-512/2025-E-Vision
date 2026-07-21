@@ -33,6 +33,26 @@ def test_non_red_gray_intensities_are_equivalent():
     assert a.center_px == pytest.approx(b.center_px, abs=3.0)
 
 
+def test_structural_two_ring_candidate_reaches_quality_classifier(monkeypatch):
+    import ev_vision.detection.ring_geometry as module
+    from ev_vision.detection.ring_geometry import ArcFit
+
+    arcs = (
+        ArcFit((80.0, 60.0), (40.0, 40.0), 0.0, 20.0, 0.20, 0.5),
+        ArcFit((80.5, 60.0), (82.0, 82.0), 0.0, 41.0, 0.20, 0.5),
+    )
+    monkeypatch.setattr(module.cv2, "findContours", lambda *args, **kwargs: ([np.zeros((12, 1, 2), np.int32)] * 2, None))
+    iterator = iter(arcs)
+    monkeypatch.setattr(module, "_fit_arc", lambda contour: next(iterator))
+    monkeypatch.setattr(module, "_ratio_match", lambda *args, **kwargs: (0.65, 1.0, arcs))
+
+    result = detect_concentric_arcs(np.zeros((120, 160), np.uint8), RingGeometryConfig())
+
+    assert result.visible_arc_count == 2
+    assert result.ratio_score == pytest.approx(0.65)
+    assert result.valid is True
+
+
 def test_wrong_radius_ratios_are_rejected():
     image = np.zeros((720, 960), np.uint8)
     for radius in (35, 69, 111, 143, 209):
@@ -40,8 +60,12 @@ def test_wrong_radius_ratios_are_rejected():
     result = detect_concentric_arcs(
         image, RingGeometryConfig(ratio_tolerance=0.10)
     )
-    assert result.valid is False
+    assert result.valid is True
     assert result.ratio_score < 0.7
+
+    from ev_vision.config import RingFirstConfig
+    from ev_vision.detection.ring_first import RingQuality, classify_ring
+    assert classify_ring(result, RingFirstConfig()) is RingQuality.REJECTED
 
 
 def test_partial_multiple_arcs_recover_center_near_edge():
