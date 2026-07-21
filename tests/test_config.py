@@ -202,3 +202,41 @@ def test_rejects_non_monotonic_ring_ratios(tmp_path: Path) -> None:
     )
     with pytest.raises(ConfigError, match="expected_radius_ratios"):
         load_config(path)
+
+
+def test_ring_first_configuration_defaults_and_yaml_override(tmp_path: Path) -> None:
+    defaults = load_config(write_config(tmp_path, {}))
+    assert defaults.detection.ring_first.allow_medium_acquisition is True
+    assert defaults.detection.ring_first.white_board_interval_frames == 6
+
+    path = write_detection_config(
+        tmp_path,
+        {
+            "ring_first": {
+                "white_board_interval_frames": 8,
+                "medium_common_center_score": 0.68,
+            }
+        },
+    )
+    config = load_config(path)
+    assert config.detection.ring_first.white_board_interval_frames == 8
+    assert config.detection.ring_first.medium_common_center_score == pytest.approx(0.68)
+
+
+@pytest.mark.parametrize(
+    ("patch", "message"),
+    [
+        ({"white_board_interval_frames": 0}, "white_board_interval_frames"),
+        ({"medium_min_arcs": 1}, "medium_min_arcs"),
+        ({"strong_min_arcs": 1}, "strong_min_arcs"),
+        ({"strong_common_center_score": 0.60}, "strong_common_center_score"),
+        ({"strong_ratio_score": 0.60}, "strong_ratio_score"),
+        ({"strong_coverage_score": 0.10}, "strong_coverage_score"),
+    ],
+)
+def test_ring_first_configuration_rejects_invalid_values(
+    tmp_path: Path, patch: dict[str, object], message: str
+) -> None:
+    path = write_detection_config(tmp_path, {"ring_first": patch})
+    with pytest.raises(ConfigError, match=message):
+        load_config(path)

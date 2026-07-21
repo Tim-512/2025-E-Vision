@@ -158,6 +158,21 @@ class RingGeometryConfig:
 
 
 @dataclass(frozen=True)
+class RingFirstConfig:
+    enabled: bool = True
+    allow_medium_acquisition: bool = True
+    white_board_interval_frames: int = 6
+    strong_min_arcs: int = 3
+    strong_common_center_score: float = 0.75
+    strong_ratio_score: float = 0.80
+    strong_coverage_score: float = 0.20
+    medium_min_arcs: int = 2
+    medium_common_center_score: float = 0.65
+    medium_ratio_score: float = 0.70
+    medium_coverage_score: float = 0.15
+
+
+@dataclass(frozen=True)
 class ClassicalScoringConfig:
     white_weight: float = 0.24
     geometry_weight: float = 0.22
@@ -209,6 +224,7 @@ class DetectionConfig:
     )
     white_board: WhiteBoardConfig = field(default_factory=WhiteBoardConfig)
     rings: RingGeometryConfig = field(default_factory=RingGeometryConfig)
+    ring_first: RingFirstConfig = field(default_factory=RingFirstConfig)
     classical_scoring: ClassicalScoringConfig = field(
         default_factory=ClassicalScoringConfig
     )
@@ -242,6 +258,7 @@ _DETECTION_SECTIONS: dict[str, type[Any]] = {
     "normalization": ImageNormalizationConfig,
     "white_board": WhiteBoardConfig,
     "rings": RingGeometryConfig,
+    "ring_first": RingFirstConfig,
     "classical_scoring": ClassicalScoringConfig,
 }
 
@@ -527,6 +544,38 @@ def _validate_detection(cfg: DetectionConfig) -> None:
         strict=True,
     ):
         _non_negative(f"detection.classical_scoring.{name}", value)
+    ring_first = cfg.ring_first
+    _positive_integer(
+        "detection.ring_first.white_board_interval_frames",
+        ring_first.white_board_interval_frames,
+    )
+    _positive_integer("detection.ring_first.strong_min_arcs", ring_first.strong_min_arcs)
+    _positive_integer("detection.ring_first.medium_min_arcs", ring_first.medium_min_arcs)
+    if ring_first.medium_min_arcs < 2:
+        raise ConfigError("detection.ring_first.medium_min_arcs must be at least 2")
+    if ring_first.strong_min_arcs < ring_first.medium_min_arcs:
+        raise ConfigError(
+            "detection.ring_first.strong_min_arcs must be at least medium_min_arcs"
+        )
+    for name in (
+        "strong_common_center_score",
+        "strong_ratio_score",
+        "strong_coverage_score",
+        "medium_common_center_score",
+        "medium_ratio_score",
+        "medium_coverage_score",
+    ):
+        _unit_interval(f"detection.ring_first.{name}", getattr(ring_first, name))
+    for strong_name, medium_name in (
+        ("strong_common_center_score", "medium_common_center_score"),
+        ("strong_ratio_score", "medium_ratio_score"),
+        ("strong_coverage_score", "medium_coverage_score"),
+    ):
+        if getattr(ring_first, strong_name) < getattr(ring_first, medium_name):
+            raise ConfigError(
+                f"detection.ring_first.{strong_name} must be at least {medium_name}"
+            )
+
     if abs(sum(cfg.classical_scoring.weights) - 1.0) > 1e-6:
         raise ConfigError(
             "detection.classical_scoring weights must sum to 1.0"
