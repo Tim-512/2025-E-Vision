@@ -187,3 +187,96 @@ def test_detector_source_has_no_red_or_model_dependency() -> None:
     assert "color_bgr2hsv" not in source
     assert "red_channel" not in source
     assert "red_mask" not in source
+
+
+def _ring_geometry_result(
+    *,
+    count: int = 2,
+    center: tuple[float, float] = (160.0, 120.0),
+    common_center: float = 0.72,
+    ratio: float = 0.76,
+    coverage: float = 0.20,
+):
+    from ev_vision.detection.ring_geometry import ArcFit, RingGeometryResult
+
+    arcs = tuple(
+        ArcFit(
+            center_px=center,
+            axes_px=(20.0 * (index + 1), 20.0 * (index + 1)),
+            angle_deg=0.0,
+            equivalent_radius_px=20.0 * (index + 1),
+            coverage=coverage,
+            residual_px=0.5,
+        )
+        for index in range(count)
+    )
+    return RingGeometryResult(
+        valid=True,
+        center_px=center,
+        arcs=arcs,
+        visible_arc_count=count,
+        common_center_score=common_center,
+        ratio_score=ratio,
+        coverage_score=coverage,
+        scale_px_per_mm=1.0,
+        failure_reason=None,
+    )
+
+
+def test_medium_ring_only_observations_can_confirm_tracking(monkeypatch) -> None:
+    import ev_vision.detection.classical_board as module
+
+    monkeypatch.setattr(module, "find_white_board_candidates", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        module,
+        "detect_concentric_arcs",
+        lambda *args, **kwargs: _ring_geometry_result(),
+    )
+    subject = ClassicalBoardDetector(DetectionConfig())
+    image = np.zeros((240, 320, 3), np.uint8)
+
+    results = [
+        subject.detect(
+            image,
+            captured_ns=1_000_000_000 + sequence * 10_000_000,
+            source_sequence=sequence,
+        )
+        for sequence in range(1, 4)
+    ]
+
+    assert [item.tracking_state for item in results] == [
+        "CONFIRMING",
+        "CONFIRMING",
+        "TRACKING",
+    ]
+    assert results[-1].target_valid is True
+    assert results[-1].observation_source is ObservationSource.CONCENTRIC_ARCS
+    assert results[-1].center_px == pytest.approx((160.0, 120.0))
+
+
+def test_single_ring_only_observation_cannot_start_tracking(monkeypatch) -> None:
+    import ev_vision.detection.classical_board as module
+
+    monkeypatch.setattr(module, "find_white_board_candidates", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        module,
+        "detect_concentric_arcs",
+        lambda *args, **kwargs: _ring_geometry_result(
+            count=1,
+            common_center=0.95,
+            ratio=0.95,
+            coverage=0.90,
+        ),
+    )
+    subject = ClassicalBoardDetector(DetectionConfig())
+    image = np.zeros((240, 320, 3), np.uint8)
+
+    for sequence in range(1, 4):
+        result = subject.detect(
+            image,
+            captured_ns=1_000_000_000 + sequence * 10_000_000,
+            source_sequence=sequence,
+        )
+
+    assert result.target_valid is False
+    assert result.center_px is None

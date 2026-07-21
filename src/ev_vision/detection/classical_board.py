@@ -18,6 +18,7 @@ from ev_vision.detection.debug_rendering import render_debug_images
 from ev_vision.detection.failures import DetectionFailure
 from ev_vision.detection.image_normalization import NormalizedFrame, normalize_frame
 from ev_vision.detection.partial_board import BoardHistory, fuse_partial_observation, predicted_roi
+from ev_vision.detection.ring_first import RingQuality, classify_ring
 from ev_vision.detection.ring_geometry import RingGeometryResult, detect_concentric_arcs
 from ev_vision.detection.white_board import WhiteBoardCandidate, find_white_board_candidates
 from ev_vision.tracking.board_tracker import (
@@ -214,11 +215,12 @@ class ClassicalBoardDetector:
             roi_xyxy=roi_xyxy,
         )
         if not white_candidates:
-            return _FullAcquisition(
-                self._miss(captured_ns, source_sequence, DetectionFailure.NO_WHITE_CANDIDATE),
-                (),
-                None,
-                None,
+            return self._acquire_rings_only(
+                normalized,
+                captured_ns=captured_ns,
+                source_sequence=source_sequence,
+                roi_xyxy=roi_xyxy,
+                failure_reason=DetectionFailure.NO_WHITE_CANDIDATE,
             )
 
         evidence: list[CandidateEvidence] = []
@@ -273,15 +275,20 @@ class ClassicalBoardDetector:
             for candidate, scored in zip(white_candidates, ranked.evaluations, strict=True)
         )
         if ranked.best is None:
-            return _FullAcquisition(
-                self._miss(
-                    captured_ns,
-                    source_sequence,
-                    ranked.failure_reason or DetectionFailure.LOW_INTERNAL_STRUCTURE,
+            ring_only = self._acquire_rings_only(
+                normalized,
+                captured_ns=captured_ns,
+                source_sequence=source_sequence,
+                roi_xyxy=roi_xyxy,
+                failure_reason=(
+                    ranked.failure_reason or DetectionFailure.LOW_INTERNAL_STRUCTURE
                 ),
+            )
+            return _FullAcquisition(
+                ring_only.observation,
                 evaluations,
-                None,
-                ring_results[0] if ring_results else None,
+                ring_only.solution,
+                ring_only.ring_result,
             )
         best_index = next(
             index for index, scored in enumerate(ranked.evaluations)
@@ -309,6 +316,54 @@ class ClassicalBoardDetector:
             confidence=ranked.best.combined_score,
         )
         return _FullAcquisition(observation, evaluations, solution, ring)
+
+    def _acquire_rings_only(
+        self,
+        normalized: NormalizedFrame,
+        *,
+        captured_ns: int,
+        source_sequence: int,
+        roi_xyxy: tuple[int, int, int, int] | None = None,
+        failure_reason: DetectionFailure = DetectionFailure.LOW_INTERNAL_STRUCTURE,
+    ) -> _FullAcquisition:
+        ring = detect_concentric_arcs(
+            normalized.ring_edge_mask,
+            self._config.rings,
+            expected_center_px=(
+                self._history.center_px if self._history is not None else None
+            ),
+            expected_scale_px_per_mm=(
+                self._history.scale_px_per_mm if self._history is not None else None
+            ),
+            roi_xyxy=roi_xyxy,
+        )
+        quality = classify_ring(ring, self._config.ring_first)
+        if quality is RingQuality.REJECTED or ring.center_px is None:
+            return _FullAcquisition(
+                self._miss(captured_ns, source_sequence, failure_reason),
+                (),
+                None,
+                ring,
+            )
+        confidence = float(np.clip(
+            0.45 * ring.common_center_score
+            + 0.35 * ring.ratio_score
+            + 0.20 * ring.coverage_score,
+            0.0,
+            1.0,
+        ))
+        observation = TrackObservation(
+            timestamp_ns=captured_ns,
+            source_sequence=source_sequence,
+            detected=True,
+            source=ObservationSource.CONCENTRIC_ARCS,
+            center_px=ring.center_px,
+            corners_px=None,
+            scale_px_per_mm=ring.scale_px_per_mm,
+            confidence=confidence,
+            acquisition_eligible=True,
+        )
+        return _FullAcquisition(observation, (), None, ring)
 
     def _acquire_partial(
         self,

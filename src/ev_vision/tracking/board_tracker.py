@@ -38,6 +38,7 @@ class TrackObservation:
     scale_px_per_mm: float | None = None
     confidence: float = 0.0
     failure_reason: DetectionFailure | None = None
+    acquisition_eligible: bool = False
 
 
 @dataclass(frozen=True)
@@ -101,9 +102,14 @@ class BoardTracker:
             TrackingState.LOST,
         }
         if acquisition:
-            if not self._is_complete_full_board(result):
-                return self._ignore_partial_during_acquisition(result)
-            return self._accept_full(result, confirming=True)
+            if self._is_complete_full_board(result):
+                return self._accept_full(result, confirming=True)
+            if (
+                result.source is ObservationSource.CONCENTRIC_ARCS
+                and result.acquisition_eligible
+            ):
+                return self._accept_confirming_rings(result)
+            return self._ignore_partial_during_acquisition(result)
 
         if result.source is ObservationSource.FULL_BOARD:
             if not self._is_complete_full_board(result):
@@ -172,6 +178,39 @@ class BoardTracker:
             target_valid=state is TrackingState.TRACKING,
             observation=result,
             observation_source=ObservationSource.FULL_BOARD,
+            predicted_center_px=None,
+            confirmation_count=min(confirmation_count, self.config.confirm_frames),
+            miss_count=0,
+            predicted_frames=0,
+            source_age_us=0,
+            velocity_px_s=self._predictor.velocity_px_s,
+            scale_px_per_mm=self._latest_scale,
+            failure_reason=None,
+        )
+        return self.latest
+
+    def _accept_confirming_rings(self, result: TrackObservation) -> TrackedBoardResult:
+        rejection = self._motion_rejection(result, require_corners=False)
+        if rejection is not None:
+            return self._reject(result, rejection)
+
+        confirmation_count = (
+            self.latest.confirmation_count + 1
+            if self.latest.state is TrackingState.CONFIRMING
+            else 1
+        )
+        state = (
+            TrackingState.TRACKING
+            if confirmation_count >= self.config.confirm_frames
+            else TrackingState.CONFIRMING
+        )
+        self._remember(result)
+        self._single_arc_frames = 0
+        self.latest = TrackedBoardResult(
+            state=state,
+            target_valid=state is TrackingState.TRACKING,
+            observation=result,
+            observation_source=result.source,
             predicted_center_px=None,
             confirmation_count=min(confirmation_count, self.config.confirm_frames),
             miss_count=0,

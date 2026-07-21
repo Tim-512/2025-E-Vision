@@ -219,3 +219,43 @@ def test_motion_predictor_enforces_maximum_horizon() -> None:
     predictor.observe((104.0, 82.0), 1_020_000_000)
     assert predictor.predict(1_040_000_000, max_horizon_ns=150_000_000) == pytest.approx((108.0, 84.0))
     assert predictor.predict(1_200_000_001, max_horizon_ns=150_000_000) is None
+
+
+def test_concentric_arcs_can_confirm_acquisition() -> None:
+    tracker = BoardTracker(config(confirm_frames=3))
+    for sequence in range(1, 4):
+        result = tracker.update(
+            TrackObservation(
+                timestamp_ns=1_000_000_000 + sequence * 10_000_000,
+                source_sequence=sequence,
+                detected=True,
+                source=ObservationSource.CONCENTRIC_ARCS,
+                center_px=(100.0 + sequence, 100.0),
+                corners_px=None,
+                scale_px_per_mm=1.2,
+                confidence=0.75,
+                acquisition_eligible=True,
+            )
+        )
+    assert result.state is TrackingState.TRACKING
+    assert result.target_valid is True
+    assert result.observation_source is ObservationSource.CONCENTRIC_ARCS
+
+
+def test_single_arc_cannot_confirm_acquisition() -> None:
+    tracker = BoardTracker(config(confirm_frames=2))
+    for sequence in range(1, 4):
+        result = tracker.update(
+            TrackObservation(
+                timestamp_ns=1_000_000_000 + sequence * 10_000_000,
+                source_sequence=sequence,
+                detected=True,
+                source=ObservationSource.SINGLE_ARC,
+                center_px=(100.0, 100.0),
+                corners_px=None,
+                scale_px_per_mm=1.2,
+                confidence=0.95,
+            )
+        )
+    assert result.target_valid is False
+    assert result.state is TrackingState.SEARCHING
