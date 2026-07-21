@@ -122,14 +122,23 @@ detection:
     enabled: true
     allow_medium_acquisition: true
     white_board_interval_frames: 6
+    ring_only: false
+    immediate_strong_acquisition: true
+    medium_confirm_frames: 2
     strong_min_arcs: 3
     strong_common_center_score: 0.75
     strong_ratio_score: 0.80
     strong_coverage_score: 0.20
     medium_min_arcs: 2
-    medium_common_center_score: 0.65
-    medium_ratio_score: 0.70
-    medium_coverage_score: 0.15
+    medium_common_center_score: 0.60
+    medium_ratio_score: 0.65
+    medium_coverage_score: 0.12
+    roi_min_half_extent_px: 72.0
+    roi_outer_extent_per_scale: 115.0
+    roi_prediction_padding_px: 24.0
+    roi_safety_factor: 1.30
+    roi_miss_expand_px: 72.0
+    roi_full_frame_after_misses: 3
   classical_scoring:
     white_weight: 0.24
     geometry_weight: 0.22

@@ -162,14 +162,23 @@ class RingFirstConfig:
     enabled: bool = True
     allow_medium_acquisition: bool = True
     white_board_interval_frames: int = 6
+    ring_only: bool = False
+    immediate_strong_acquisition: bool = True
+    medium_confirm_frames: int = 2
     strong_min_arcs: int = 3
     strong_common_center_score: float = 0.75
     strong_ratio_score: float = 0.80
     strong_coverage_score: float = 0.20
     medium_min_arcs: int = 2
-    medium_common_center_score: float = 0.65
-    medium_ratio_score: float = 0.70
-    medium_coverage_score: float = 0.15
+    medium_common_center_score: float = 0.60
+    medium_ratio_score: float = 0.65
+    medium_coverage_score: float = 0.12
+    roi_min_half_extent_px: float = 72.0
+    roi_outer_extent_per_scale: float = 115.0
+    roi_prediction_padding_px: float = 24.0
+    roi_safety_factor: float = 1.30
+    roi_miss_expand_px: float = 72.0
+    roi_full_frame_after_misses: int = 3
 
 
 @dataclass(frozen=True)
@@ -548,6 +557,30 @@ def _validate_detection(cfg: DetectionConfig) -> None:
     _positive_integer(
         "detection.ring_first.white_board_interval_frames",
         ring_first.white_board_interval_frames,
+    )
+    _positive_integer(
+        "detection.ring_first.medium_confirm_frames",
+        ring_first.medium_confirm_frames,
+    )
+    _positive("detection.ring_first.roi_min_half_extent_px", ring_first.roi_min_half_extent_px)
+    _positive(
+        "detection.ring_first.roi_outer_extent_per_scale",
+        ring_first.roi_outer_extent_per_scale,
+    )
+    _non_negative(
+        "detection.ring_first.roi_prediction_padding_px",
+        ring_first.roi_prediction_padding_px,
+    )
+    _positive("detection.ring_first.roi_safety_factor", ring_first.roi_safety_factor)
+    if ring_first.roi_safety_factor < 1.0:
+        raise ConfigError("detection.ring_first.roi_safety_factor must be at least 1.0")
+    _non_negative(
+        "detection.ring_first.roi_miss_expand_px",
+        ring_first.roi_miss_expand_px,
+    )
+    _positive_integer(
+        "detection.ring_first.roi_full_frame_after_misses",
+        ring_first.roi_full_frame_after_misses,
     )
     _positive_integer("detection.ring_first.strong_min_arcs", ring_first.strong_min_arcs)
     _positive_integer("detection.ring_first.medium_min_arcs", ring_first.medium_min_arcs)

@@ -206,32 +206,50 @@ def test_rejects_non_monotonic_ring_ratios(tmp_path: Path) -> None:
 
 def test_ring_first_configuration_defaults_and_yaml_override(tmp_path: Path) -> None:
     defaults = load_config(write_config(tmp_path, {}))
-    assert defaults.detection.ring_first.allow_medium_acquisition is True
-    assert defaults.detection.ring_first.white_board_interval_frames == 6
+    ring = defaults.detection.ring_first
+    assert ring.allow_medium_acquisition is True
+    assert ring.ring_only is False
+    assert ring.immediate_strong_acquisition is True
+    assert ring.medium_confirm_frames == 2
+    assert ring.medium_common_center_score == pytest.approx(0.60)
+    assert ring.medium_ratio_score == pytest.approx(0.65)
+    assert ring.medium_coverage_score == pytest.approx(0.12)
+    assert ring.roi_min_half_extent_px == pytest.approx(72.0)
+    assert ring.roi_safety_factor == pytest.approx(1.30)
+    assert ring.roi_full_frame_after_misses == 3
 
     path = write_detection_config(
         tmp_path,
         {
             "ring_first": {
-                "white_board_interval_frames": 8,
+                "ring_only": True,
+                "medium_confirm_frames": 3,
                 "medium_common_center_score": 0.68,
+                "roi_safety_factor": 1.4,
             }
         },
     )
     config = load_config(path)
-    assert config.detection.ring_first.white_board_interval_frames == 8
+    assert config.detection.ring_first.ring_only is True
+    assert config.detection.ring_first.medium_confirm_frames == 3
     assert config.detection.ring_first.medium_common_center_score == pytest.approx(0.68)
+    assert config.detection.ring_first.roi_safety_factor == pytest.approx(1.4)
 
 
 @pytest.mark.parametrize(
     ("patch", "message"),
     [
         ({"white_board_interval_frames": 0}, "white_board_interval_frames"),
+        ({"medium_confirm_frames": 0}, "medium_confirm_frames"),
+        ({"roi_min_half_extent_px": 0}, "roi_min_half_extent_px"),
+        ({"roi_safety_factor": 0.9}, "roi_safety_factor"),
+        ({"roi_miss_expand_px": -1}, "roi_miss_expand_px"),
+        ({"roi_full_frame_after_misses": 0}, "roi_full_frame_after_misses"),
         ({"medium_min_arcs": 1}, "medium_min_arcs"),
         ({"strong_min_arcs": 1}, "strong_min_arcs"),
-        ({"strong_common_center_score": 0.60}, "strong_common_center_score"),
-        ({"strong_ratio_score": 0.60}, "strong_ratio_score"),
-        ({"strong_coverage_score": 0.10}, "strong_coverage_score"),
+        ({"strong_common_center_score": 0.59}, "strong_common_center_score"),
+        ({"strong_ratio_score": 0.64}, "strong_ratio_score"),
+        ({"strong_coverage_score": 0.11}, "strong_coverage_score"),
     ],
 )
 def test_ring_first_configuration_rejects_invalid_values(
@@ -248,7 +266,7 @@ def test_jetson_local_uses_field_tuned_ring_first_settings() -> None:
     assert config.camera.exposure_us == 10_000
     assert config.camera.gain_db == pytest.approx(5.0)
     assert config.camera.acquisition_fps == pytest.approx(60.0)
-    assert config.detection.normalization.clahe_clip_limit == pytest.approx(8.5)
+    assert config.detection.normalization.clahe_clip_limit == pytest.approx(10.0)
     assert config.detection.white_board.min_white_occupancy == pytest.approx(0.5)
     assert config.detection.rings.ratio_tolerance == pytest.approx(0.18)
     assert config.detection.rings.min_arc_coverage == pytest.approx(0.18)
@@ -256,4 +274,7 @@ def test_jetson_local_uses_field_tuned_ring_first_settings() -> None:
     assert config.detection.classical_scoring.acquisition_threshold == pytest.approx(0.66)
     assert config.detection.ring_first.enabled is True
     assert config.detection.ring_first.allow_medium_acquisition is True
-    assert config.detection.ring_first.white_board_interval_frames == 6
+    assert config.detection.ring_first.ring_only is True
+    assert config.detection.ring_first.immediate_strong_acquisition is True
+    assert config.detection.ring_first.medium_confirm_frames == 2
+    assert config.detection.ring_first.medium_ratio_score == pytest.approx(0.65)
