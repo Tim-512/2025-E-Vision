@@ -10,3 +10,12 @@ predicted_control_max_age_ms: 60.0
 predicted_max_angle_step_deg: 1.5
 yaw_sign: 1
 pitch_sign: 1
+laser_pose_compensation_enabled: false
+laser_offset_x_mm: 0.0
+laser_offset_y_mm: 0.0
+laser_offset_z_mm: 0.0
+laser_yaw_bias_deg: 0.0
+laser_pitch_bias_deg: 0.0
+pose_min_distance_mm: 100.0
+pose_max_distance_mm: 10000.0
+pose_max_reprojection_error_px: 5.0

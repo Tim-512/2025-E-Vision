@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 import ev_vision.gimbal_usb.cli as cli
+from ev_vision.calibration import Calibration
 from ev_vision.gimbal_usb.config import GimbalUsbConfig
 from ev_vision.gimbal_usb.protocol import GimbalTargetCommand
 from ev_vision.gimbal_usb.target_angles import (
@@ -81,7 +82,10 @@ def camera_runtime(events: list[str], *, start_error: Exception | None = None):
     )
     return SimpleNamespace(
         service=FakeService(events, start_error=start_error),
-        config=SimpleNamespace(camera=camera),
+        config=SimpleNamespace(
+            camera=camera,
+            board=SimpleNamespace(width_cm=21.0, height_cm=29.7),
+        ),
     )
 
 
@@ -194,7 +198,57 @@ def test_build_angle_converter_loads_valid_calibration(monkeypatch) -> None:
         "max_rms_px": 0.4,
         "yaw_sign": -1,
         "pitch_sign": 1,
+        "laser_pose_compensation_enabled": False,
+        "laser_offset_x_mm": 0.0,
+        "laser_offset_y_mm": 0.0,
+        "laser_offset_z_mm": 0.0,
+        "laser_yaw_bias_deg": 0.0,
+        "laser_pitch_bias_deg": 0.0,
+        "board_size_mm": (210.0, 297.0),
+        "pose_min_distance_mm": 100.0,
+        "pose_max_distance_mm": 10000.0,
+        "pose_max_reprojection_error_px": 5.0,
     }
+
+
+def test_build_angle_converter_passes_laser_and_board_configuration(monkeypatch) -> None:
+    expected = object()
+    recorded = {}
+
+    def from_file(path, **kwargs):
+        recorded.update(path=path, **kwargs)
+        return expected
+
+    monkeypatch.setattr(TargetAngleConverter, "from_file", from_file)
+    config = gimbal_config(
+        laser_pose_compensation_enabled=True,
+        laser_offset_x_mm=35.0,
+        laser_offset_y_mm=-12.0,
+        laser_offset_z_mm=8.0,
+        laser_yaw_bias_deg=0.4,
+        laser_pitch_bias_deg=-0.3,
+        pose_min_distance_mm=250.0,
+        pose_max_distance_mm=5000.0,
+        pose_max_reprojection_error_px=3.0,
+    )
+
+    result = cli.build_angle_converter(
+        config,
+        image_size=(1280, 1024),
+        board_size_mm=(210.0, 297.0),
+    )
+
+    assert result is expected
+    assert recorded["laser_pose_compensation_enabled"] is True
+    assert recorded["laser_offset_x_mm"] == 35.0
+    assert recorded["laser_offset_y_mm"] == -12.0
+    assert recorded["laser_offset_z_mm"] == 8.0
+    assert recorded["laser_yaw_bias_deg"] == 0.4
+    assert recorded["laser_pitch_bias_deg"] == -0.3
+    assert recorded["board_size_mm"] == (210.0, 297.0)
+    assert recorded["pose_min_distance_mm"] == 250.0
+    assert recorded["pose_max_distance_mm"] == 5000.0
+    assert recorded["pose_max_reprojection_error_px"] == 3.0
 
 
 def test_build_worker_wires_gate_transport_and_output_rate(monkeypatch) -> None:
@@ -477,3 +531,59 @@ def test_tool_wrapper_delegates_to_cli() -> None:
     text = Path("tools/gimbal_vision.py").read_text(encoding="utf-8")
     assert "from ev_vision.gimbal_usb.cli import main" in text
     assert "raise SystemExit(main())" in text
+
+
+def test_runtime_snapshot_prints_latest_valid_angles() -> None:
+    runtime = camera_runtime([])
+    worker = FakeWorker([])
+    worker.snapshot = lambda: SimpleNamespace(
+        ticks=10,
+        sent_valid=3,
+        sent_invalid=7,
+        overruns=0,
+        last_error=None,
+        last_decision=SimpleNamespace(
+            command=GimbalTargetCommand(1.25, -2.5, True)
+        ),
+        serial=SimpleNamespace(connected=True, sent_frames=10, last_error=None),
+    )
+
+    text = cli.format_runtime_snapshot(runtime, worker)
+
+    assert "yaw=1.250deg" in text
+    assert "pitch=-2.500deg" in text
+
+
+def test_startup_summary_prints_laser_compensation_configuration(capsys) -> None:
+    runtime = camera_runtime([])
+    converter = TargetAngleConverter(
+        Calibration(
+            image_size=(1280, 1024),
+            camera_matrix=[[800.0, 0.0, 640.0], [0.0, 800.0, 512.0], [0.0, 0.0, 1.0]],
+            distortion=[0.0, 0.0, 0.0, 0.0, 0.0],
+            rms_px=0.3,
+        ),
+        laser_pose_compensation_enabled=True,
+        laser_offset_x_mm=35.0,
+        laser_offset_y_mm=-12.0,
+        laser_offset_z_mm=8.0,
+        laser_yaw_bias_deg=0.4,
+        laser_pitch_bias_deg=-0.3,
+        board_size_mm=(210.0, 297.0),
+    )
+    config = gimbal_config(
+        laser_pose_compensation_enabled=True,
+        laser_offset_x_mm=35.0,
+        laser_offset_y_mm=-12.0,
+        laser_offset_z_mm=8.0,
+        laser_yaw_bias_deg=0.4,
+        laser_pitch_bias_deg=-0.3,
+    )
+
+    cli.print_startup_summary(runtime, config, converter)
+
+    output = capsys.readouterr().out
+    assert "laser pose compensation=enabled" in output
+    assert "laser offset camera XYZ=(35.000, -12.000, 8.000) mm" in output
+    assert "laser outgoing bias yaw=0.400 deg, pitch=-0.300 deg" in output
+    assert "board size=210.0x297.0 mm" in output

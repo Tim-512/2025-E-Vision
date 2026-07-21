@@ -28,6 +28,15 @@ APPROVED_VALUES = {
     "predicted_max_angle_step_deg": 1.5,
     "yaw_sign": 1,
     "pitch_sign": 1,
+    "laser_pose_compensation_enabled": False,
+    "laser_offset_x_mm": 0.0,
+    "laser_offset_y_mm": 0.0,
+    "laser_offset_z_mm": 0.0,
+    "laser_yaw_bias_deg": 0.0,
+    "laser_pitch_bias_deg": 0.0,
+    "pose_min_distance_mm": 100.0,
+    "pose_max_distance_mm": 10000.0,
+    "pose_max_reprojection_error_px": 5.0,
 }
 
 
@@ -54,6 +63,15 @@ def test_loads_approved_gimbal_values(tmp_path: Path) -> None:
         predicted_max_angle_step_deg=1.5,
         yaw_sign=1,
         pitch_sign=1,
+        laser_pose_compensation_enabled=False,
+        laser_offset_x_mm=0.0,
+        laser_offset_y_mm=0.0,
+        laser_offset_z_mm=0.0,
+        laser_yaw_bias_deg=0.0,
+        laser_pitch_bias_deg=0.0,
+        pose_min_distance_mm=100.0,
+        pose_max_distance_mm=10000.0,
+        pose_max_reprojection_error_px=5.0,
     )
 
 
@@ -73,6 +91,15 @@ def test_minimal_yaml_uses_safe_defaults(tmp_path: Path) -> None:
     assert value.predicted_max_angle_step_deg == 1.5
     assert value.yaw_sign == 1
     assert value.pitch_sign == 1
+    assert value.laser_pose_compensation_enabled is False
+    assert value.laser_offset_x_mm == 0.0
+    assert value.laser_offset_y_mm == 0.0
+    assert value.laser_offset_z_mm == 0.0
+    assert value.laser_yaw_bias_deg == 0.0
+    assert value.laser_pitch_bias_deg == 0.0
+    assert value.pose_min_distance_mm == 100.0
+    assert value.pose_max_distance_mm == 10000.0
+    assert value.pose_max_reprojection_error_px == 5.0
 
 
 @pytest.mark.parametrize(
@@ -110,6 +137,17 @@ def test_minimal_yaml_uses_safe_defaults(tmp_path: Path) -> None:
         ("pitch_sign", 0),
         ("pitch_sign", -2),
         ("pitch_sign", False),
+        ("laser_pose_compensation_enabled", 1),
+        ("laser_offset_x_mm", True),
+        ("laser_offset_x_mm", math.nan),
+        ("laser_offset_y_mm", math.inf),
+        ("laser_offset_z_mm", -math.inf),
+        ("laser_yaw_bias_deg", math.nan),
+        ("laser_pitch_bias_deg", math.inf),
+        ("pose_min_distance_mm", 0),
+        ("pose_max_distance_mm", math.inf),
+        ("pose_max_reprojection_error_px", 0),
+        ("pose_max_reprojection_error_px", math.nan),
     ],
 )
 def test_rejects_unsafe_values(field: str, value: object) -> None:
@@ -125,6 +163,15 @@ def test_rejects_invalid_calibration_path() -> None:
     values["calibration_path"] = ""
 
     with pytest.raises(GimbalUsbConfigError, match="calibration_path"):
+        GimbalUsbConfig(**values).validate()
+
+
+def test_rejects_reversed_pose_distance_range() -> None:
+    values = dataclasses.asdict(GimbalUsbConfig(port="/dev/test"))
+    values["pose_min_distance_mm"] = 2000.0
+    values["pose_max_distance_mm"] = 1000.0
+
+    with pytest.raises(GimbalUsbConfigError, match="pose_max_distance_mm"):
         GimbalUsbConfig(**values).validate()
 
 

@@ -496,3 +496,162 @@ ps -ef | grep -E '[e]v-camera|[e]v-gimbal|[u]vicorn|[m]vviewer'
 - 预测第 1–3 帧有效，第 4 帧或 60 ms 后失效。
 - `Ctrl+C` 后 5 个安全帧和云台固件 >100 ms 超时保护。
 - 405 nm 激光在全部测试中的物理断开或机械遮挡措施。
+## 9. 激光非共轴方位补偿
+
+这一节用于补偿 405 nm 激光发射口与相机光心不重合造成的近距离视差。USB 帧仍保持原来的 26 字节格式；只修正发送给云台的 `yaw` 和 `pitch`，`distance_m`、`fire`、目标编号和保留字段都不改变。
+
+### 9.1 坐标和符号
+
+相机坐标采用 OpenCV 约定：
+
+- `+X`：图像向右。
+- `+Y`：图像向下。
+- `+Z`：沿相机光轴向前。
+
+`laser_offset_x_mm`、`laser_offset_y_mm`、`laser_offset_z_mm` 表示“激光发射口相对相机光心”的位置，单位为 mm。例如激光口在相机右侧 35 mm、上方 18 mm、前方 12 mm，应填写：
+
+```yaml
+laser_offset_x_mm: 35.0
+laser_offset_y_mm: -18.0
+laser_offset_z_mm: 12.0
+```
+
+程序先在相机坐标中计算 XYZ 平移补偿，再应用 `yaw_sign` 和 `pitch_sign`。`laser_yaw_bias_deg` 与 `laser_pitch_bias_deg` 是最终发给云台坐标系的固定角度微调量。
+
+### 9.2 建立 Jetson 本地云台配置
+
+共享的 `config/gimbal_usb.yaml` 保留安全默认值。比赛 Jetson 使用本地文件，避免 USB by-id、机械偏移和微调量被其他电脑覆盖：
+
+```bash
+mkdir -p "$HOME/.config/ev-vision"
+cp config/gimbal_usb.yaml "$HOME/.config/ev-vision/gimbal_usb.yaml"
+nano "$HOME/.config/ev-vision/gimbal_usb.yaml"
+```
+
+按 Jetson 实际设备和当前方向填写。当前 USB by-id 以 `ls -l /dev/serial/by-id/` 的输出为准，不要复制已经失效的旧序列号：
+
+```yaml
+port: /dev/serial/by-id/usb-RoboMaster_Gimbal_Vision_USB_305835803034-if00
+baudrate: 115200
+output_hz: 50.0
+calibration_path: config/camera_calibration.yaml
+max_calibration_rms_px: 0.5
+max_result_age_ms: 120.0
+reconnect_interval_s: 1.0
+predicted_control_max_frames: 3
+predicted_control_max_age_ms: 60.0
+predicted_max_angle_step_deg: 1.5
+yaw_sign: -1
+pitch_sign: 1
+
+laser_pose_compensation_enabled: true
+laser_offset_x_mm: 0.0
+laser_offset_y_mm: 0.0
+laser_offset_z_mm: 0.0
+laser_yaw_bias_deg: 0.0
+laser_pitch_bias_deg: 0.0
+pose_min_distance_mm: 100.0
+pose_max_distance_mm: 10000.0
+pose_max_reprojection_error_px: 5.0
+```
+
+启用补偿后，只有真实的 `FULL_BOARD` 完整靶面观测会使用四角点做 PnP 距离/视差补偿。圆环、局部靶面和纯预测结果只使用靶心角度加固定 bias；程序不会复用旧距离。PnP 解失败、深度超限或重投影误差过大时，会自动退回靶心角度，不会因为一次姿态解算失败而把有效目标清零。
+
+### 9.3 测量 XYZ 偏移
+
+1. 给相机和激光支架建立不易移动的机械基准面。
+2. 尽量量到相机成像光轴中心，而不是相机外壳边缘；无法直接量到时，可用镜头中心作为近似起点。
+3. 分别测量激光发射口相对镜头中心的左右、上下、前后距离。
+4. 按 9.1 的正负号填写，精确到 1 mm 已足够开始测试。
+5. XYZ 是机械尺寸，不要用 bias 去代替；bias 用于安装角度、云台零位及剩余系统误差。
+
+如果暂时无法可靠测量，先保持 XYZ 为 0，只标定 bias；之后再打开 `laser_pose_compensation_enabled` 并逐步加入实测 XYZ。
+
+### 9.4 固定角度 bias 标定
+
+**激光为上电常亮，开始前必须先物理断开激光电源或用可靠的不透光挡板封住发射口。USB 中的 `fire=0` 不能关闭激光。**
+
+1. 限制云台速度、电流和最大转角，准备物理急停。
+2. 先将 XYZ 与两个 bias 全设为 0，确认视觉框、靶心和 yaw/pitch 方向正确。
+3. 在常用中等距离固定靶子，让云台稳定对准视觉靶心。
+4. 在确保无人和无反射物的封闭条件下短时解除遮挡，观察光点相对靶心的偏差。
+5. 只调一个轴，每次修改 0.05–0.20°：
+   - 光点需要云台向当前“正 yaw”方向修正，就增大 `laser_yaw_bias_deg`；反之减小。
+   - 光点需要云台向当前“正 pitch”方向修正，就增大 `laser_pitch_bias_deg`；反之减小。
+6. 每次修改后重启进程；bias 不受距离变化影响，应优先在中等距离消除固定角误差。
+
+不要同时修改 `yaw_sign`/`pitch_sign` 和 bias。符号只负责坐标方向，bias 只负责固定零位误差。
+
+### 9.5 近、中、远三距离验收
+
+在近距离、常用距离、远距离各测试一次，并记录：目标距离、视觉 observation source、发送 yaw/pitch、激光落点横纵偏差。
+
+- 三个距离偏差方向和大小几乎相同：继续调固定 bias。
+- 中远距离较准、近距离偏差明显：检查 XYZ 测量值和正负号，确认当前观测为 `FULL_BOARD`。
+- 完整靶面时补偿有效，局部靶面时退回固定角：这是预期行为，因为局部/预测观测没有可信的实时深度。
+- 偏差突然变大或方向翻转：立即遮挡/断开激光，检查 `yaw_sign`、`pitch_sign` 和 XYZ 坐标定义。
+
+建议先把 `pose_max_reprojection_error_px` 保持为 `5.0`。只有在完整靶面四角稳定但经常回退时才逐步放宽，并检查相机标定、靶面尺寸和角点质量，不能为了“总是启用 PnP”无限放宽。
+
+### 9.6 使用最新相机参数启动 Jetson 本地窗口和 USB 输出
+
+比赛相机参数应保存在：
+
+```text
+$HOME/.config/ev-vision/competition.yaml
+```
+
+当前调好的关键值为：
+
+```yaml
+camera:
+  exposure_us: 10000
+  gain_db: 5.0
+  acquisition_fps: 60
+  auto_exposure: false
+  auto_gain: false
+  auto_white_balance: false
+
+detection:
+  normalization:
+    clahe_clip_limit: 8.5
+  white_board:
+    min_white_occupancy: 0.5
+  rings:
+    ratio_tolerance: 0.18
+    min_arc_coverage: 0.18
+  classical_scoring:
+    tracking_threshold: 0.52
+    acquisition_threshold: 0.66
+```
+
+从 Jetson 桌面终端启动：
+
+```bash
+cd ~/2025-E-Vision/2025-E-Vision
+source ~/anaconda3/etc/profile.d/conda.sh
+conda activate 2025-e-vision
+
+export PYTHONPATH="/opt/MVS/Samples/aarch64/Python/MvImport${PYTHONPATH:+:$PYTHONPATH}"
+export LD_LIBRARY_PATH="/opt/MVS/lib/aarch64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+ev-gimbal-vision \
+  --config "$HOME/.config/ev-vision/competition.yaml" \
+  --gimbal-config "$HOME/.config/ev-vision/gimbal_usb.yaml" \
+  --serial 00G02809155 \
+  --detection-fps 1000 \
+  --display \
+  --width 512 \
+  --display-fps 15
+```
+
+若终端提示 `DISPLAY is not set`，说明不是在 Jetson 桌面图形会话中执行；无显示器测试时删除 `--display --width 512 --display-fps 15`。启动摘要必须显示：补偿已启用、XYZ、bias、靶面尺寸、允许的 pose Z 范围和最大重投影误差。终端运行状态会显示最终发送的 `yaw=...deg pitch=...deg`。
+
+### 9.7 激光安全底线
+
+- 405 nm 激光在本项目中为硬件上电常亮，软件和 USB `fire=0` 都不是安全联锁。
+- 初次方向、XYZ 和 bias 测试必须物理断电或可靠遮挡。
+- 光束保持低于眼睛高度；现场不得有人处在光路或可能反射的方向。
+- 移除镜子、玻璃、亮面金属和其他镜面/强反射物。
+- 云台使用低速、低电流、小角度限制，并保留可立即切断激光和云台电源的物理急停。
+- 检测无效、串口断开或进程退出时，云台控制包会归零，但激光仍然亮；必须由硬件安全措施覆盖这种状态。

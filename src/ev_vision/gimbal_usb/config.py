@@ -26,6 +26,15 @@ class GimbalUsbConfig:
     predicted_max_angle_step_deg: float = 1.5
     yaw_sign: int = 1
     pitch_sign: int = 1
+    laser_pose_compensation_enabled: bool = False
+    laser_offset_x_mm: float = 0.0
+    laser_offset_y_mm: float = 0.0
+    laser_offset_z_mm: float = 0.0
+    laser_yaw_bias_deg: float = 0.0
+    laser_pitch_bias_deg: float = 0.0
+    pose_min_distance_mm: float = 100.0
+    pose_max_distance_mm: float = 10000.0
+    pose_max_reprojection_error_px: float = 5.0
 
     def validate(self) -> None:
         if not isinstance(self.port, str) or not self.port.strip():
@@ -71,6 +80,45 @@ class GimbalUsbConfig:
                 or float(value) <= 0.0
             ):
                 raise GimbalUsbConfigError(f"{name} must be positive and finite")
+
+        if not isinstance(self.laser_pose_compensation_enabled, bool):
+            raise GimbalUsbConfigError(
+                "laser_pose_compensation_enabled must be a boolean"
+            )
+
+        finite_fields = (
+            "laser_offset_x_mm",
+            "laser_offset_y_mm",
+            "laser_offset_z_mm",
+            "laser_yaw_bias_deg",
+            "laser_pitch_bias_deg",
+        )
+        for name in finite_fields:
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+            ):
+                raise GimbalUsbConfigError(f"{name} must be finite")
+
+        for name in (
+            "pose_min_distance_mm",
+            "pose_max_distance_mm",
+            "pose_max_reprojection_error_px",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) <= 0.0
+            ):
+                raise GimbalUsbConfigError(f"{name} must be positive and finite")
+        if float(self.pose_max_distance_mm) <= float(self.pose_min_distance_mm):
+            raise GimbalUsbConfigError(
+                "pose_max_distance_mm must be greater than pose_min_distance_mm"
+            )
 
         for name in ("yaw_sign", "pitch_sign"):
             value = getattr(self, name)

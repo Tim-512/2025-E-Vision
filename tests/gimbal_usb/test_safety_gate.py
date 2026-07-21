@@ -24,12 +24,14 @@ class FakeConverter:
 
     def __init__(self, angles: tuple[float, float]) -> None:
         self.angles = angles
-        self.calls: list[tuple[float, float] | None] = []
+        self.calls: list[tuple[tuple[float, float] | None, tuple[tuple[float, float], ...]]] = []
 
     def convert(
-        self, center_px: tuple[float, float] | None
+        self,
+        center_px: tuple[float, float] | None,
+        corners_px: tuple[tuple[float, float], ...] = (),
     ) -> tuple[float, float]:
-        self.calls.append(center_px)
+        self.calls.append((center_px, corners_px))
         return self.angles
 
 
@@ -40,9 +42,11 @@ class SequenceConverter:
         self._angles = iter(angles)
 
     def convert(
-        self, center_px: tuple[float, float] | None
+        self,
+        center_px: tuple[float, float] | None,
+        corners_px: tuple[tuple[float, float], ...] = (),
     ) -> tuple[float, float]:
-        del center_px
+        del center_px, corners_px
         return next(self._angles)
 
 
@@ -50,15 +54,15 @@ class UnavailableConverter:
     available = False
     reason = "calibration unavailable"
 
-    def convert(self, center_px):
+    def convert(self, center_px, corners_px=()):
         raise AssertionError("unavailable converter must not be called")
 
 
 class RaisingConverter:
     available = True
 
-    def convert(self, center_px):
-        del center_px
+    def convert(self, center_px, corners_px=()):
+        del center_px, corners_px
         raise RuntimeError("calibration conversion failed")
 
 
@@ -109,6 +113,20 @@ def test_fresh_real_source_is_immediately_valid(source: str) -> None:
     assert decision.command == GimbalTargetCommand(1.0, -2.0, True)
     assert decision.reason == "real_observation"
     assert decision.observation_source == source
+
+
+def test_only_full_board_passes_corners_to_angle_converter() -> None:
+    corners = ((1.0, 2.0), (3.0, 2.0), (3.0, 4.0), (1.0, 4.0))
+    converter = FakeConverter((1.0, -2.0))
+    gate = GimbalControlGate(converter, limits())
+
+    gate.evaluate(snapshot(observation_source="FULL_BOARD", corners_px=corners))
+    gate.evaluate(snapshot(observation_source="CONCENTRIC_ARCS", corners_px=corners))
+
+    assert converter.calls == [
+        ((640.0, 512.0), corners),
+        ((640.0, 512.0), ()),
+    ]
 
 
 def test_observation_source_enum_is_supported() -> None:
@@ -339,8 +357,8 @@ def test_prediction_converter_exception_latches() -> None:
         def __init__(self) -> None:
             self.calls = 0
 
-        def convert(self, center_px):
-            del center_px
+        def convert(self, center_px, corners_px=()):
+            del center_px, corners_px
             self.calls += 1
             if self.calls == 1:
                 return (0.0, 0.0)

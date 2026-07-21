@@ -220,7 +220,10 @@ class GimbalControlGate:
         try:
             if not bool(self._converter.available):
                 raise RuntimeError("angle converter unavailable")
-            yaw_deg, pitch_deg = self._converter.convert(center)
+            pose_corners = (
+                detection.corners_px if source == "FULL_BOARD" else ()
+            )
+            yaw_deg, pitch_deg = self._converter.convert(center, pose_corners)
             yaw_deg = float(yaw_deg)
             pitch_deg = float(pitch_deg)
             if not math.isfinite(yaw_deg) or not math.isfinite(pitch_deg):

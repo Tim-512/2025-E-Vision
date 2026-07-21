@@ -81,6 +81,7 @@ def build_angle_converter(
     config: GimbalUsbConfig,
     *,
     image_size: tuple[int, int],
+    board_size_mm: tuple[float, float] = (210.0, 297.0),
 ) -> AngleConverter:
     """Load calibration without allowing calibration failure to stop vision."""
     try:
@@ -90,6 +91,20 @@ def build_angle_converter(
             max_rms_px=config.max_calibration_rms_px,
             yaw_sign=config.yaw_sign,
             pitch_sign=config.pitch_sign,
+            laser_pose_compensation_enabled=(
+                config.laser_pose_compensation_enabled
+            ),
+            laser_offset_x_mm=config.laser_offset_x_mm,
+            laser_offset_y_mm=config.laser_offset_y_mm,
+            laser_offset_z_mm=config.laser_offset_z_mm,
+            laser_yaw_bias_deg=config.laser_yaw_bias_deg,
+            laser_pitch_bias_deg=config.laser_pitch_bias_deg,
+            board_size_mm=board_size_mm,
+            pose_min_distance_mm=config.pose_min_distance_mm,
+            pose_max_distance_mm=config.pose_max_distance_mm,
+            pose_max_reprojection_error_px=(
+                config.pose_max_reprojection_error_px
+            ),
         )
     except Exception as exc:
         return UnavailableTargetAngleConverter(str(exc))
@@ -104,7 +119,12 @@ def build_worker(
     camera = camera_runtime.config.camera
     image_size = (camera.width, camera.height)
     if converter is None:
-        converter = build_angle_converter(config, image_size=image_size)
+        board = camera_runtime.config.board
+        converter = build_angle_converter(
+            config,
+            image_size=image_size,
+            board_size_mm=(board.width_cm * 10.0, board.height_cm * 10.0),
+        )
     gate = GimbalControlGate(
         converter,
         GateLimits(
@@ -235,6 +255,33 @@ def print_startup_summary(
         f"{config.predicted_max_angle_step_deg:g} deg per axis"
     )
     print(f"  yaw_sign={config.yaw_sign}, pitch_sign={config.pitch_sign}")
+    if isinstance(converter, TargetAngleConverter):
+        compensation_state = (
+            "enabled" if converter.laser_pose_compensation_enabled else "disabled"
+        )
+        print(f"  laser pose compensation={compensation_state}")
+        print(
+            "  laser offset camera XYZ="
+            f"({converter.laser_offset_x_mm:.3f}, "
+            f"{converter.laser_offset_y_mm:.3f}, "
+            f"{converter.laser_offset_z_mm:.3f}) mm"
+        )
+        print(
+            "  laser outgoing bias "
+            f"yaw={converter.laser_yaw_bias_deg:.3f} deg, "
+            f"pitch={converter.laser_pitch_bias_deg:.3f} deg"
+        )
+        print(
+            f"  board size={converter.board_size_mm[0]:.1f}x"
+            f"{converter.board_size_mm[1]:.1f} mm"
+        )
+        print(
+            "  accepted pose Z="
+            f"{converter.pose_min_distance_mm:.1f}.."
+            f"{converter.pose_max_distance_mm:.1f} mm, "
+            "maximum reprojection error="
+            f"{converter.pose_max_reprojection_error_px:.2f} px"
+        )
     print("  distance=0, fire=0, invalid output is all-zero tracking=0")
     print(
         "SAFETY: the 405 nm laser is hardware-always-on; software fire=0 cannot "
@@ -247,11 +294,20 @@ def format_runtime_snapshot(camera_runtime: CameraRuntime, worker: GimbalOutputW
     output = worker.snapshot()
     serial_state = "up" if output.serial.connected else "down"
     error = output.last_error or output.serial.last_error or "none"
+    decision = getattr(output, "last_decision", None)
+    command = None if decision is None else decision.command
+    if command is not None and command.tracking:
+        angle_text = (
+            f" yaw={command.yaw_deg:.3f}deg"
+            f" pitch={command.pitch_deg:.3f}deg"
+        )
+    else:
+        angle_text = " yaw=invalid pitch=invalid"
     return (
         f"camera={camera.state} acquisition={camera.acquisition_fps:.1f}fps "
         f"detection={camera.detection_fps:.1f}fps | usb={serial_state} "
-        f"ticks={output.ticks} valid={output.sent_valid} safe={output.sent_invalid} "
-        f"overruns={output.overruns} error={error}"
+        f"ticks={output.ticks} valid={output.sent_valid} safe={output.sent_invalid}"
+        f"{angle_text} overruns={output.overruns} error={error}"
     )
 
 
@@ -348,7 +404,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         camera_runtime.config.camera.width,
         camera_runtime.config.camera.height,
     )
-    converter = build_angle_converter(gimbal_config, image_size=image_size)
+    board = camera_runtime.config.board
+    converter = build_angle_converter(
+        gimbal_config,
+        image_size=image_size,
+        board_size_mm=(board.width_cm * 10.0, board.height_cm * 10.0),
+    )
     try:
         worker = build_worker(camera_runtime, gimbal_config, converter=converter)
     except KeyboardInterrupt:
