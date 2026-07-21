@@ -286,6 +286,18 @@ function renderDetectionConfig(config) {
   $("min-arc-coverage").value = config.rings.min_arc_coverage;
   $("classical-tracking-threshold").value = config.classical_scoring.tracking_threshold;
   $("classical-acquisition-threshold").value = config.classical_scoring.acquisition_threshold;
+  $("ring-only-mode").checked = config.ring_first.ring_only;
+  $("ring-immediate-strong").checked = config.ring_first.immediate_strong_acquisition;
+  $("ring-medium-confirm-frames").value = config.ring_first.medium_confirm_frames;
+  $("ring-medium-common-center").value = config.ring_first.medium_common_center_score;
+  $("ring-medium-ratio-score").value = config.ring_first.medium_ratio_score;
+  $("ring-medium-coverage-score").value = config.ring_first.medium_coverage_score;
+  $("ring-roi-min-half-extent").value = config.ring_first.roi_min_half_extent_px;
+  $("ring-roi-outer-extent-scale").value = config.ring_first.roi_outer_extent_per_scale;
+  $("ring-roi-prediction-padding").value = config.ring_first.roi_prediction_padding_px;
+  $("ring-roi-safety-factor").value = config.ring_first.roi_safety_factor;
+  $("ring-roi-miss-expand").value = config.ring_first.roi_miss_expand_px;
+  $("ring-roi-full-frame-misses").value = config.ring_first.roi_full_frame_after_misses;
   $("detection-confirm-frames").value = config.tracking.confirm_frames;
   $("detection-predict-frames").value = config.tracking.predict_frames;
   $("predict-max-frames").value = config.tracking.predict_max_frames;
@@ -319,6 +331,20 @@ function readDetectionConfigForm() {
     value.classical_scoring = {
       tracking_threshold: Number($("classical-tracking-threshold").value),
       acquisition_threshold: Number($("classical-acquisition-threshold").value),
+    };
+    value.ring_first = {
+      ring_only: $("ring-only-mode").checked,
+      immediate_strong_acquisition: $("ring-immediate-strong").checked,
+      medium_confirm_frames: Number($("ring-medium-confirm-frames").value),
+      medium_common_center_score: Number($("ring-medium-common-center").value),
+      medium_ratio_score: Number($("ring-medium-ratio-score").value),
+      medium_coverage_score: Number($("ring-medium-coverage-score").value),
+      roi_min_half_extent_px: Number($("ring-roi-min-half-extent").value),
+      roi_outer_extent_per_scale: Number($("ring-roi-outer-extent-scale").value),
+      roi_prediction_padding_px: Number($("ring-roi-prediction-padding").value),
+      roi_safety_factor: Number($("ring-roi-safety-factor").value),
+      roi_miss_expand_px: Number($("ring-roi-miss-expand").value),
+      roi_full_frame_after_misses: Number($("ring-roi-full-frame-misses").value),
     };
   } else {
     value.model = {

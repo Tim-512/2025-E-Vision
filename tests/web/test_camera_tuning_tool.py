@@ -670,6 +670,12 @@ def test_dashboard_contains_classical_controls_and_status() -> None:
     for token in (
         "clahe-clip-limit", "min-white-occupancy",
         "ring-ratio-tolerance", "min-arc-coverage",
+        "ring-only-mode", "ring-immediate-strong",
+        "ring-medium-confirm-frames", "ring-medium-common-center",
+        "ring-medium-ratio-score", "ring-medium-coverage-score",
+        "ring-roi-min-half-extent", "ring-roi-outer-extent-scale",
+        "ring-roi-prediction-padding", "ring-roi-safety-factor",
+        "ring-roi-miss-expand", "ring-roi-full-frame-misses",
         "predict-max-frames", "predict-max-ms",
         "observation-source", "predicted-frames",
         "normalized-gray", "white-mask", "edge-mask",

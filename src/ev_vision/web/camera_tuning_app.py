@@ -21,6 +21,7 @@ from ev_vision.config import (
     DetectionConfig,
     ImageNormalizationConfig,
     ModelDetectionConfig,
+    RingFirstConfig,
     RingGeometryConfig,
     RoiGeometryConfig,
     WhiteBoardConfig,
@@ -303,6 +304,32 @@ class DetectionRingsRequest(_FiniteRequest):
         return replace(current, **self.model_dump(exclude_none=True))
 
 
+class DetectionRingFirstRequest(_FiniteRequest):
+    enabled: StrictBool | None = None
+    allow_medium_acquisition: StrictBool | None = None
+    white_board_interval_frames: StrictInt | None = None
+    ring_only: StrictBool | None = None
+    immediate_strong_acquisition: StrictBool | None = None
+    medium_confirm_frames: StrictInt | None = None
+    strong_min_arcs: StrictInt | None = None
+    strong_common_center_score: _NUMERIC | None = None
+    strong_ratio_score: _NUMERIC | None = None
+    strong_coverage_score: _NUMERIC | None = None
+    medium_min_arcs: StrictInt | None = None
+    medium_common_center_score: _NUMERIC | None = None
+    medium_ratio_score: _NUMERIC | None = None
+    medium_coverage_score: _NUMERIC | None = None
+    roi_min_half_extent_px: _NUMERIC | None = None
+    roi_outer_extent_per_scale: _NUMERIC | None = None
+    roi_prediction_padding_px: _NUMERIC | None = None
+    roi_safety_factor: _NUMERIC | None = None
+    roi_miss_expand_px: _NUMERIC | None = None
+    roi_full_frame_after_misses: StrictInt | None = None
+
+    def domain(self, current: RingFirstConfig) -> RingFirstConfig:
+        return replace(current, **self.model_dump(exclude_none=True))
+
+
 class DetectionClassicalScoringRequest(_FiniteRequest):
     white_weight: _NUMERIC | None = None
     geometry_weight: _NUMERIC | None = None
@@ -330,6 +357,7 @@ class DetectionConfigRequest(BaseModel):
     white_board: DetectionWhiteBoardRequest | None = None
     rings: DetectionRingsRequest | None = None
     classical_scoring: DetectionClassicalScoringRequest | None = None
+    ring_first: DetectionRingFirstRequest | None = None
 
     def domain(self, current: DetectionConfig) -> DetectionConfig:
         if self.backend is not None and self.backend != current.backend:
@@ -369,6 +397,11 @@ class DetectionConfigRequest(BaseModel):
                 current.classical_scoring
                 if self.classical_scoring is None
                 else self.classical_scoring.domain(current.classical_scoring)
+            ),
+            ring_first=(
+                current.ring_first
+                if self.ring_first is None
+                else self.ring_first.domain(current.ring_first)
             ),
         )
         _validate_detection(candidate)
@@ -461,6 +494,7 @@ def _detection_config_response(value: DetectionConfig) -> dict[str, Any]:
         "white_board": _json_value(value.white_board),
         "rings": _json_value(value.rings),
         "classical_scoring": _json_value(value.classical_scoring),
+        "ring_first": _json_value(value.ring_first),
         "tracking": _json_value(value.tracking),
     }
 

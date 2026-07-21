@@ -118,6 +118,7 @@ def valid_detection_payload() -> dict[str, Any]:
         "white_board": {field: getattr(config.white_board, field) for field in config.white_board.__dataclass_fields__},
         "rings": {field: list(getattr(config.rings, field)) if field == "expected_radius_ratios" else getattr(config.rings, field) for field in config.rings.__dataclass_fields__},
         "classical_scoring": {field: getattr(config.classical_scoring, field) for field in config.classical_scoring.__dataclass_fields__},
+        "ring_first": {field: getattr(config.ring_first, field) for field in config.ring_first.__dataclass_fields__},
         "tracking": {field: getattr(config.tracking, field) for field in config.tracking.__dataclass_fields__},
     }
 
@@ -225,6 +226,52 @@ def test_detection_config_update_is_separate_from_camera_parameters(
     assert response.json()["model"]["confidence_threshold"] == 0.50
     assert service.detection_apply_calls[-1].model.confidence_threshold == 0.50
     assert service.apply_calls == []
+
+
+def test_detection_config_updates_ring_only_fields(
+    client: TestClient, service: FakeService
+) -> None:
+    payload = valid_detection_payload()
+    payload["ring_first"].update(
+        {
+            "ring_only": True,
+            "immediate_strong_acquisition": True,
+            "medium_confirm_frames": 2,
+            "medium_common_center_score": 0.58,
+            "medium_ratio_score": 0.62,
+            "medium_coverage_score": 0.10,
+            "roi_min_half_extent_px": 80.0,
+            "roi_prediction_padding_px": 28.0,
+            "roi_safety_factor": 1.35,
+            "roi_miss_expand_px": 76.0,
+            "roi_full_frame_after_misses": 4,
+        }
+    )
+
+    response = client.put("/api/detection/config", json=payload)
+
+    assert response.status_code == 200
+    changed = service.detection_apply_calls[-1].ring_first
+    assert changed.ring_only is True
+    assert changed.medium_confirm_frames == 2
+    assert changed.medium_ratio_score == pytest.approx(0.62)
+    assert changed.roi_safety_factor == pytest.approx(1.35)
+    assert changed.roi_full_frame_after_misses == 4
+
+
+def test_detection_config_ring_first_patch_preserves_omitted_values(
+    client: TestClient, service: FakeService
+) -> None:
+    response = client.put(
+        "/api/detection/config",
+        json={"ring_first": {"medium_ratio_score": 0.61}},
+    )
+
+    assert response.status_code == 200
+    changed = service.detection_apply_calls[-1].ring_first
+    assert changed.medium_ratio_score == pytest.approx(0.61)
+    assert changed.ring_only is False
+    assert changed.roi_safety_factor == pytest.approx(1.30)
 
 
 @pytest.mark.parametrize(
