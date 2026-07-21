@@ -259,3 +259,42 @@ def test_single_arc_cannot_confirm_acquisition() -> None:
         )
     assert result.target_valid is False
     assert result.state is TrackingState.SEARCHING
+
+
+def test_ring_observation_can_request_single_frame_acquisition() -> None:
+    tracker = BoardTracker(config(confirm_frames=3))
+    observation = TrackObservation(
+        timestamp_ns=1_000_000_000,
+        source_sequence=1,
+        detected=True,
+        source=ObservationSource.CONCENTRIC_ARCS,
+        center_px=(100.0, 100.0),
+        corners_px=None,
+        scale_px_per_mm=1.0,
+        confidence=0.9,
+        acquisition_eligible=True,
+        acquisition_confirm_frames=1,
+    )
+
+    result = tracker.update(observation)
+
+    assert result.state is TrackingState.TRACKING
+    assert result.target_valid is True
+
+
+def test_tracker_exposes_bounded_center_prediction() -> None:
+    tracker = BoardTracker(config(confirm_frames=2))
+    for sequence, timestamp_ns, center in (
+        (1, 1_000_000_000, (100.0, 80.0)),
+        (2, 1_020_000_000, (104.0, 82.0)),
+    ):
+        tracker.update(TrackObservation(
+            timestamp_ns=timestamp_ns, source_sequence=sequence, detected=True,
+            source=ObservationSource.CONCENTRIC_ARCS, center_px=center,
+            corners_px=None, scale_px_per_mm=1.0, confidence=0.8,
+            acquisition_eligible=True, acquisition_confirm_frames=2,
+        ))
+
+    assert tracker.latest_real_center_px == pytest.approx((104.0, 82.0))
+    assert tracker.latest_real_timestamp_ns == 1_020_000_000
+    assert tracker.predict_center(1_040_000_000) == pytest.approx((108.0, 84.0))

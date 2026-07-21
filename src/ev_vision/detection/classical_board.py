@@ -16,7 +16,11 @@ from ev_vision.detection.contracts import (
 )
 from ev_vision.detection.debug_rendering import render_debug_images
 from ev_vision.detection.failures import DetectionFailure
-from ev_vision.detection.image_normalization import NormalizedFrame, normalize_frame
+from ev_vision.detection.image_normalization import (
+    NormalizedFrame,
+    normalize_frame,
+    normalize_ring_frame,
+)
 from ev_vision.detection.partial_board import BoardHistory, fuse_partial_observation, predicted_roi
 from ev_vision.detection.ring_first import RingQuality, classify_ring, translate_ring_result
 from ev_vision.detection.ring_geometry import RingGeometryResult, detect_concentric_arcs
@@ -50,6 +54,7 @@ class ClassicalBoardDetector:
         self._history: BoardHistory | None = None
         self._board = BoardConfig()
         self._tracking_frame_count = 0
+        self._roi_miss_level = 0
 
     def detect(
         self,
@@ -60,6 +65,15 @@ class ClassicalBoardDetector:
         include_debug: bool = False,
         update_tracker: bool = True,
     ) -> ClassicalBoardResult:
+        if self._config.ring_first.ring_only:
+            return self._detect_ring_only(
+                image,
+                captured_ns=captured_ns,
+                source_sequence=source_sequence,
+                include_debug=include_debug,
+                update_tracker=update_tracker,
+            )
+
         started = time.perf_counter()
         acquisition = self._tracker.latest.state in {
             TrackingState.SEARCHING,
@@ -269,15 +283,219 @@ class ClassicalBoardDetector:
             debug_images=debug_images,
         )
 
+    def _detect_ring_only(
+        self,
+        image: np.ndarray,
+        *,
+        captured_ns: int,
+        source_sequence: int,
+        include_debug: bool,
+        update_tracker: bool,
+    ) -> ClassicalBoardResult:
+        started = time.perf_counter()
+        height, width = image.shape[:2]
+        state = self._tracker.latest.state
+        acquisition = state in {
+            TrackingState.SEARCHING,
+            TrackingState.CONFIRMING,
+            TrackingState.LOST,
+        }
+        forced_full_frame = (
+            not acquisition
+            and self._roi_miss_level
+            >= self._config.ring_first.roi_full_frame_after_misses
+        )
+
+        crop_started = time.perf_counter()
+        processing_image = image
+        offset_xy = (0, 0)
+        roi_used = False
+        predicted_shift_px = 0.0
+        if not acquisition and not forced_full_frame:
+            roi, predicted_shift_px = self._ring_only_tracking_roi(
+                captured_ns, image.shape[:2]
+            )
+            if roi is not None:
+                x0, y0, x1, y1 = roi
+                if (x0, y0, x1, y1) != (0, 0, width, height):
+                    processing_image = image[y0:y1, x0:x1]
+                    offset_xy = (x0, y0)
+                    roi_used = True
+        crop_ms = (time.perf_counter() - crop_started) * 1000.0
+
+        normalization_started = time.perf_counter()
+        normalized = normalize_ring_frame(
+            processing_image,
+            self._config.normalization,
+            mask_radius_px=self._config.rings.saturation_mask_radius_px,
+        )
+        normalization_ms = (time.perf_counter() - normalization_started) * 1000.0
+
+        expected_center = self._tracker.predict_center(captured_ns)
+        if expected_center is None:
+            expected_center = self._tracker.latest_real_center_px
+        if expected_center is not None:
+            expected_center = (
+                expected_center[0] - offset_xy[0],
+                expected_center[1] - offset_xy[1],
+            )
+        expected_scale = self._tracker.latest_scale_px_per_mm
+
+        detection_started = time.perf_counter()
+        ring_started = time.perf_counter()
+        local_ring = detect_concentric_arcs(
+            normalized.ring_edge_mask,
+            self._config.rings,
+            expected_center_px=expected_center,
+            expected_scale_px_per_mm=expected_scale,
+            roi_xyxy=None,
+        )
+        ring_ms = (time.perf_counter() - ring_started) * 1000.0
+        ring = translate_ring_result(local_ring, offset_xy)
+        quality = classify_ring(ring, self._config.ring_first)
+        if quality is RingQuality.REJECTED or ring.center_px is None:
+            observation = self._miss(
+                captured_ns,
+                source_sequence,
+                ring.failure_reason or DetectionFailure.LOW_INTERNAL_STRUCTURE,
+            )
+        else:
+            observation = self._ring_observation(
+                ring,
+                captured_ns=captured_ns,
+                source_sequence=source_sequence,
+                acquisition_confirm_frames=(
+                    1
+                    if quality is RingQuality.STRONG
+                    and self._config.ring_first.immediate_strong_acquisition
+                    else self._config.ring_first.medium_confirm_frames
+                ),
+            )
+
+        tracked = (
+            self._tracker.update(observation, now_ns=captured_ns)
+            if update_tracker
+            else self._tracker.preview(observation, now_ns=captured_ns)
+        )
+        if update_tracker:
+            if observation.detected:
+                self._roi_miss_level = 0
+            elif roi_used:
+                self._roi_miss_level += 1
+        detection_ms = (time.perf_counter() - detection_started) * 1000.0
+
+        center = tracked.predicted_center_px
+        if tracked.observation is not None and tracked.observation.center_px is not None:
+            center = tracked.observation.center_px
+        debug_ring = (
+            translate_ring_result(ring, (-offset_xy[0], -offset_xy[1]))
+            if roi_used
+            else ring
+        )
+        debug_images = (
+            render_debug_images(normalized, ring_result=debug_ring)
+            if include_debug
+            else {}
+        )
+        total_ms = (time.perf_counter() - started) * 1000.0
+        roi_height, roi_width = processing_image.shape[:2]
+        return ClassicalBoardResult(
+            timestamp_ns=int(captured_ns),
+            source_sequence=int(source_sequence),
+            detected=bool(tracked.observation is not None and tracked.observation.detected),
+            target_valid=tracked.target_valid,
+            tracking_state=tracked.state.value,
+            observation_source=tracked.observation_source,
+            confidence=(
+                tracked.observation.confidence
+                if tracked.observation is not None and tracked.observation.detected
+                else 0.0
+            ),
+            center_px=center if tracked.target_valid or tracked.state is TrackingState.CONFIRMING else None,
+            corners_px=(),
+            scale_px_per_mm=tracked.scale_px_per_mm,
+            velocity_px_s=tracked.velocity_px_s,
+            predicted_frames=tracked.predicted_frames,
+            source_age_us=tracked.source_age_us,
+            homography_valid=False,
+            target_x_mm=None,
+            target_y_mm=None,
+            near_image_edge=False,
+            partially_outside=False,
+            failure_reason=tracked.failure_reason,
+            candidates=(),
+            timings_ms={
+                "crop_ms": crop_ms,
+                "normalization_ms": normalization_ms,
+                "ring_ms": ring_ms,
+                "white_board_ms": 0.0,
+                "detection_ms": detection_ms,
+                "total_ms": total_ms,
+                "roi_used": 1.0 if roi_used else 0.0,
+                "roi_fallback": 1.0 if forced_full_frame else 0.0,
+                "predicted_shift_px": predicted_shift_px,
+                "roi_width": float(roi_width),
+                "roi_height": float(roi_height),
+                "roi_miss_level": float(self._roi_miss_level),
+                "ring_candidate_count": float(ring.visible_arc_count),
+                "white_board_ran": 0.0,
+                "normalization": normalization_ms,
+                "detection": detection_ms,
+                "total": total_ms,
+            },
+            debug_images=debug_images,
+        )
+
+    def _ring_only_tracking_roi(
+        self,
+        timestamp_ns: int,
+        image_shape: tuple[int, int],
+    ) -> tuple[tuple[int, int, int, int] | None, float]:
+        height, width = image_shape
+        latest_center = self._tracker.latest_real_center_px
+        predicted_center = self._tracker.predict_center(timestamp_ns)
+        if predicted_center is None:
+            predicted_center = latest_center
+        scale = self._tracker.latest_scale_px_per_mm
+        if predicted_center is None or scale is None or scale <= 0.0:
+            return None, 0.0
+
+        predicted_shift_px = 0.0
+        if latest_center is not None:
+            predicted_shift_px = float(np.hypot(
+                predicted_center[0] - latest_center[0],
+                predicted_center[1] - latest_center[1],
+            ))
+        config = self._config.ring_first
+        ring_extent = max(
+            config.roi_min_half_extent_px,
+            config.roi_outer_extent_per_scale * scale,
+        )
+        half_extent = (
+            ring_extent
+            + predicted_shift_px
+            + config.roi_prediction_padding_px
+            + config.roi_miss_expand_px * self._roi_miss_level
+        ) * config.roi_safety_factor
+        x0 = max(0, int(np.floor(predicted_center[0] - half_extent)))
+        y0 = max(0, int(np.floor(predicted_center[1] - half_extent)))
+        x1 = min(width, int(np.ceil(predicted_center[0] + half_extent)))
+        y1 = min(height, int(np.ceil(predicted_center[1] + half_extent)))
+        if x1 <= x0 or y1 <= y0:
+            return None, predicted_shift_px
+        return (x0, y0, x1, y1), predicted_shift_px
+
     def reset(self) -> None:
         self._tracker.reset()
         self._history = None
         self._tracking_frame_count = 0
+        self._roi_miss_level = 0
 
     def apply_config(self, config: DetectionConfig) -> None:
         self._config = config
         self._tracker.apply_config(config.tracking)
         self._tracking_frame_count = 0
+        self._roi_miss_level = 0
 
     def reload_model(self) -> None:
         return None
@@ -493,6 +711,7 @@ class ClassicalBoardDetector:
         *,
         captured_ns: int,
         source_sequence: int,
+        acquisition_confirm_frames: int | None = None,
     ) -> TrackObservation:
         confidence = float(np.clip(
             0.45 * ring.common_center_score
@@ -505,6 +724,7 @@ class ClassicalBoardDetector:
             source=ObservationSource.CONCENTRIC_ARCS, center_px=ring.center_px,
             corners_px=None, scale_px_per_mm=ring.scale_px_per_mm,
             confidence=confidence, acquisition_eligible=True,
+            acquisition_confirm_frames=acquisition_confirm_frames,
         )
 
     def _acquire_partial(

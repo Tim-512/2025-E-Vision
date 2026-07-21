@@ -440,3 +440,85 @@ def test_stage_timings_are_reported() -> None:
     }
     assert set(result.timings_ms) >= expected
     assert all(result.timings_ms[name] >= 0.0 for name in expected)
+
+
+def _ring_only_config(**overrides):
+    from dataclasses import replace
+    from ev_vision.config import RingFirstConfig
+    return replace(
+        DetectionConfig(),
+        ring_first=replace(RingFirstConfig(), ring_only=True, **overrides),
+    )
+
+def test_ring_only_strong_target_locks_immediately_without_white_board(monkeypatch) -> None:
+    import ev_vision.detection.classical_board as module
+
+    monkeypatch.setattr(module, "find_white_board_candidates", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("white board called")))
+    monkeypatch.setattr(module, "detect_concentric_arcs", lambda *args, **kwargs: _ring_geometry_result(count=3, common_center=0.82, ratio=0.86, coverage=0.25))
+    result = ClassicalBoardDetector(_ring_only_config()).detect(
+        np.zeros((240, 320, 3), np.uint8), captured_ns=1_000_000_000, source_sequence=1
+    )
+
+    assert result.target_valid is True
+    assert result.tracking_state == "TRACKING"
+    assert result.corners_px == ()
+    assert result.timings_ms["white_board_ran"] == 0.0
+
+def test_ring_only_medium_target_confirms_in_two_frames(monkeypatch) -> None:
+    import ev_vision.detection.classical_board as module
+
+    monkeypatch.setattr(module, "find_white_board_candidates", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("white board called")))
+    monkeypatch.setattr(module, "detect_concentric_arcs", lambda *args, **kwargs: _ring_geometry_result(count=2, common_center=0.62, ratio=0.66, coverage=0.13))
+    subject = ClassicalBoardDetector(_ring_only_config())
+    image = np.zeros((240, 320, 3), np.uint8)
+
+    first = subject.detect(image, captured_ns=1_000_000_000, source_sequence=1)
+    second = subject.detect(image, captured_ns=1_010_000_000, source_sequence=2)
+
+    assert first.tracking_state == "CONFIRMING"
+    assert second.tracking_state == "TRACKING"
+    assert second.target_valid is True
+
+def test_ring_only_roi_miss_does_not_repeat_normalization_same_frame(monkeypatch) -> None:
+    import ev_vision.detection.classical_board as module
+
+    subject = ClassicalBoardDetector(_ring_only_config())
+    image = np.zeros((480, 640, 3), np.uint8)
+    strong = _ring_geometry_result(count=3, center=(320.0, 240.0), common_center=0.82, ratio=0.86, coverage=0.25)
+    monkeypatch.setattr(module, "detect_concentric_arcs", lambda *args, **kwargs: strong)
+    subject.detect(image, captured_ns=1_000_000_000, source_sequence=1)
+
+    calls = []
+    original = module.normalize_ring_frame
+    monkeypatch.setattr(module, "normalize_ring_frame", lambda frame, *args, **kwargs: (calls.append(frame.shape[:2]) or original(frame, *args, **kwargs)))
+    monkeypatch.setattr(module, "detect_concentric_arcs", lambda *args, **kwargs: _ring_geometry_result(count=1))
+    missed = subject.detect(image, captured_ns=1_020_000_000, source_sequence=2)
+
+    assert len(calls) == 1
+    assert missed.timings_ms["roi_used"] == 1.0
+    assert missed.timings_ms["roi_miss_level"] == 1.0
+
+def test_ring_only_velocity_prediction_moves_and_expands_roi(monkeypatch) -> None:
+    import ev_vision.detection.classical_board as module
+
+    subject = ClassicalBoardDetector(_ring_only_config())
+    image = np.zeros((600, 900, 3), np.uint8)
+    calls = 0
+    def moving_ring(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            center = (300.0, 300.0)
+        elif calls == 2:
+            expected = kwargs.get("expected_center_px") or (300.0, 300.0)
+            center = (expected[0] + 20.0, expected[1])
+        else:
+            center = kwargs.get("expected_center_px") or (120.0, 120.0)
+        return _ring_geometry_result(count=3, center=center, common_center=0.82, ratio=0.86, coverage=0.25)
+    monkeypatch.setattr(module, "detect_concentric_arcs", moving_ring)
+    subject.detect(image, captured_ns=1_000_000_000, source_sequence=1)
+    subject.detect(image, captured_ns=1_020_000_000, source_sequence=2)
+    result = subject.detect(image, captured_ns=1_040_000_000, source_sequence=3)
+
+    assert result.timings_ms["predicted_shift_px"] == pytest.approx(20.0, abs=1.0)
+    assert result.timings_ms["roi_width"] > 2 * 115.0

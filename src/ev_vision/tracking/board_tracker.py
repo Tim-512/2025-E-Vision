@@ -39,6 +39,7 @@ class TrackObservation:
     confidence: float = 0.0
     failure_reason: DetectionFailure | None = None
     acquisition_eligible: bool = False
+    acquisition_confirm_frames: int | None = None
 
 
 @dataclass(frozen=True)
@@ -135,6 +136,28 @@ class BoardTracker:
     def apply_config(self, config: BoardTrackingConfig) -> None:
         self.config = config
 
+    @property
+    def latest_real_center_px(self) -> tuple[float, float] | None:
+        return self._predictor.latest_point
+
+    @property
+    def latest_real_timestamp_ns(self) -> int | None:
+        return self._predictor.latest_timestamp_ns
+
+    @property
+    def latest_scale_px_per_mm(self) -> float | None:
+        return self._latest_scale
+
+    @property
+    def latest_velocity_px_s(self) -> tuple[float, float] | None:
+        return self._predictor.velocity_px_s or self._latest_velocity
+
+    def predict_center(self, timestamp_ns: int) -> tuple[float, float] | None:
+        return self._predictor.predict(
+            timestamp_ns,
+            max_horizon_ns=int(self.config.predict_max_ms * 1_000_000.0),
+        )
+
     def temporal_score(self, center_px: tuple[float, float]) -> float:
         if not self._valid_center(center_px):
             return 0.0
@@ -199,9 +222,14 @@ class BoardTracker:
             if self.latest.state is TrackingState.CONFIRMING
             else 1
         )
+        required_confirm_frames = (
+            self.config.confirm_frames
+            if result.acquisition_confirm_frames is None
+            else max(1, result.acquisition_confirm_frames)
+        )
         state = (
             TrackingState.TRACKING
-            if confirmation_count >= self.config.confirm_frames
+            if confirmation_count >= required_confirm_frames
             else TrackingState.CONFIRMING
         )
         self._remember(result)
@@ -212,7 +240,7 @@ class BoardTracker:
             observation=result,
             observation_source=result.source,
             predicted_center_px=None,
-            confirmation_count=min(confirmation_count, self.config.confirm_frames),
+            confirmation_count=min(confirmation_count, required_confirm_frames),
             miss_count=0,
             predicted_frames=0,
             source_age_us=0,

@@ -218,11 +218,15 @@ def test_jetson_profile_has_tuned_camera_and_complete_detection_mapping() -> Non
         **default_raw["detection"],
         "normalization": {
             **default_raw["detection"]["normalization"],
-            "clahe_clip_limit": 8.5,
+            "clahe_clip_limit": 10.0,
         },
         "white_board": {
             **default_raw["detection"]["white_board"],
             "min_white_occupancy": 0.5,
+        },
+        "ring_first": {
+            **default_raw["detection"]["ring_first"],
+            "ring_only": True,
         },
     }
     assert jetson_raw == expected
@@ -232,4 +236,6 @@ def test_jetson_profile_has_tuned_camera_and_complete_detection_mapping() -> Non
     assert config.camera.gain_db == 5.0
     assert config.camera.acquisition_fps == 60
     assert config.detection.backend == "classical"
+    assert config.detection.normalization.clahe_clip_limit == 10.0
+    assert config.detection.ring_first.ring_only is True
     assert config.detection.tracking.predict_max_ms == 150.0
