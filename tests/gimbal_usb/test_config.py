@@ -210,15 +210,26 @@ def test_jetson_profile_has_tuned_camera_and_complete_detection_mapping() -> Non
     expected = dict(default_raw)
     expected["camera"] = {
         **default_raw["camera"],
-        "acquisition_fps": 50,
-        "exposure_us": 15000,
-        "gain_db": 14.0,
+        "acquisition_fps": 60,
+        "exposure_us": 10000,
+        "gain_db": 5.0,
+    }
+    expected["detection"] = {
+        **default_raw["detection"],
+        "normalization": {
+            **default_raw["detection"]["normalization"],
+            "clahe_clip_limit": 8.5,
+        },
+        "white_board": {
+            **default_raw["detection"]["white_board"],
+            "min_white_occupancy": 0.5,
+        },
     }
     assert jetson_raw == expected
 
     config = load_config("config/jetson-local.yaml")
-    assert config.camera.exposure_us == 15000
-    assert config.camera.gain_db == 14.0
-    assert config.camera.acquisition_fps == 50
+    assert config.camera.exposure_us == 10000
+    assert config.camera.gain_db == 5.0
+    assert config.camera.acquisition_fps == 60
     assert config.detection.backend == "classical"
     assert config.detection.tracking.predict_max_ms == 150.0

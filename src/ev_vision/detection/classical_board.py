@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import time
 
 import cv2
@@ -18,7 +18,7 @@ from ev_vision.detection.debug_rendering import render_debug_images
 from ev_vision.detection.failures import DetectionFailure
 from ev_vision.detection.image_normalization import NormalizedFrame, normalize_frame
 from ev_vision.detection.partial_board import BoardHistory, fuse_partial_observation, predicted_roi
-from ev_vision.detection.ring_first import RingQuality, classify_ring
+from ev_vision.detection.ring_first import RingQuality, classify_ring, translate_ring_result
 from ev_vision.detection.ring_geometry import RingGeometryResult, detect_concentric_arcs
 from ev_vision.detection.white_board import WhiteBoardCandidate, find_white_board_candidates
 from ev_vision.tracking.board_tracker import (
@@ -35,6 +35,8 @@ class _FullAcquisition:
     candidates: tuple[ClassicalCandidateEvaluation, ...]
     solution: BoardPlaneSolution | None
     ring_result: RingGeometryResult | None
+    ring_ms: float = 0.0
+    white_board_ms: float = 0.0
 
 
 class ClassicalBoardDetector:
@@ -47,6 +49,7 @@ class ClassicalBoardDetector:
         self._tracker = BoardTracker(config.tracking)
         self._history: BoardHistory | None = None
         self._board = BoardConfig()
+        self._tracking_frame_count = 0
 
     def detect(
         self,
@@ -58,57 +61,128 @@ class ClassicalBoardDetector:
         update_tracker: bool = True,
     ) -> ClassicalBoardResult:
         started = time.perf_counter()
-        normalized = normalize_frame(
-            image,
-            self._config.normalization,
-            mask_radius_px=self._config.rings.saturation_mask_radius_px,
-        )
-        normalized_ms = (time.perf_counter() - started) * 1000.0
         acquisition = self._tracker.latest.state in {
             TrackingState.SEARCHING,
             TrackingState.CONFIRMING,
             TrackingState.LOST,
         }
+
+        crop_started = time.perf_counter()
+        processing_image = image
+        offset_xy = (0, 0)
         roi_xyxy: tuple[int, int, int, int] | None = None
+        roi_used = False
+        if not acquisition:
+            candidate_roi = self._tracking_roi(captured_ns, image.shape[:2])
+            if candidate_roi is not None:
+                x0, y0, x1, y1 = candidate_roi
+                height, width = image.shape[:2]
+                if x1 > x0 and y1 > y0 and (x0, y0, x1, y1) != (0, 0, width, height):
+                    processing_image = image[y0:y1, x0:x1]
+                    offset_xy = (x0, y0)
+                    roi_xyxy = candidate_roi
+                    roi_used = True
+        crop_ms = (time.perf_counter() - crop_started) * 1000.0
+
+        normalization_started = time.perf_counter()
+        normalized = normalize_frame(
+            processing_image,
+            self._config.normalization,
+            mask_radius_px=self._config.rings.saturation_mask_radius_px,
+        )
+        normalization_ms = (time.perf_counter() - normalization_started) * 1000.0
+
+        if acquisition:
+            if update_tracker:
+                self._tracking_frame_count = 0
+            tracking_frame_number = 0
+        else:
+            tracking_frame_number = self._tracking_frame_count + 1
+            if update_tracker:
+                self._tracking_frame_count = tracking_frame_number
+        interval = max(1, self._config.ring_first.white_board_interval_frames)
+        white_board_ran = bool(
+            acquisition
+            or not self._config.ring_first.enabled
+            or tracking_frame_number % interval == 0
+        )
+
         ring_result: RingGeometryResult | None = None
         solution: BoardPlaneSolution | None = None
         candidates: tuple[ClassicalCandidateEvaluation, ...] = ()
         near_image_edge = False
         partially_outside = False
+        ring_ms = 0.0
+        white_board_ms = 0.0
 
         detection_started = time.perf_counter()
-        if acquisition:
+        if acquisition or white_board_ran:
             full = self._acquire_full_board(
                 normalized,
                 captured_ns=captured_ns,
                 source_sequence=source_sequence,
-                tracking=False,
+                tracking=not acquisition,
+                offset_xy=offset_xy,
             )
-            observation = full.observation
-            candidates = full.candidates
-            solution = full.solution
-            ring_result = full.ring_result
         else:
-            full = self._acquire_full_board(
+            full = self._acquire_rings_only(
                 normalized,
                 captured_ns=captured_ns,
                 source_sequence=source_sequence,
-                tracking=True,
-                roi_xyxy=self._tracking_roi(captured_ns, normalized.gray.shape),
+                offset_xy=offset_xy,
+                failure_reason=DetectionFailure.LOW_INTERNAL_STRUCTURE,
             )
-            candidates = full.candidates
-            solution = full.solution
-            ring_result = full.ring_result
-            if full.observation.detected:
-                observation = full.observation
-            else:
-                observation, ring_result, roi_xyxy, near_image_edge, partially_outside = (
-                    self._acquire_partial(
-                        normalized,
-                        captured_ns=captured_ns,
-                        source_sequence=source_sequence,
+        observation = full.observation
+        candidates = full.candidates
+        solution = full.solution
+        ring_result = full.ring_result
+        ring_ms += full.ring_ms
+        white_board_ms += full.white_board_ms
+
+        if not acquisition and not observation.detected and roi_used:
+            # A target can move outside the predicted crop. Pay the full-frame cost
+            # only after the cheap ROI path misses so normal tracking stays fast.
+            fallback_normalization_started = time.perf_counter()
+            fallback_normalized = normalize_frame(
+                image,
+                self._config.normalization,
+                mask_radius_px=self._config.rings.saturation_mask_radius_px,
+            )
+            normalization_ms += (
+                time.perf_counter() - fallback_normalization_started
+            ) * 1000.0
+            fallback = self._acquire_rings_only(
+                fallback_normalized,
+                captured_ns=captured_ns,
+                source_sequence=source_sequence,
+                failure_reason=observation.failure_reason or DetectionFailure.LOW_INTERNAL_STRUCTURE,
+            )
+            ring_ms += fallback.ring_ms
+            if fallback.observation.detected:
+                observation = fallback.observation
+                ring_result = fallback.ring_result
+                normalized = fallback_normalized
+                offset_xy = (0, 0)
+                if observation.center_px is not None:
+                    outside = self._translated_history_outside(
+                        observation.center_px,
+                        image_size=(image.shape[1], image.shape[0]),
                     )
-                )
+                    near_image_edge = outside
+                    partially_outside = outside
+            else:
+                ring_result = fallback.ring_result
+
+        if not acquisition and not observation.detected:
+            observation, ring_result, near_image_edge, partially_outside = self._acquire_partial(
+                normalized,
+                captured_ns=captured_ns,
+                source_sequence=source_sequence,
+                ring=ring_result,
+                offset_xy=offset_xy,
+                full_image_shape=image.shape[:2],
+                allow_white_region=white_board_ran,
+            )
 
         tracked = (
             self._tracker.update(observation, now_ns=captured_ns)
@@ -132,16 +206,28 @@ class ClassicalBoardDetector:
             and solution.homography_valid
         )
         failure_reason = tracked.failure_reason
+
+        debug_ring = (
+            translate_ring_result(ring_result, (-offset_xy[0], -offset_xy[1]))
+            if ring_result is not None and roi_used
+            else ring_result
+        )
+        debug_candidates = (
+            tuple(self._translate_evaluation(item, (-offset_xy[0], -offset_xy[1])) for item in candidates)
+            if roi_used
+            else candidates
+        )
         debug_images = (
             render_debug_images(
                 normalized,
-                ring_result=ring_result,
-                candidates=candidates,
-                roi_xyxy=roi_xyxy,
+                ring_result=debug_ring,
+                candidates=debug_candidates,
+                roi_xyxy=None,
             )
             if include_debug
             else {}
         )
+        total_ms = (time.perf_counter() - started) * 1000.0
         return ClassicalBoardResult(
             timestamp_ns=int(captured_ns),
             source_sequence=int(source_sequence),
@@ -168,9 +254,17 @@ class ClassicalBoardDetector:
             failure_reason=failure_reason,
             candidates=candidates,
             timings_ms={
-                "normalization": normalized_ms,
+                "crop_ms": crop_ms,
+                "normalization_ms": normalization_ms,
+                "ring_ms": ring_ms,
+                "white_board_ms": white_board_ms,
+                "detection_ms": detection_ms,
+                "total_ms": total_ms,
+                "roi_used": 1.0 if roi_used else 0.0,
+                "white_board_ran": 1.0 if white_board_ran else 0.0,
+                "normalization": normalization_ms,
                 "detection": detection_ms,
-                "total": (time.perf_counter() - started) * 1000.0,
+                "total": total_ms,
             },
             debug_images=debug_images,
         )
@@ -178,10 +272,12 @@ class ClassicalBoardDetector:
     def reset(self) -> None:
         self._tracker.reset()
         self._history = None
+        self._tracking_frame_count = 0
 
     def apply_config(self, config: DetectionConfig) -> None:
         self._config = config
         self._tracker.apply_config(config.tracking)
+        self._tracking_frame_count = 0
 
     def reload_model(self) -> None:
         return None
@@ -191,14 +287,27 @@ class ClassicalBoardDetector:
         timestamp_ns: int,
         image_shape: tuple[int, int],
     ) -> tuple[int, int, int, int] | None:
-        if self._history is None:
-            return None
         height, width = image_shape
-        return predicted_roi(
-            self._history,
-            timestamp_ns=timestamp_ns,
-            image_size=(width, height),
-        )
+        if self._history is not None:
+            return predicted_roi(
+                self._history,
+                timestamp_ns=timestamp_ns,
+                image_size=(width, height),
+            )
+        center = self._tracker.latest.predicted_center_px
+        if center is None and self._tracker.latest.observation is not None:
+            center = self._tracker.latest.observation.center_px
+        scale = self._tracker.latest.scale_px_per_mm
+        if center is None or scale is None or scale <= 0.0:
+            return None
+        # The outer ring radius is about 100 mm; 15% padding keeps the crop
+        # small while retaining the complete ring geometry.
+        half_extent = max(64.0, 115.0 * scale)
+        x0 = max(0, int(np.floor(center[0] - half_extent)))
+        y0 = max(0, int(np.floor(center[1] - half_extent)))
+        x1 = min(width, int(np.ceil(center[0] + half_extent)))
+        y1 = min(height, int(np.ceil(center[1] + half_extent)))
+        return (x0, y0, x1, y1)
 
     def _acquire_full_board(
         self,
@@ -207,32 +316,43 @@ class ClassicalBoardDetector:
         captured_ns: int,
         source_sequence: int,
         tracking: bool,
-        roi_xyxy: tuple[int, int, int, int] | None = None,
+        offset_xy: tuple[int, int] = (0, 0),
     ) -> _FullAcquisition:
-        white_candidates = find_white_board_candidates(
+        white_started = time.perf_counter()
+        local_candidates = find_white_board_candidates(
             normalized,
             self._config.white_board,
-            roi_xyxy=roi_xyxy,
+            roi_xyxy=None,
         )
-        if not white_candidates:
-            return self._acquire_rings_only(
+        white_board_ms = (time.perf_counter() - white_started) * 1000.0
+        if not local_candidates:
+            rings_only = self._acquire_rings_only(
                 normalized,
                 captured_ns=captured_ns,
                 source_sequence=source_sequence,
-                roi_xyxy=roi_xyxy,
+                offset_xy=offset_xy,
                 failure_reason=DetectionFailure.NO_WHITE_CANDIDATE,
             )
+            return replace(rings_only, white_board_ms=white_board_ms)
 
+        candidates = tuple(
+            self._translate_white_candidate(candidate, offset_xy)
+            for candidate in local_candidates
+        )
         evidence: list[CandidateEvidence] = []
         ring_results: list[RingGeometryResult] = []
         solutions: list[BoardPlaneSolution] = []
-        for candidate in white_candidates:
-            ring = detect_concentric_arcs(
+        ring_ms = 0.0
+        for local_candidate, candidate in zip(local_candidates, candidates, strict=True):
+            ring_started = time.perf_counter()
+            local_ring = detect_concentric_arcs(
                 normalized.ring_edge_mask,
                 self._config.rings,
-                expected_center_px=candidate.center_px,
-                roi_xyxy=candidate.bbox_xyxy,
+                expected_center_px=local_candidate.center_px,
+                roi_xyxy=local_candidate.bbox_xyxy,
             )
+            ring_ms += (time.perf_counter() - ring_started) * 1000.0
+            ring = translate_ring_result(local_ring, offset_xy)
             ring_results.append(ring)
             solution = solve_board_plane(candidate.corners_px, board=self._board)
             solutions.append(solution)
@@ -253,8 +373,7 @@ class ClassicalBoardDetector:
                 0.0,
                 min(
                     self._config.classical_scoring.max_texture_penalty,
-                    (texture_ratio - 0.75)
-                    / 0.25
+                    (texture_ratio - 0.75) / 0.25
                     * self._config.classical_scoring.max_texture_penalty,
                 ),
             )
@@ -272,50 +391,59 @@ class ClassicalBoardDetector:
         ranked = rank_candidates(evidence, self._config.classical_scoring, tracking=tracking)
         evaluations = tuple(
             self._evaluation(candidate, scored)
-            for candidate, scored in zip(white_candidates, ranked.evaluations, strict=True)
+            for candidate, scored in zip(candidates, ranked.evaluations, strict=True)
         )
         if ranked.best is None:
-            ring_only = self._acquire_rings_only(
+            acceptable = [
+                ring for ring in ring_results
+                if classify_ring(ring, self._config.ring_first) is not RingQuality.REJECTED
+            ]
+            if acceptable:
+                ring = max(
+                    acceptable,
+                    key=lambda item: (
+                        item.visible_arc_count,
+                        item.common_center_score + item.ratio_score + item.coverage_score,
+                    ),
+                )
+                observation = self._ring_observation(
+                    ring, captured_ns=captured_ns, source_sequence=source_sequence
+                )
+                return _FullAcquisition(
+                    observation, evaluations, None, ring, ring_ms, white_board_ms
+                )
+            rings_only = self._acquire_rings_only(
                 normalized,
                 captured_ns=captured_ns,
                 source_sequence=source_sequence,
-                roi_xyxy=roi_xyxy,
-                failure_reason=(
-                    ranked.failure_reason or DetectionFailure.LOW_INTERNAL_STRUCTURE
-                ),
+                offset_xy=offset_xy,
+                failure_reason=(ranked.failure_reason or DetectionFailure.LOW_INTERNAL_STRUCTURE),
             )
             return _FullAcquisition(
-                ring_only.observation,
-                evaluations,
-                ring_only.solution,
-                ring_only.ring_result,
+                rings_only.observation, evaluations, rings_only.solution,
+                rings_only.ring_result, ring_ms + rings_only.ring_ms, white_board_ms
             )
         best_index = next(
-            index for index, scored in enumerate(ranked.evaluations)
-            if scored is ranked.best
+            index for index, scored in enumerate(ranked.evaluations) if scored is ranked.best
         )
-        candidate = white_candidates[best_index]
+        candidate = candidates[best_index]
         solution = solutions[best_index]
         ring = ring_results[best_index]
         if not solution.homography_valid or solution.center_px is None:
             return _FullAcquisition(
                 self._miss(captured_ns, source_sequence, DetectionFailure.A4_GEOMETRY_INVALID),
-                evaluations,
-                solution,
-                ring,
+                evaluations, solution, ring, ring_ms, white_board_ms
             )
         scale = self._board_scale(candidate.corners_px)
         observation = TrackObservation(
-            timestamp_ns=captured_ns,
-            source_sequence=source_sequence,
-            detected=True,
-            source=ObservationSource.FULL_BOARD,
-            center_px=solution.center_px,
-            corners_px=candidate.corners_px,
-            scale_px_per_mm=scale,
+            timestamp_ns=captured_ns, source_sequence=source_sequence, detected=True,
+            source=ObservationSource.FULL_BOARD, center_px=solution.center_px,
+            corners_px=candidate.corners_px, scale_px_per_mm=scale,
             confidence=ranked.best.combined_score,
         )
-        return _FullAcquisition(observation, evaluations, solution, ring)
+        return _FullAcquisition(
+            observation, evaluations, solution, ring, ring_ms, white_board_ms
+        )
 
     def _acquire_rings_only(
         self,
@@ -323,47 +451,61 @@ class ClassicalBoardDetector:
         *,
         captured_ns: int,
         source_sequence: int,
-        roi_xyxy: tuple[int, int, int, int] | None = None,
+        offset_xy: tuple[int, int] = (0, 0),
         failure_reason: DetectionFailure = DetectionFailure.LOW_INTERNAL_STRUCTURE,
     ) -> _FullAcquisition:
-        ring = detect_concentric_arcs(
-            normalized.ring_edge_mask,
-            self._config.rings,
-            expected_center_px=(
-                self._history.center_px if self._history is not None else None
-            ),
-            expected_scale_px_per_mm=(
-                self._history.scale_px_per_mm if self._history is not None else None
-            ),
-            roi_xyxy=roi_xyxy,
+        expected_center = None
+        expected_scale = None
+        if self._history is not None:
+            expected_center = self._history.center_px
+            expected_scale = self._history.scale_px_per_mm
+        else:
+            expected_center = self._tracker.latest.predicted_center_px
+            if expected_center is None and self._tracker.latest.observation is not None:
+                expected_center = self._tracker.latest.observation.center_px
+            expected_scale = self._tracker.latest.scale_px_per_mm
+        if expected_center is not None:
+            expected_center = (
+                expected_center[0] - offset_xy[0], expected_center[1] - offset_xy[1]
+            )
+        ring_started = time.perf_counter()
+        local_ring = detect_concentric_arcs(
+            normalized.ring_edge_mask, self._config.rings,
+            expected_center_px=expected_center, expected_scale_px_per_mm=expected_scale,
+            roi_xyxy=None,
         )
+        ring_ms = (time.perf_counter() - ring_started) * 1000.0
+        ring = translate_ring_result(local_ring, offset_xy)
         quality = classify_ring(ring, self._config.ring_first)
         if quality is RingQuality.REJECTED or ring.center_px is None:
             return _FullAcquisition(
                 self._miss(captured_ns, source_sequence, failure_reason),
-                (),
-                None,
-                ring,
+                (), None, ring, ring_ms, 0.0
             )
+        observation = self._ring_observation(
+            ring, captured_ns=captured_ns, source_sequence=source_sequence
+        )
+        return _FullAcquisition(observation, (), None, ring, ring_ms, 0.0)
+
+    @staticmethod
+    def _ring_observation(
+        ring: RingGeometryResult,
+        *,
+        captured_ns: int,
+        source_sequence: int,
+    ) -> TrackObservation:
         confidence = float(np.clip(
             0.45 * ring.common_center_score
             + 0.35 * ring.ratio_score
             + 0.20 * ring.coverage_score,
-            0.0,
-            1.0,
+            0.0, 1.0,
         ))
-        observation = TrackObservation(
-            timestamp_ns=captured_ns,
-            source_sequence=source_sequence,
-            detected=True,
-            source=ObservationSource.CONCENTRIC_ARCS,
-            center_px=ring.center_px,
-            corners_px=None,
-            scale_px_per_mm=ring.scale_px_per_mm,
-            confidence=confidence,
-            acquisition_eligible=True,
+        return TrackObservation(
+            timestamp_ns=captured_ns, source_sequence=source_sequence, detected=True,
+            source=ObservationSource.CONCENTRIC_ARCS, center_px=ring.center_px,
+            corners_px=None, scale_px_per_mm=ring.scale_px_per_mm,
+            confidence=confidence, acquisition_eligible=True,
         )
-        return _FullAcquisition(observation, (), None, ring)
 
     def _acquire_partial(
         self,
@@ -371,79 +513,52 @@ class ClassicalBoardDetector:
         *,
         captured_ns: int,
         source_sequence: int,
-    ) -> tuple[TrackObservation, RingGeometryResult, tuple[int, int, int, int] | None, bool, bool]:
-        if self._history is None:
-            empty = detect_concentric_arcs(normalized.ring_edge_mask, self._config.rings)
-            return self._miss(captured_ns, source_sequence, DetectionFailure.PARTIAL_HISTORY_REQUIRED), empty, None, False, False
-        height, width = normalized.gray.shape
-        roi = predicted_roi(
-            self._history,
-            timestamp_ns=captured_ns,
-            image_size=(width, height),
-        )
-        ring = detect_concentric_arcs(
-            normalized.ring_edge_mask,
-            self._config.rings,
-            expected_center_px=self._history.center_px,
-            expected_scale_px_per_mm=self._history.scale_px_per_mm,
-            roi_xyxy=roi,
-        )
-        if not ring.valid:
-            fallback = detect_concentric_arcs(
-                normalized.ring_edge_mask,
-                self._config.rings,
-                expected_scale_px_per_mm=self._history.scale_px_per_mm,
+        ring: RingGeometryResult | None,
+        offset_xy: tuple[int, int],
+        full_image_shape: tuple[int, int],
+        allow_white_region: bool,
+    ) -> tuple[TrackObservation, RingGeometryResult | None, bool, bool]:
+        if self._history is None or ring is None:
+            return (
+                self._miss(captured_ns, source_sequence, DetectionFailure.PARTIAL_HISTORY_REQUIRED),
+                ring, False, False,
             )
-            if fallback.valid or fallback.visible_arc_count > ring.visible_arc_count:
-                ring = fallback
-        white_center, white_confidence = self._local_white_region(normalized, roi)
+        height, width = full_image_shape
+        if allow_white_region:
+            local_roi = (0, 0, normalized.gray.shape[1], normalized.gray.shape[0])
+            white_center, white_confidence = self._local_white_region(normalized, local_roi)
+            if white_center is not None:
+                white_center = (white_center[0] + offset_xy[0], white_center[1] + offset_xy[1])
+        else:
+            white_center, white_confidence = None, 0.0
         arc_confidence = float(np.clip(
-            0.45 * ring.common_center_score
-            + 0.35 * ring.ratio_score
-            + 0.20 * ring.coverage_score,
-            0.0,
-            1.0,
+            0.45 * ring.common_center_score + 0.35 * ring.ratio_score
+            + 0.20 * ring.coverage_score, 0.0, 1.0,
         ))
         partial = fuse_partial_observation(
-            history=self._history,
-            timestamp_ns=captured_ns,
-            image_size=(width, height),
-            arc_center_px=ring.center_px,
-            arc_count=ring.visible_arc_count,
-            arc_confidence=arc_confidence,
-            white_center_px=white_center,
-            white_confidence=white_confidence,
-            observed_scale_px_per_mm=ring.scale_px_per_mm,
+            history=self._history, timestamp_ns=captured_ns, image_size=(width, height),
+            arc_center_px=ring.center_px, arc_count=ring.visible_arc_count,
+            arc_confidence=arc_confidence, white_center_px=white_center,
+            white_confidence=white_confidence, observed_scale_px_per_mm=ring.scale_px_per_mm,
         )
         if not partial.valid or partial.center_px is None:
             if ring.valid and ring.center_px is not None:
-                outside = self._translated_history_outside(
-                    ring.center_px,
-                    image_size=(width, height),
-                )
+                outside = self._translated_history_outside(ring.center_px, image_size=(width, height))
                 observation = TrackObservation(
-                    timestamp_ns=captured_ns,
-                    source_sequence=source_sequence,
-                    detected=True,
-                    source=ObservationSource.CONCENTRIC_ARCS,
-                    center_px=ring.center_px,
-                    corners_px=None,
-                    scale_px_per_mm=ring.scale_px_per_mm,
+                    timestamp_ns=captured_ns, source_sequence=source_sequence, detected=True,
+                    source=ObservationSource.CONCENTRIC_ARCS, center_px=ring.center_px,
+                    corners_px=None, scale_px_per_mm=ring.scale_px_per_mm,
                     confidence=arc_confidence,
                 )
-                return observation, ring, roi, outside, outside
-            return self._miss(captured_ns, source_sequence, partial.failure_reason), ring, roi, partial.near_image_edge, partial.partially_outside
+                return observation, ring, outside, outside
+            return (self._miss(captured_ns, source_sequence, partial.failure_reason), ring,
+                    partial.near_image_edge, partial.partially_outside)
         observation = TrackObservation(
-            timestamp_ns=captured_ns,
-            source_sequence=source_sequence,
-            detected=True,
-            source=partial.source,
-            center_px=partial.center_px,
-            corners_px=None,
-            scale_px_per_mm=partial.scale_px_per_mm,
-            confidence=partial.confidence,
+            timestamp_ns=captured_ns, source_sequence=source_sequence, detected=True,
+            source=partial.source, center_px=partial.center_px, corners_px=None,
+            scale_px_per_mm=partial.scale_px_per_mm, confidence=partial.confidence,
         )
-        return observation, ring, roi, partial.near_image_edge, partial.partially_outside
+        return observation, ring, partial.near_image_edge, partial.partially_outside
 
     def _remember(
         self,
@@ -522,6 +637,37 @@ class ClassicalBoardDetector:
         width = 0.5 * (sides[0] + sides[2])
         height = 0.5 * (sides[1] + sides[3])
         return float(0.5 * (width / 210.0 + height / 297.0))
+
+    @staticmethod
+    def _translate_white_candidate(
+        candidate: WhiteBoardCandidate,
+        offset_xy: tuple[int, int],
+    ) -> WhiteBoardCandidate:
+        offset_x, offset_y = offset_xy
+        if offset_x == 0 and offset_y == 0:
+            return candidate
+        contour = candidate.contour + np.asarray(
+            [[[offset_x, offset_y]]], dtype=candidate.contour.dtype
+        )
+        return replace(
+            candidate, contour=contour,
+            corners_px=tuple((x + offset_x, y + offset_y) for x, y in candidate.corners_px),
+            center_px=(candidate.center_px[0] + offset_x, candidate.center_px[1] + offset_y),
+            bbox_xyxy=(candidate.bbox_xyxy[0] + offset_x, candidate.bbox_xyxy[1] + offset_y,
+                       candidate.bbox_xyxy[2] + offset_x, candidate.bbox_xyxy[3] + offset_y),
+        )
+
+    @staticmethod
+    def _translate_evaluation(
+        evaluation: ClassicalCandidateEvaluation,
+        offset_xy: tuple[int, int],
+    ) -> ClassicalCandidateEvaluation:
+        offset_x, offset_y = offset_xy
+        return replace(
+            evaluation,
+            corners_px=tuple((x + offset_x, y + offset_y) for x, y in evaluation.corners_px),
+            center_px=(evaluation.center_px[0] + offset_x, evaluation.center_px[1] + offset_y),
+        )
 
     @staticmethod
     def _evaluation(candidate: WhiteBoardCandidate, scored) -> ClassicalCandidateEvaluation:

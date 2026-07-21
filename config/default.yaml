@@ -118,6 +118,18 @@ detection:
     min_multiple_arcs: 2
     max_single_arc_frames: 2
     saturation_mask_radius_px: 12
+  ring_first:
+    enabled: true
+    allow_medium_acquisition: true
+    white_board_interval_frames: 6
+    strong_min_arcs: 3
+    strong_common_center_score: 0.75
+    strong_ratio_score: 0.80
+    strong_coverage_score: 0.20
+    medium_min_arcs: 2
+    medium_common_center_score: 0.65
+    medium_ratio_score: 0.70
+    medium_coverage_score: 0.15
   classical_scoring:
     white_weight: 0.24
     geometry_weight: 0.22

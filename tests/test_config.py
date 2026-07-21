@@ -240,3 +240,20 @@ def test_ring_first_configuration_rejects_invalid_values(
     path = write_detection_config(tmp_path, {"ring_first": patch})
     with pytest.raises(ConfigError, match=message):
         load_config(path)
+
+
+def test_jetson_local_uses_field_tuned_ring_first_settings() -> None:
+    config = load_config("config/jetson-local.yaml")
+
+    assert config.camera.exposure_us == 10_000
+    assert config.camera.gain_db == pytest.approx(5.0)
+    assert config.camera.acquisition_fps == pytest.approx(60.0)
+    assert config.detection.normalization.clahe_clip_limit == pytest.approx(8.5)
+    assert config.detection.white_board.min_white_occupancy == pytest.approx(0.5)
+    assert config.detection.rings.ratio_tolerance == pytest.approx(0.18)
+    assert config.detection.rings.min_arc_coverage == pytest.approx(0.18)
+    assert config.detection.classical_scoring.tracking_threshold == pytest.approx(0.52)
+    assert config.detection.classical_scoring.acquisition_threshold == pytest.approx(0.66)
+    assert config.detection.ring_first.enabled is True
+    assert config.detection.ring_first.allow_medium_acquisition is True
+    assert config.detection.ring_first.white_board_interval_frames == 6

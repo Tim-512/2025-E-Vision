@@ -196,6 +196,7 @@ def _ring_geometry_result(
     common_center: float = 0.72,
     ratio: float = 0.76,
     coverage: float = 0.20,
+    scale: float = 1.0,
 ):
     from ev_vision.detection.ring_geometry import ArcFit, RingGeometryResult
 
@@ -218,7 +219,7 @@ def _ring_geometry_result(
         common_center_score=common_center,
         ratio_score=ratio,
         coverage_score=coverage,
-        scale_px_per_mm=1.0,
+        scale_px_per_mm=scale,
         failure_reason=None,
     )
 
@@ -254,6 +255,47 @@ def test_medium_ring_only_observations_can_confirm_tracking(monkeypatch) -> None
     assert results[-1].center_px == pytest.approx((160.0, 120.0))
 
 
+def test_ring_only_tracking_uses_roi_without_white_board_history(monkeypatch) -> None:
+    import ev_vision.detection.classical_board as module
+
+    monkeypatch.setattr(module, "find_white_board_candidates", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        module,
+        "detect_concentric_arcs",
+        lambda *args, **kwargs: _ring_geometry_result(
+            center=kwargs.get("expected_center_px") or (160.0, 120.0),
+            scale=kwargs.get("expected_scale_px_per_mm") or 1.0,
+        ),
+    )
+    subject = ClassicalBoardDetector(DetectionConfig())
+    image = np.zeros((240, 320, 3), np.uint8)
+    for sequence in range(1, 4):
+        result = subject.detect(
+            image,
+            captured_ns=1_000_000_000 + sequence * 10_000_000,
+            source_sequence=sequence,
+        )
+    assert result.target_valid is True
+
+    original_normalize = module.normalize_frame
+    normalized_shapes: list[tuple[int, int]] = []
+
+    def recording_normalize(frame, *args, **kwargs):
+        normalized_shapes.append(frame.shape[:2])
+        return original_normalize(frame, *args, **kwargs)
+
+    monkeypatch.setattr(module, "normalize_frame", recording_normalize)
+    result = subject.detect(
+        image, captured_ns=1_040_000_000, source_sequence=4
+    )
+
+    assert result.target_valid is True
+    assert normalized_shapes[-1][0] < image.shape[0]
+    assert normalized_shapes[-1][1] < image.shape[1]
+    assert result.timings_ms["roi_used"] == 1.0
+    assert result.center_px == pytest.approx((160.0, 120.0))
+
+
 def test_single_ring_only_observation_cannot_start_tracking(monkeypatch) -> None:
     import ev_vision.detection.classical_board as module
 
@@ -280,3 +322,121 @@ def test_single_ring_only_observation_cannot_start_tracking(monkeypatch) -> None
 
     assert result.target_valid is False
     assert result.center_px is None
+
+
+def test_tracking_crops_before_normalization_and_maps_center(monkeypatch) -> None:
+    import ev_vision.detection.classical_board as module
+
+    subject = _confirmed_detector()
+    target = render_ring_target()
+    original_normalize = module.normalize_frame
+    normalized_shapes: list[tuple[int, int]] = []
+
+    def recording_normalize(image, *args, **kwargs):
+        normalized_shapes.append(image.shape[:2])
+        return original_normalize(image, *args, **kwargs)
+
+    def local_ring(*args, **kwargs):
+        center = kwargs.get("expected_center_px")
+        assert center is not None
+        scale = kwargs.get("expected_scale_px_per_mm") or 1.0
+        return _ring_geometry_result(center=center, scale=scale)
+
+    monkeypatch.setattr(module, "normalize_frame", recording_normalize)
+    monkeypatch.setattr(module, "find_white_board_candidates", lambda *args, **kwargs: [])
+    monkeypatch.setattr(module, "detect_concentric_arcs", local_ring)
+
+    result = subject.detect(
+        target.image,
+        captured_ns=1_050_000_000,
+        source_sequence=5,
+    )
+
+    assert normalized_shapes
+    assert normalized_shapes[-1][0] < target.image.shape[0]
+    assert normalized_shapes[-1][1] < target.image.shape[1]
+    assert result.target_valid is True
+    assert result.center_px == pytest.approx(target.center_px, abs=10.0)
+    assert result.timings_ms["roi_used"] == 1.0
+
+
+def test_acquisition_still_normalizes_full_frame(monkeypatch) -> None:
+    import ev_vision.detection.classical_board as module
+
+    original_normalize = module.normalize_frame
+    normalized_shapes: list[tuple[int, int]] = []
+
+    def recording_normalize(image, *args, **kwargs):
+        normalized_shapes.append(image.shape[:2])
+        return original_normalize(image, *args, **kwargs)
+
+    monkeypatch.setattr(module, "normalize_frame", recording_normalize)
+    subject = ClassicalBoardDetector(DetectionConfig())
+    target = render_ring_target()
+    subject.detect(target.image, captured_ns=1_000_000_000, source_sequence=1)
+
+    assert normalized_shapes == [target.image.shape[:2]]
+
+
+def test_white_board_correction_runs_every_six_tracking_frames(monkeypatch) -> None:
+    import ev_vision.detection.classical_board as module
+
+    subject = _confirmed_detector()
+    target = render_ring_target()
+    white_calls = 0
+
+    def counted_white(*args, **kwargs):
+        nonlocal white_calls
+        white_calls += 1
+        return []
+
+    def tracked_ring(*args, **kwargs):
+        center = kwargs.get("expected_center_px")
+        if center is None:
+            center = target.center_px
+        scale = kwargs.get("expected_scale_px_per_mm") or 1.0
+        return _ring_geometry_result(center=center, scale=scale)
+
+    monkeypatch.setattr(module, "find_white_board_candidates", counted_white)
+    monkeypatch.setattr(module, "detect_concentric_arcs", tracked_ring)
+
+    results = []
+    for offset in range(1, 7):
+        results.append(subject.detect(
+            target.image,
+            captured_ns=1_030_000_000 + offset * 10_000_000,
+            source_sequence=3 + offset,
+        ))
+
+    assert all(result.target_valid for result in results)
+    assert white_calls == 1
+    assert [result.timings_ms["white_board_ran"] for result in results] == [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ]
+
+
+def test_stage_timings_are_reported() -> None:
+    target = render_ring_target()
+    result = ClassicalBoardDetector(DetectionConfig()).detect(
+        target.image,
+        captured_ns=1_000_000_000,
+        source_sequence=1,
+    )
+
+    expected = {
+        "crop_ms",
+        "normalization_ms",
+        "ring_ms",
+        "white_board_ms",
+        "detection_ms",
+        "total_ms",
+        "roi_used",
+        "white_board_ran",
+    }
+    assert set(result.timings_ms) >= expected
+    assert all(result.timings_ms[name] >= 0.0 for name in expected)

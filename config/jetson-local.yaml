@@ -2,9 +2,9 @@
   width: 1280
   height: 1024
   pixel_format: BayerRG8
-  acquisition_fps: 50
-  exposure_us: 15000
-  gain_db: 14.0
+  acquisition_fps: 60
+  exposure_us: 10000
+  gain_db: 5.0
   auto_exposure: false
   auto_gain: false
   auto_white_balance: false
@@ -92,7 +92,7 @@ detection:
     max_result_age_ms: 100.0
   normalization:
     gaussian_kernel: 3
-    clahe_clip_limit: 2.0
+    clahe_clip_limit: 8.5
     clahe_grid_size: 8
     illumination_kernel: 81
     white_percentile: 72.0
@@ -105,7 +105,7 @@ detection:
     aspect_ratio_tolerance: 0.24
     min_area_fraction: 0.015
     max_area_fraction: 0.92
-    min_white_occupancy: 0.58
+    min_white_occupancy: 0.5
     max_texture_std: 58.0
     min_convexity: 0.90
     min_side_px: 45.0
@@ -118,6 +118,18 @@ detection:
     min_multiple_arcs: 2
     max_single_arc_frames: 2
     saturation_mask_radius_px: 12
+  ring_first:
+    enabled: true
+    allow_medium_acquisition: true
+    white_board_interval_frames: 6
+    strong_min_arcs: 3
+    strong_common_center_score: 0.75
+    strong_ratio_score: 0.80
+    strong_coverage_score: 0.20
+    medium_min_arcs: 2
+    medium_common_center_score: 0.65
+    medium_ratio_score: 0.70
+    medium_coverage_score: 0.15
   classical_scoring:
     white_weight: 0.24
     geometry_weight: 0.22
